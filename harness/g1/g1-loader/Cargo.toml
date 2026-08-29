@@ -1,0 +1,25 @@
+[package]
+name = "g1-loader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# TODO-verify: every pin below is unverified against a real build — this dev machine has no cargo
+# toolchain. If the workflow fails on an API mismatch, read the resolved version's docs rather than
+# guessing (Rules.md §5).
+#
+# Deliberately using aya's SYNCHRONOUS PerfEventArray and std::process, not the async variant: the
+# async one sits behind an `async_tokio` feature flag whose exact name varies across aya versions,
+# and a gate probe should depend on as little unverified API surface as possible.
+aya = "0.13"
+anyhow = "1"                      # Rules.md §2: anyhow at the CLI boundary only — this is one
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+g1-common = { path = "../g1-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "g1-loader"
+path = "src/main.rs"

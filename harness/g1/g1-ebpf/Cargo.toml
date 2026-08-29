@@ -1,0 +1,40 @@
+[package]
+name = "g1-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Separate workspace from the loader: this crate targets bpfel-unknown-none, is no_std, uses
+# panic=abort, and requires nightly + `-Z build-std=core`.
+[workspace]
+
+[dependencies]
+# TODO-verify: pins are unverified against a real build — this dev machine has no cargo toolchain.
+# If the workflow fails on an API mismatch, read the docs for the resolved version rather than
+# guessing (Rules.md §5). aya-ebpf is the current name; older material says `aya-bpf`.
+aya-ebpf = "0.1.1"
+g1-common = { path = "../g1-common" }
+
+[[bin]]
+name = "g1-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1

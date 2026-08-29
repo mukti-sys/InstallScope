@@ -1,0 +1,35 @@
+{
+  "harness_version": "g2-0.1.0",
+  "gate": "G2",
+  "package": "SYNTHETIC-FIXTURE-not-a-real-package",
+  "manager": "npm",
+  "manager_version": "10.0.0",
+  "install_command": "npm install SYNTHETIC-FIXTURE-not-a-real-package --no-audit --no-fund",
+  "started_at": "2024-06-24T15:34:38Z",
+  "ended_at": "2024-06-24T15:34:41Z",
+  "start_epoch": "1719245678.000000",
+  "duration_s": 3.0,
+  "timeout_s": 300,
+  "exit_code": 0,
+  "timed_out": false,
+  "strace_started": true,
+  "complete": true,
+  "incomplete_reason": null,
+  "trace_files": 2,
+  "trace_bytes": 4096,
+  "installed": { "package_json_count": 3, "bytes": 123456 },
+  "paths": {
+    "project": "/work/project",
+    "cache": "/work/cache",
+    "home": "/work/home",
+    "tmp": "/work/tmp"
+  },
+  "env": {
+    "node": "v20.0.0",
+    "strace": "strace -- version 6.1",
+    "kernel": "6.5.0-synthetic",
+    "ptrace_scope": "0",
+    "runner_os": "SYNTHETIC"
+  },
+  "_fixture_note": "SYNTHETIC. Hand-written to exercise the parser and classifier. Rules.md §5: this is labeled synthetic and must never be cited as a receipt or presented as a recording of any real package."
+}

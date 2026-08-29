@@ -1,0 +1,25 @@
+# Rust
+target/
+**/target/
+
+# Node
+node_modules/
+
+# G2 harness local output (CI uploads these as artifacts instead)
+harness/g2/out/
+harness/g2/work/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Internal dev-kit docs (local only)
+Architecture.md
+Design.md
+Memory.md
+PRD.md
+Phases.md
+Rules.md
+Scope.md

@@ -1,0 +1,8 @@
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+# bpfel-unknown-none has no prebuilt core, so it must be compiled from source. This requires
+# nightly with the rust-src component installed.

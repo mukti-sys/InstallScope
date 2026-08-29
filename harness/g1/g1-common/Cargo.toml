@@ -1,0 +1,9 @@
+[package]
+name = "g1-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Shared between the eBPF program (no_std) and the loader (std). Dependency-free on purpose:
+# anything added here has to compile for bpfel-unknown-none.
+[dependencies]

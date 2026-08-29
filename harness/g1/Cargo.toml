@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["g1-common", "g1-loader"]
+
+# g1-ebpf is deliberately NOT a member: it targets bpfel-unknown-none, needs nightly plus
+# -Z build-std=core, and is no_std with panic=abort. A single workspace cannot express two such
+# different build configurations cleanly. This split is the standard aya project layout.
+exclude = ["g1-ebpf"]
+
+[profile.release]
+debug = false
+strip = true

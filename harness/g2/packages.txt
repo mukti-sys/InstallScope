@@ -1,0 +1,64 @@
+# G2 candidate package list — one npm spec per line.
+#
+# PROVENANCE / TODO-verify: this list is hand-written from general familiarity with widely-used
+# npm packages. It is NOT a verified download-rank top-50, and nothing here establishes a ranking.
+# Before making any popularity claim in public, run `node harness/g2/rank-packages.mjs`, which
+# records each package's actual weekly download count, and use the phrasing it prints
+# (e.g. "50 packages, each with at least N weekly downloads as of DATE") rather than "the top 50".
+#
+# No behavioral claim is attached to any entry here. Whether a package has install scripts,
+# downloads binaries, or touches the network is exactly what the harness is run to discover.
+# Do not reorder this file to "put the interesting ones first" — that biases the gate.
+#
+# Lines starting with # and blank lines are ignored. Specs may be pinned (pkg@1.2.3).
+
+lodash
+chalk
+tslib
+semver
+debug
+ms
+commander
+yargs
+glob
+rimraf
+minimist
+uuid
+dotenv
+axios
+express
+body-parser
+cors
+react
+react-dom
+vue
+typescript
+eslint
+prettier
+jest
+mocha
+chai
+webpack
+vite
+rollup
+esbuild
+sass
+postcss
+tailwindcss
+nodemon
+ts-node
+ws
+socket.io
+mongoose
+pg
+mysql2
+ioredis
+sqlite3
+bcrypt
+sharp
+node-gyp
+husky
+core-js
+protobufjs
+puppeteer
+playwright

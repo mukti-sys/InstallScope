@@ -1,0 +1,276 @@
+name: G1 — aya eBPF runner probe
+
+# Phase 0 kill gate G1 (Phases.md:12-14): does an aya eBPF program load and record an event on a
+# stock `ubuntu-latest` runner? Budget ~1 hour. Done = green run + uploaded artifact.
+#
+# Fallback order is pre-authorized in Scope.md:59 so a failure is not a design debate:
+# aya -> libbpf-rs -> strace-only product. The strace backend ships regardless (Architecture.md:35),
+# so failing this gate is survivable.
+#
+# Manual dispatch only: it needs sudo to load BPF, and gates are run deliberately, not on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_ms:
+        description: "How long the loader waits for at least one event"
+        required: false
+        default: "5000"
+      rust_toolchain:
+        description: "Nightly toolchain for the eBPF crate (bpfel-unknown-none has no prebuilt core)"
+        required: false
+        default: "nightly"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: load + attach + record one event
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- environment facts recorded BEFORE anything is built or loaded --------------------
+      # Architecture.md:96 asserts passwordless sudo and BTF at /sys/kernel/btf/vmlinux on
+      # ubuntu-latest, with "verify in G1 anyway". This is that verification. Recorded up front so
+      # runner facts can never be confused with results.
+      - name: Record runner environment
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          {
+            echo "=== runner ==="
+            echo "image_os: ${ImageOS:-unknown}"
+            echo "image_version: ${ImageVersion:-unknown}"
+            echo "kernel: $(uname -r)"
+            echo "arch: $(uname -m)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo ""
+            echo "=== BPF preconditions ==="
+            if [ -r /sys/kernel/btf/vmlinux ]; then
+              echo "btf_vmlinux: present ($(stat -c%s /sys/kernel/btf/vmlinux) bytes)"
+            else
+              echo "btf_vmlinux: MISSING"
+            fi
+            echo "unprivileged_bpf_disabled: $(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo unavailable)"
+            echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unavailable)"
+            echo "kernel_lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)"
+            echo ""
+            echo "=== tracepoint visibility ==="
+            sudo test -d /sys/kernel/debug/tracing/events/syscalls/sys_enter_execve \
+              && echo "sys_enter_execve: present (debugfs)" \
+              || echo "sys_enter_execve: not visible via debugfs"
+            echo ""
+            echo "=== sudo ==="
+            sudo -n true && echo "passwordless_sudo: yes" || echo "passwordless_sudo: NO"
+            echo "capabilities_of_shell: $(capsh --print 2>/dev/null | grep -m1 'Current:' || echo unavailable)"
+          } | tee out/runner-env.txt
+
+      - name: Install nightly Rust with rust-src
+        # rust-src is required because -Z build-std=core compiles core from source for
+        # bpfel-unknown-none, which has no prebuilt std/core.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          components: rust-src, clippy, rustfmt
+
+      - name: Install stable Rust for the loader
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bpf-linker
+        # aya's eBPF codegen links through bpf-linker rather than the system linker.
+        run: |
+          set -euo pipefail
+          cargo install bpf-linker --locked
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            harness/g1/target
+            harness/g1/g1-ebpf/target
+          key: g1-cargo-${{ runner.os }}-${{ hashFiles('harness/g1/**/Cargo.toml') }}
+          restore-keys: g1-cargo-${{ runner.os }}-
+
+      # ---- build ----------------------------------------------------------------------------
+      # Pins in the manifests are TODO-verify (Rules.md §5): they were written without a local cargo
+      # toolchain. If either build fails on an API mismatch, read the resolved version's docs — do
+      # not guess. Cargo.lock files are uploaded so the resolved versions are recoverable facts.
+      - name: Build eBPF program (nightly, bpfel-unknown-none)
+        id: build_ebpf
+        working-directory: harness/g1/g1-ebpf
+        run: |
+          set -uo pipefail
+          cargo +${{ inputs.rust_toolchain }} build --release 2>&1 | tee ../../../out/build-ebpf.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Build loader (stable)
+        id: build_loader
+        working-directory: harness/g1
+        run: |
+          set -uo pipefail
+          cargo build --release 2>&1 | tee ../../out/build-loader.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Clippy on the loader
+        # Rules.md §6 requires clippy -D warnings, and §2 denies unwrap/expect in non-test code.
+        working-directory: harness/g1
+        continue-on-error: true
+        run: cargo clippy --release --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used 2>&1 | tee ../../out/clippy.log
+
+      - name: Inspect the compiled object
+        run: |
+          set -uo pipefail
+          OBJ=harness/g1/g1-ebpf/target/bpfel-unknown-none/release/g1-ebpf
+          {
+            echo "object: $OBJ"
+            ls -l "$OBJ" || echo "MISSING"
+            file "$OBJ" || true
+            echo ""
+            echo "=== sections ==="
+            readelf -S "$OBJ" 2>/dev/null | grep -E 'tracepoint|maps|license|\.text' || true
+          } | tee out/object-info.txt
+
+      # ---- the gate itself ------------------------------------------------------------------
+      - name: Load, attach, and record one event
+        id: probe
+        run: |
+          set -uo pipefail
+          # sudo because BPF load needs CAP_BPF/CAP_PERFMON (Architecture.md:97).
+          sudo ./harness/g1/target/release/g1-loader \
+            --object harness/g1/g1-ebpf/target/bpfel-unknown-none/release/g1-ebpf \
+            --out out/g1-result.json \
+            --events out/g1-events.jsonl \
+            --timeout-ms "${{ inputs.timeout_ms }}" \
+            2>&1 | tee out/loader.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # Do not fail the step here: the summary and artifact steps must run either way.
+          exit 0
+
+      - name: Verify the recorded evidence
+        # The loader's own exit code is not taken on trust. The artifact is re-read here, because a
+        # gate that passes without evidence on disk has proven nothing (Rules.md §2).
+        run: |
+          set -uo pipefail
+          if [ ! -f out/g1-result.json ]; then
+            echo "::error title=G1 FAILED::loader produced no result file at all"
+            exit 1
+          fi
+          node -e '
+            const fs = require("node:fs");
+            const r = JSON.parse(fs.readFileSync("out/g1-result.json", "utf8"));
+            const problems = [];
+            if (!r.load_ok) problems.push("program did not load");
+            if (!r.attach_ok) problems.push("program did not attach");
+            if (!(r.events_received > 0)) problems.push("no events received");
+            const lines = fs.existsSync("out/g1-events.jsonl")
+              ? fs.readFileSync("out/g1-events.jsonl", "utf8").split("\n").filter((l) => l.trim() !== "")
+              : [];
+            if (lines.length === 0) problems.push("g1-events.jsonl is empty — no recorded evidence");
+            if (r.events_received !== lines.length) {
+              problems.push(`result claims ${r.events_received} events but the JSONL has ${lines.length}`);
+            }
+            if (problems.length > 0) {
+              console.log(`::error title=G1 FAILED::${problems.join("; ")}`);
+              console.log(`::notice title=Fallback::${r.fallback_if_failed}`);
+              process.exit(1);
+            }
+            console.log(`::notice title=G1 evidence::${lines.length} events recorded, first comm=${JSON.stringify(JSON.parse(lines[0]).comm)}`);
+          '
+
+      - name: Write step summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "# G1 — aya eBPF runner probe"
+            echo ""
+            if [ -f out/g1-result.json ]; then
+              node -e '
+                const r = require("./out/g1-result.json");
+                const L = [];
+                L.push(r.passed ? "## PASS" : "## FAIL");
+                L.push("");
+                if (!r.passed) {
+                  L.push(`Failed at stage \`${r.failure_stage}\`:`);
+                  L.push("");
+                  L.push("```");
+                  L.push(String(r.failure_detail ?? "no detail recorded"));
+                  L.push("```");
+                  L.push("");
+                  L.push(`**Fallback:** ${r.fallback_if_failed}`);
+                  L.push("");
+                }
+                L.push("| Check | Result |");
+                L.push("|---|---|");
+                L.push(`| Object loaded | ${r.load_ok ? "yes" : "**no**"} |`);
+                L.push(`| Attached to \`${r.tracepoint}\` | ${r.attach_ok ? "yes" : "**no**"} |`);
+                L.push(`| Events received | ${r.events_received} |`);
+                L.push(`| Events lost | ${r.events_lost} |`);
+                L.push(`| Wait time | ${r.wait_ms} ms |`);
+                L.push(`| Online CPUs / perf buffers | ${r.online_cpus} |`);
+                L.push(`| Kernel | \`${r.env.kernel_release}\` |`);
+                L.push(`| BTF at /sys/kernel/btf/vmlinux | ${r.env.btf_vmlinux_present ? "present" : "**missing**"} |`);
+                L.push(`| Runner image | ${r.env.runner_image_os ?? "?"} ${r.env.runner_image_version ?? ""} |`);
+                L.push("");
+                L.push("### What this run does and does not establish");
+                L.push("");
+                L.push(`**Proves:** ${r.proves}`);
+                L.push("");
+                L.push(`**Does not prove:** ${r.does_not_prove}`);
+                console.log(L.join("\n"));
+              ' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "## FAIL — no result file"
+              echo ""
+              echo "The loader did not run or crashed before writing \`g1-result.json\`."
+              echo "Check \`build-ebpf.log\`, \`build-loader.log\`, and \`loader.log\` in the artifact."
+              echo ""
+              echo "**Fallback (Scope.md:59):** aya → libbpf-rs → strace-only product."
+            fi >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Record the outcome and, if failed, the fallback branch taken, in \`Memory.md\` (Rules.md §7)." >> "$GITHUB_STEP_SUMMARY"
+          } || true
+
+      - name: Collect Cargo.lock files
+        if: always()
+        # The manifest pins are TODO-verify; the lockfiles turn "what actually built" into a
+        # recoverable fact rather than a guess.
+        run: |
+          set -uo pipefail
+          cp harness/g1/Cargo.lock out/loader-Cargo.lock 2>/dev/null || true
+          cp harness/g1/g1-ebpf/Cargo.lock out/ebpf-Cargo.lock 2>/dev/null || true
+
+      - name: Upload G1 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1-probe
+          path: out
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Fail the job if the gate failed
+        # Last step on purpose: the artifact is uploaded first so a failure is diagnosable.
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.probe.outputs.status }}" != "0" ]; then
+            echo "G1 FAILED (loader exit ${{ steps.probe.outputs.status }})."
+            echo "Per Rules.md §7: STOP. Log the failure and the fallback branch in Memory.md."
+            echo "Do not code around this gate."
+            exit 1
+          fi
+          echo "G1 passed. Log the result in Memory.md before starting Phase 2."

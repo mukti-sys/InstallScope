@@ -1,0 +1,11 @@
+1719245678.001000 execve("/usr/bin/node", ["node", "/work/project/node_modules/.bin/postinstall-fixture"], 0x7ffd1234abcd /* 8 vars */) = 0
+1719245678.001050 mkdir("/work/project/node_modules/.fixture", 0777) = 0
+1719245678.001060 openat(AT_FDCWD, "relative-file.txt", O_WRONLY|O_CREAT, 0666) = 11
+1719245678.001070 rename("/work/tmp/staging-abc", "/work/project/node_modules/fixture") = 0
+1719245678.001080 symlink("../fixture/bin.js", "/work/project/node_modules/.bin/fixture") = 0
+1719245678.001090 unlink("/work/tmp/staging-abc.lock") = 0
+1719245678.001100 openat(AT_FDCWD, "/proc/self/status", O_RDONLY) = 12</proc/12/status>
+1719245678.001150 sendmsg(13<UDP:[10.1.0.4:41240]>, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, msg_namelen=16, msg_iov=[{iov_base="\022\006\001\000\000\001\000\000\000\000\000\000\014registry.np"..., iov_len=40}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 40
+1719245678.001200 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=1001, si_status=0} ---
+1719245678.001250 openat(AT_FDCWD, "/work/cache/_cacache/content-v2/sha512/ab/cd/ef", O_WRONLY|O_CREAT|O_EXCL, 0666) = 14</work/cache/_cacache/content-v2/sha512/ab/cd/ef>
+1719245678.001300 +++ exited with 0 +++

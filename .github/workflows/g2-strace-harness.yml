@@ -1,0 +1,349 @@
+name: G2 — strace receipts harness
+
+# Phase 0 kill gate G2 (Phases.md:6-11): do real npm installs do surprising things?
+# Target: >=10 documented behavioral surprises, else Scope.md:60 applies and coding stops.
+#
+# Isolation: ONE ubuntu-latest job per package. Each job is a fresh ephemeral VM with its own
+# kernel, filesystem, and empty npm cache. Phases.md:7 asks for "fresh VM per package"; this is
+# that property obtained on runners because the dev machine is win32 with no WSL. Venue change,
+# not scope change — Scope.md:25 already names ubuntu-latest as in-scope.
+#
+# Manual dispatch only. This workflow installs arbitrary third-party packages and lets their
+# install scripts run unsandboxed on the runner (audit mode: everything allowed, everything
+# logged). That is the point of the gate, but it must never fire automatically on a push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_limit:
+        description: "How many packages from packages.txt to record (max 50 — GitHub matrix cap is 256, but runner minutes are the real limit)"
+        required: false
+        default: "12"
+      package_override:
+        description: "Optional: comma-separated package specs to record INSTEAD of packages.txt (e.g. lodash,sharp@0.33.0)"
+        required: false
+        default: ""
+      timeout_seconds:
+        description: "Per-install strace timeout in seconds"
+        required: false
+        default: "300"
+      manager:
+        description: "Package manager (npm or pnpm — v1 supports these two only, Scope.md:26)"
+        required: false
+        default: "npm"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Verify the parser/classifier before spending 50 runners on them. Pure Node, no Linux needed.
+  # ---------------------------------------------------------------------------------------------
+  verify-harness:
+    name: verify harness (golden tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Golden tests over the synthetic fixture
+        run: node harness/g2/test-parse.mjs
+
+  # ---------------------------------------------------------------------------------------------
+  # Build the matrix. Done in a job (not inline) so the package list stays a plain text file that a
+  # human can read and audit, rather than YAML.
+  # ---------------------------------------------------------------------------------------------
+  plan:
+    name: plan matrix
+    needs: verify-harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build package matrix
+        id: build
+        env:
+          PKG_LIMIT: ${{ inputs.package_limit }}
+          PKG_OVERRIDE: ${{ inputs.package_override }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const limitRaw = (process.env.PKG_LIMIT || "12").trim();
+          const limit = Number.parseInt(limitRaw, 10);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+            console.error(`plan: FATAL: package_limit must be an integer 1-50, got: ${limitRaw}`);
+            process.exit(1);
+          }
+
+          const override = (process.env.PKG_OVERRIDE || "").trim();
+          let specs;
+          if (override !== "") {
+            specs = override.split(",").map((s) => s.trim()).filter((s) => s !== "");
+            console.error(`plan: using ${specs.length} override package(s)`);
+          } else {
+            specs = fs.readFileSync("harness/g2/packages.txt", "utf8")
+              .split("\n").map((l) => l.trim())
+              .filter((l) => l !== "" && !l.startsWith("#"))
+              .slice(0, limit);
+          }
+
+          // Same character policy as record-package.sh: reject anything that could escape into a
+          // shell or path context before it reaches a runner.
+          const bad = specs.filter((s) => !/^[A-Za-z0-9@/._-]+$/.test(s) || s.includes(".."));
+          if (bad.length > 0) {
+            console.error(`plan: FATAL: rejected package specs: ${bad.join(", ")}`);
+            process.exit(1);
+          }
+          if (specs.length === 0) {
+            console.error("plan: FATAL: no packages to record");
+            process.exit(1);
+          }
+
+          // Artifact names cannot contain / : < > | * ? \ or quotes, so scoped packages need a slug.
+          const include = specs.map((spec) => ({
+            spec,
+            slug: spec.replace(/[^A-Za-z0-9._-]/g, "_"),
+          }));
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `count=${include.length}\n`);
+          console.error(`plan: ${include.length} packages -> ${include.map((i) => i.spec).join(", ")}`);
+          NODE
+
+      - name: Summary
+        run: |
+          {
+            echo "## G2 plan"
+            echo ""
+            echo "Recording **${{ steps.build.outputs.count }}** packages, one ephemeral \`ubuntu-latest\` VM each."
+            echo ""
+            echo "Manager: \`${{ inputs.manager }}\` · per-install timeout: \`${{ inputs.timeout_seconds }}s\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  # One fresh VM per package.
+  # ---------------------------------------------------------------------------------------------
+  record:
+    name: "record ${{ matrix.spec }}"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # A package whose install explodes is still evidence. Never let one package abort the gate.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        if: inputs.manager == 'pnpm'
+        run: npm install --global pnpm@9
+
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace
+          strace -V | head -n 1
+
+      - name: Record runner environment
+        # Captured before recording so runner facts are never mistaken for package behavior.
+        # Also the G1 precondition check in miniature: does this runner even permit ptrace?
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          {
+            echo "kernel: $(uname -r)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "arch: $(uname -m)"
+            echo "node: $(node --version)"
+            echo "npm: $(npm --version)"
+            echo "strace: $(strace -V | head -n 1)"
+            echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unavailable)"
+            echo "runner_image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } | tee out/runner-env.txt
+
+      - name: Record install under strace
+        id: record
+        env:
+          SPEC: ${{ matrix.spec }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+          MANAGER: ${{ inputs.manager }}
+        run: |
+          set -uo pipefail
+          chmod +x harness/g2/record-package.sh
+          # Quoted env vars, never interpolated into the command line: matrix values are data.
+          harness/g2/record-package.sh \
+            --package "$SPEC" \
+            --outdir out \
+            --timeout "$TIMEOUT" \
+            --manager "$MANAGER"
+          status=$?
+          echo "record_status=$status" >> "$GITHUB_OUTPUT"
+          # Exit 3 means strace never ran — a harness failure worth surfacing loudly. Any other
+          # non-zero from the install itself is evidence, not failure.
+          if [ "$status" -eq 3 ]; then
+            echo "::error title=G2 recorder failed::strace produced no trace files for $SPEC"
+            exit 1
+          fi
+          exit 0
+
+      - name: Parse trace to JSONL
+        if: always() && steps.record.outcome != 'skipped'
+        run: |
+          set -uo pipefail
+          node harness/g2/parse-trace.mjs --indir out --out out/events.jsonl
+
+      - name: Classify findings
+        if: always() && hashFiles('out/events.jsonl') != ''
+        run: |
+          set -uo pipefail
+          node harness/g2/classify.mjs --indir out --out out/findings.json
+
+      - name: Job summary
+        if: always()
+        env:
+          SPEC: ${{ matrix.spec }}
+        run: |
+          set -uo pipefail
+          if [ -f out/findings.json ]; then
+            node -e '
+              const f = require("./out/findings.json");
+              const L = [];
+              L.push(`## \`${process.env.SPEC}\``);
+              L.push("");
+              L.push(`Surprise Index **${f.score}/100**${f.partial ? "  **PARTIAL**" : ""}`);
+              if (f.partial) L.push(`> incomplete: ${f.partial_reasons.join("; ")}`);
+              L.push("");
+              L.push(`events ${f.counts.events} · findings ${f.counts.findings} · candidates ${f.counts.candidate_surprises}`);
+              L.push("");
+              // Max 3 bullets in the comment surface (PRD.md:57). Full evidence is the artifact.
+              for (const c of f.candidate_surprises.slice(0, 3)) L.push(`- \`${c.severity}\` ${c.title}`);
+              if (f.candidate_surprises.length > 3) L.push(`- …${f.candidate_surprises.length - 3} more in the artifact`);
+              require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, L.join("\n") + "\n");
+            '
+          else
+            echo "## \`$SPEC\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**No findings.json produced — recording failed. This is PARTIAL, not clean.**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compress raw traces
+        if: always()
+        # Raw strace output is large and only needed when a human disputes a finding.
+        run: |
+          set -uo pipefail
+          if [ -d out/trace ]; then
+            tar -C out -czf out/trace.tar.gz trace 2>/dev/null || true
+            rm -rf out/trace
+          fi
+          rm -rf out/work
+
+      - name: Upload recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g2-${{ matrix.slug }}
+          path: out
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------------------------
+  # Aggregate. Reports candidates; never declares the gate passed.
+  # ---------------------------------------------------------------------------------------------
+  aggregate:
+    name: aggregate results
+    needs: [plan, record]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download all recordings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: g2-*
+          path: recordings
+
+      - name: Aggregate
+        run: |
+          set -uo pipefail
+          mkdir -p summary
+          node harness/g2/aggregate.mjs \
+            --indir recordings \
+            --out-json summary/g2-summary.json \
+            --out-md summary/SUMMARY.md
+
+      - name: Write step summary
+        run: cat summary/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Flag PARTIAL recordings loudly
+        # Rules.md §2: a green run with silently-dead recorders is the worst outcome this project
+        # can produce. Annotate, but do not fail — PARTIAL is data too.
+        run: |
+          set -uo pipefail
+          node -e '
+            const s = require("./summary/g2-summary.json");
+            const t = s.totals;
+            if (t.recordings_partial > 0) {
+              const names = s.packages.filter((p) => p.partial).map((p) => p.package).join(", ");
+              console.log(`::warning title=PARTIAL recordings::${t.recordings_partial} of ${t.packages_recorded} recordings are incomplete and excluded from the gate count: ${names}`);
+            }
+            if (t.packages_recorded === 0) {
+              console.log("::error title=No recordings::aggregate found no findings.json anywhere; the gate measured nothing");
+              process.exit(1);
+            }
+            console.log(`::notice title=G2 candidates::${t.distinct_package_rule_pairs} distinct package+rule candidates from ${t.recordings_complete} complete recordings (target >=${s.target_surprises}, human confirmation required)`);
+          '
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g2-summary
+          path: summary
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Restate the gate protocol
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "### This job does not decide G2"
+            echo ""
+            echo "The number above counts **candidates**. A candidate becomes a **receipt** only when a"
+            echo "human reads the evidence and confirms the behavior is genuinely surprising."
+            echo ""
+            echo "Per Rules.md §7 and Phases.md:10, record the human verdict, the confirmed receipt count,"
+            echo "and any rule changes in \`Memory.md\`. If the confirmed count is under 10 across the full"
+            echo "list, Scope.md:60 applies: a human chooses between repositioning and stopping. Widening"
+            echo "the rules to manufacture findings is a process failure, not a fix."
+          } >> "$GITHUB_STEP_SUMMARY"
