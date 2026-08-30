@@ -1,0 +1,23 @@
+[package]
+name = "installscope"
+description = "The flight recorder for package installs. Records the syscall-level ground truth of what an install actually does."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "installscope"
+path = "src/main.rs"
+
+[dependencies]
+installscope-core = { workspace = true }
+installscope-recorder = { workspace = true }
+# Rules.md §2: anyhow is permitted at the CLI boundary ONLY. This crate is that boundary.
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

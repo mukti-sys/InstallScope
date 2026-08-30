@@ -1,0 +1,279 @@
+name: Phase 1 — recorder E2E
+
+# Runs the recorder against real processes on a real kernel, which is the only way to check the parts
+# a fixture cannot: process orchestration, timeouts, signals, and whether real strace output actually
+# parses. Phases.md:20 makes "records real `npm install` end-to-end" and "complete→clean /
+# crash→PARTIAL" the Phase 1 Done conditions; this workflow is where those are demonstrated.
+#
+# Separate from rust.yml because these tests install a package from the live registry: they need
+# network access and take minutes rather than seconds. They are #[ignore]d in the test binary so a
+# normal `cargo test` never depends on the network.
+#
+# Manual dispatch plus a weekly run: strace's output format and npm's behavior both drift, and a
+# parser that silently stops handling real output is exactly the failure this project exists to
+# prevent in other people's tools.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to record (lodash is small and script-free; try sharp or node-gyp for a build)"
+        required: false
+        default: "lodash"
+  schedule:
+    # Sundays 04:17 UTC. Off-peak, and the odd minute avoids the top-of-hour stampede.
+    - cron: "17 4 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: phase1-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: record real processes under strace
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace
+          strace -V | head -n 1
+
+      - name: Record the environment
+        # Captured before anything runs so runner facts are never mistaken for recorder behavior when
+        # a result is disputed.
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          {
+            echo "kernel: $(uname -r)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "arch: $(uname -m)"
+            echo "node: $(node --version)"
+            echo "npm: $(npm --version)"
+            echo "strace: $(strace -V | head -n 1)"
+            echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unavailable)"
+            echo "runner_image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } | tee artifacts/runner-env.txt
+
+      - name: Build the release binary
+        run: cargo build --release --workspace
+
+      # ---- the ignored E2E test suite ---------------------------------------------------------
+      - name: E2E tests (complete→clean and crash→PARTIAL)
+        # These are the Phases.md:20 Done conditions, asserted in code rather than eyeballed.
+        run: |
+          set -uo pipefail
+          cargo test -p installscope-recorder --test e2e_linux -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee artifacts/e2e-tests.log
+          exit "${PIPESTATUS[0]}"
+
+      # ---- an actual recorded install, kept as an artifact -------------------------------------
+      # The test suite asserts correctness; this step produces evidence a human can read, which is
+      # what makes a regression diagnosable rather than merely detectable.
+      - name: Record a real npm install through the CLI
+        id: record
+        env:
+          PACKAGE: ${{ inputs.package || 'lodash' }}
+        run: |
+          set -uo pipefail
+          case "$PACKAGE" in
+            *[!A-Za-z0-9@/._-]*|''|-*|*..*)
+              echo "::error title=Bad input::refusing suspicious package spec: $PACKAGE"; exit 1 ;;
+          esac
+
+          work="$RUNNER_TEMP/e2e"
+          mkdir -p "$work/home" "$work/cache" "$work/tmp"
+          printf '%s\n' '{"name":"e2e-scratch","version":"0.0.0","private":true}' > "$work/package.json"
+
+          # Private HOME and cache so the recording reflects the package, not the runner image's
+          # pre-warmed npm state.
+          env -i \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            HOME="$work/home" \
+            TMPDIR="$work/tmp" \
+            npm_config_cache="$work/cache" \
+            CI=true \
+            ./target/release/installscope record \
+              --out artifacts/recording \
+              --cwd "$work" \
+              --project "$work" \
+              --cache "$work/cache" \
+              --timeout 300 \
+              -- npm install "$PACKAGE" --no-audit --no-fund --foreground-scripts --loglevel=error \
+            2>&1 | tee artifacts/record.log
+          status="${PIPESTATUS[0]}"
+          echo "record_status=$status" >> "$GITHUB_OUTPUT"
+          # Exit code 3 means PARTIAL: recorded, but not whole. Reported below rather than swallowed.
+          exit 0
+
+      - name: Verify the artifact independently
+        # The recorder's own exit code is not taken on trust. `verify` re-reads the stream, which is
+        # the same thing a downstream consumer does — and Rules.md §2 says a green result over dead
+        # evidence is the worst outcome this project can produce.
+        run: |
+          set -uo pipefail
+          if [ ! -f artifacts/recording/events.jsonl ]; then
+            echo "::error title=No recording::events.jsonl was never written"
+            exit 1
+          fi
+          ./target/release/installscope verify artifacts/recording/events.jsonl \
+            2>&1 | tee artifacts/verify.log
+          verify_status="${PIPESTATUS[0]}"
+
+          case "$verify_status" in
+            0) echo "recording is complete" ;;
+            3) echo "::warning title=PARTIAL recording::the recording is incomplete; see verify.log for the reason" ;;
+            *) echo "::error title=Unreadable recording::verify could not read the stream"; exit 1 ;;
+          esac
+
+          if [ "$verify_status" != "${{ steps.record.outputs.record_status }}" ]; then
+            echo "::error title=Disagreement::record exited ${{ steps.record.outputs.record_status }} but verify exited $verify_status on the same stream"
+            exit 1
+          fi
+
+      - name: Sanity-check the recorded evidence
+        # Asserts the recording contains the categories of evidence an npm install must produce. A
+        # stream that parses but contains nothing would pass `verify` while being useless.
+        run: |
+          set -uo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const lines = fs.readFileSync("artifacts/recording/events.jsonl", "utf8")
+            .split("\n").filter((l) => l.trim() !== "");
+
+          const events = lines.map((l, i) => {
+            try { return JSON.parse(l); }
+            catch (e) { console.log(`::error::line ${i + 1} is not valid JSON`); process.exit(1); }
+          });
+
+          for (const [i, e] of events.entries()) {
+            if (e.schema_version !== 1) {
+              console.log(`::error::line ${i + 1} has schema_version ${e.schema_version}, expected 1`);
+              process.exit(1);
+            }
+          }
+
+          const byOp = {};
+          for (const e of events) byOp[e.op] = (byOp[e.op] ?? 0) + 1;
+          console.log("event counts by op:", JSON.stringify(byOp, null, 2));
+
+          const problems = [];
+          if (events[0]?.op !== "session_start") problems.push("stream does not open with session_start");
+          if (events.at(-1)?.op !== "session_end") problems.push("stream does not close with session_end");
+          if (!byOp.fs_write) problems.push("no fs_write events — an install must write files");
+          if (!byOp.proc_spawn) problems.push("no proc_spawn events — npm spawns at minimum itself");
+          if (!byOp.dns_query && !byOp.net_connect) problems.push("no network evidence at all");
+
+          // Byte accounting is the Phase 0 gap this phase closed; assert it produced real numbers.
+          const bytes = events
+            .filter((e) => e.op === "fs_write" && typeof e.bytes === "number")
+            .reduce((sum, e) => sum + e.bytes, 0);
+          if (bytes <= 0) problems.push("no write byte volumes recorded (the Phase 0 gap is still open)");
+          console.log(`total recorded write bytes: ${bytes}`);
+
+          // Unresolved paths are expected and fine — the recorder refusing to guess a base is the
+          // designed behavior. The real lie would be the opposite: a path claiming a resolved origin
+          // while not being absolute, which would let the rules engine place it in a zone it cannot
+          // actually be placed in and manufacture a critical finding.
+          const overclaimed = events.filter((e) => {
+            const t = e.target;
+            if (!t?.origin) return false;
+            return t.origin !== "unresolved" && !String(t.path ?? "").startsWith("/");
+          });
+          if (overclaimed.length > 0) {
+            console.log(JSON.stringify(overclaimed.slice(0, 5), null, 2));
+            problems.push(`${overclaimed.length} events claim a resolved origin for a non-absolute path`);
+          }
+
+          const origins = {};
+          for (const e of events) if (e.target?.origin) origins[e.target.origin] = (origins[e.target.origin] ?? 0) + 1;
+          console.log("path origins:", JSON.stringify(origins));
+
+          if (problems.length > 0) {
+            for (const p of problems) console.log(`::error title=Weak evidence::${p}`);
+            process.exit(1);
+          }
+          console.log("recorded evidence contains every expected category");
+          NODE
+
+      - name: Step summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "# Phase 1 — recorder E2E"
+            echo ""
+            echo "Package recorded: \`${{ inputs.package || 'lodash' }}\`"
+            echo ""
+            if [ -f artifacts/verify.log ]; then
+              echo "## Verification"
+              echo ""
+              echo '```'
+              cat artifacts/verify.log
+              echo '```'
+            fi
+            if [ -f artifacts/record.log ]; then
+              echo ""
+              echo "## Recorder output"
+              echo ""
+              echo '```'
+              cat artifacts/record.log
+              echo '```'
+            fi
+            echo ""
+            echo "Full event stream is in the \`phase1-e2e\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compress the event stream
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f artifacts/recording/events.jsonl ]; then
+            wc -l artifacts/recording/events.jsonl
+            gzip -9 -c artifacts/recording/events.jsonl > artifacts/events.jsonl.gz
+            rm -f artifacts/recording/events.jsonl
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-e2e
+          path: artifacts
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail if the recording was not usable
+        if: always()
+        run: |
+          set -uo pipefail
+          status="${{ steps.record.outputs.record_status }}"
+          case "$status" in
+            0) echo "recording complete" ;;
+            3)
+              # PARTIAL is a legitimate result to keep, but on a scheduled healthcheck against a
+              # small package it means something regressed.
+              echo "::error title=PARTIAL::the recorder produced an incomplete recording of a simple install"
+              exit 1 ;;
+            *)
+              echo "::error title=Recorder failed::exit status $status"
+              exit 1 ;;
+          esac

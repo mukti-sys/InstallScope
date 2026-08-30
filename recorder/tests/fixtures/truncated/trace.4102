@@ -1,0 +1,3 @@
+1719245678.001600 openat(AT_FDCWD, "/work/project/half-written.txt", O_WRONLY|O_CREAT, 0666) = 3</work/project/half-written.txt>
+1719245678.001610 write(3</work/project/half-written.txt>, "start", 5) = 5
+1719245678.001700 openat(AT_FDCWD, "/work/project/dies-here.txt", O_WRONLY|O_CREAT <unfinished ...>

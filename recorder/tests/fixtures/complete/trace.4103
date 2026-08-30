@@ -1,0 +1,5 @@
+1719245678.002000 openat(AT_FDCWD, "no-cwd-known.txt", O_WRONLY|O_CREAT, 0666) = 3
+1719245678.002010 write(3, "unanchored", 10) = 10
+1719245678.002020 close(3) = 0
+1719245678.002030 mkdir("also-relative", 0777) = 0
+1719245678.002100 +++ exited with 0 +++

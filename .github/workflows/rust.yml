@@ -1,0 +1,113 @@
+name: rust
+
+# Phase 1 product code CI. Cheap and always-on: no sudo, no third-party package installs, no
+# untrusted install scripts. The gate workflows stay workflow_dispatch-only for those reasons; this
+# one runs on every push because Rules.md §6 requires `cargo fmt` + `clippy -D warnings` clean and
+# that is only true if it is checked.
+#
+# Rules.md §2 additionally bans .unwrap()/.expect() in non-test code. The crates deny those lints
+# internally via #![cfg_attr(not(test), deny(...))], so clippy here enforces it rather than a grep.
+
+on:
+  push:
+    paths:
+      - "core/**"
+      - "recorder/**"
+      - "cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - "recorder/**"
+      - "cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # --all-targets so tests are linted too; the golden fixtures are where correctness lives.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      - name: Verify the no-unwrap rule covers non-test code
+        # Belt and braces over the crate-level lints: a future `#[allow]` would silence clippy
+        # locally without anyone noticing. This catches the attribute itself.
+        run: |
+          set -uo pipefail
+          hits="$(grep -rn 'allow(clippy::unwrap_used\|allow(clippy::expect_used' \
+            core/src recorder/src cli/src 2>/dev/null || true)"
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error title=Rules.md §2::unwrap/expect lints must not be allowed in product code"
+            exit 1
+          fi
+          echo "no unwrap/expect allow-attributes in product code"
+
+      - name: Confirm the dependency tree has no LLM, cloud, or telemetry crates
+        # Rules.md §1 bans these outright: "this product's entire moral claim is 'we watch packages,
+        # not people.'" Checked mechanically because a transitive dependency could introduce one
+        # without a visible manifest change.
+        run: |
+          set -uo pipefail
+          cargo tree --workspace --edges normal --prefix none --format '{p}' \
+            | sort -u > /tmp/deps.txt
+          echo "--- resolved dependency set ---"
+          cat /tmp/deps.txt
+          banned='openai|anthropic|langchain|aws-sdk|azure_|google-cloud|sentry|datadog|opentelemetry|posthog|segment|mixpanel|amplitude'
+          if grep -Eiq "^($banned)" /tmp/deps.txt; then
+            grep -Ei "^($banned)" /tmp/deps.txt
+            echo "::error title=Rules.md §1::banned dependency category present in the tree"
+            exit 1
+          fi
+          echo "dependency tree is clean"
+
+  cross-check:
+    name: build the recorder for linux release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      - name: Confirm the binary runs and reports its version
+        run: |
+          set -euo pipefail
+          ./target/release/installscope --version
+          ./target/release/installscope --help

