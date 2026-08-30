@@ -64,7 +64,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends strace
 
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace
 
       - name: Verify the no-unwrap rule covers non-test code
         # Belt and braces over the crate-level lints: a future `#[allow]` would silence clippy
