@@ -106,7 +106,7 @@ jobs:
           # Private HOME and cache so the recording reflects the package, not the runner image's
           # pre-warmed npm state.
           env -i \
-            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            PATH="$PATH" \
             HOME="$work/home" \
             TMPDIR="$work/tmp" \
             npm_config_cache="$work/cache" \
