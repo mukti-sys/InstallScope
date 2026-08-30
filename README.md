@@ -4,6 +4,8 @@
 
 The flight recorder for package installs.
 
+> 🚧 **Status:** Early development (Phase 0/1). Core architecture is being validated — README and full documentation will follow once the recorder pipeline is stable.
+
 ---
 
 ## What is InstallScope?
@@ -30,3 +32,13 @@ Phase 0 validates the core technical assumptions before product code:
 2. **Gate G2 — `strace` Receipts Harness**: Runs candidate npm package installs inside clean ephemeral matrix environments under `strace -f -ff` and extracts structured syscall telemetry.
 
 See `.github/workflows/` and `harness/` for test harness workflows.
+
+---
+
+## License
+
+Dual-licensed under either:
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
