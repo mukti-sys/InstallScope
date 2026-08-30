@@ -11,4 +11,5 @@
 1719245678.001460 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 30<UDP:[52001]>
 1719245678.001470 connect(30<UDP:[52001]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 0
 1719245678.001480 send(30<UDP:[10.1.0.4:52001->127.0.0.53:53]>, "\022\007\001\000\000\001\000\000\000\000\000\000\011resolvers\007example\003net\000\000\001\000\001", 41, MSG_NOSIGNAL) = 41
+1719245678.001490 sendmmsg(30<UDP:[10.1.0.4:52001->127.0.0.53:53]>, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\022\010\001\000\000\001\000\000\000\000\000\000\005batch\007example\003org\000\000\001\000\001", iov_len=37}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=37}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\022\011\001\000\000\001\000\000\000\000\000\000\005batch\007example\003org\000\000\034\000\001", iov_len=37}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=37}], 2, MSG_NOSIGNAL) = 2
 1719245678.001500 +++ exited with 0 +++

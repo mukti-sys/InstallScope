@@ -37,9 +37,10 @@ use crate::{RecorderError, Result, AGENT_VERSION};
 /// - `close`/`dup*`: fd table accuracy;
 /// - `chdir`/`fchdir`: so relative paths resolve instead of being discarded as Unresolved;
 /// - `socket`/`connect`: network destinations, and the peer needed to attribute a later `send`;
-/// - `sendto`/`sendmsg`/`send`: DNS questions. `send` matters most in practice — glibc's resolver
-///   connects its UDP socket and then calls `send`, so omitting it means a recording can show a
-///   connection to port 53 while producing no DNS evidence at all;
+/// - `sendto`/`sendmsg`/`send`/`sendmmsg`: DNS questions. The last two matter most in practice —
+///   glibc's resolver connects its UDP socket and then batches the A and AAAA queries through
+///   `sendmmsg`, so omitting them means a recording can show a connection to port 53 while producing
+///   no DNS evidence at all;
 /// - `execve*`: spawns;
 /// - `clone*`/`fork`/`vfork`: inherit the fd table into children.
 ///
@@ -51,7 +52,7 @@ const TRACE_SET: &str = concat!(
     "chdir,fchdir,",
     "rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,",
     "chmod,fchmodat,chown,lchown,fchownat,link,linkat,symlink,symlinkat,",
-    "socket,connect,sendto,sendmsg,send,",
+    "socket,connect,sendto,sendmsg,send,sendmmsg,",
     "execve,execveat,clone,clone3,fork,vfork"
 );
 
@@ -632,7 +633,8 @@ mod tests {
         // matters most: it is the Phase 0 gap this phase exists to close.
         for required in [
             "openat", "write", "pwrite64", "close", "connect", "sendto", "sendmsg", "send",
-            "socket", "execve", "clone", "chdir", "rename", "symlink", "chmod", "unlink",
+            "sendmmsg", "socket", "execve", "clone", "chdir", "rename", "symlink", "chmod",
+            "unlink",
         ] {
             assert!(
                 TRACE_SET.split(',').any(|s| s == required),

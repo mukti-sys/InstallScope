@@ -421,6 +421,34 @@ fn decodes_dns_questions_sent_on_a_connected_socket() {
 }
 
 #[test]
+fn decodes_every_question_in_a_batched_sendmmsg() {
+    // Run 33297018475 still produced zero DNS events after `send` was handled: glibc actually batches
+    // the A and AAAA lookups for one hostname into a single `sendmmsg`. Reading only the first
+    // iov_base would halve the recorded questions; missing the syscall entirely records none.
+    let (events, _) = parse_fixture("complete");
+    let batched: Vec<&installscope_core::DnsQuery> = dns(&events)
+        .into_iter()
+        .filter(|d| d.qname == "batch.example.org")
+        .collect();
+    assert_eq!(
+        batched.len(),
+        2,
+        "both messages in the batch must be decoded, got {:?}",
+        batched.iter().map(|d| d.qtype).collect::<Vec<_>>()
+    );
+    // A (1) and AAAA (28) — the pair a resolver sends for one name.
+    let mut types: Vec<Option<u16>> = batched.iter().map(|d| d.qtype).collect();
+    types.sort();
+    assert_eq!(types, vec![Some(1), Some(28)]);
+    assert!(
+        batched
+            .iter()
+            .all(|d| d.resolver_ip.as_deref() == Some("127.0.0.53")),
+        "a NULL msg_name must fall back to the connected peer"
+    );
+}
+
+#[test]
 fn preserves_argv_for_spawns() {
     let (events, _) = parse_fixture("complete");
     let all = spawns(&events);

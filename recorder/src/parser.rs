@@ -940,80 +940,74 @@ impl Parser {
                 }
             }
 
-            "sendto" | "sendmsg" | "send" => {
+            "sendto" | "sendmsg" | "send" | "sendmmsg" => {
                 // Only DNS is extracted. Recording every datagram would add noise without adding
                 // findings; the connect event already establishes that traffic occurred.
                 //
-                // Three call shapes reach here. `sendto` and `sendmsg` name their destination inline.
-                // `send` does not — it is only legal on a connected socket — so its destination comes
-                // from the fd table's recorded peer. Real installs take the third path: glibc's
-                // resolver connects its UDP socket and then calls `send`, which is why a recording can
-                // show a connect to :53 and still produce no DNS evidence if only the first two are
-                // handled.
+                // Four call shapes reach here, and real resolvers use the ones that are easiest to
+                // miss. `sendto`/`sendmsg` may name their destination inline. `send` cannot — it is
+                // only legal on a connected socket. `sendmmsg` carries a *batch* of messages, which is
+                // what glibc actually uses: it sends the A and AAAA queries for one hostname in a
+                // single call. A parser handling only the first two sees a connect to port 53 and no
+                // questions at all.
                 let fd = args.first().and_then(|a| fd_number(a));
-                let (destination, payload_arg, truncated) = match name {
-                    "sendto" => {
-                        let inline = args
-                            .get(4)
-                            .and_then(|a| parse_sockaddr(a))
-                            .map(|sa| (sa.ip, sa.port));
-                        // sendto on a connected socket passes NULL for the address.
-                        let dest = inline.or_else(|| {
-                            fd.and_then(|fd| self.fds.socket_peer(pid, fd))
-                                .map(|(ip, port)| (ip.map(ToString::to_string), port))
-                        });
-                        (dest, args.get(1).cloned(), false)
-                    }
-                    "sendmsg" => {
-                        let inline = extract_braced(args_text, "msg_name=")
-                            .and_then(|s| parse_sockaddr(&s))
-                            .map(|sa| (sa.ip, sa.port));
-                        let dest = inline.or_else(|| {
-                            fd.and_then(|f| self.fds.socket_peer(pid, f))
-                                .map(|(ip, port)| (ip.map(ToString::to_string), port))
-                        });
-                        let (iov, iov_truncated) = extract_iov(args_text);
-                        (dest, iov, iov_truncated)
-                    }
-                    // `send(fd, buf, len, flags)` — destination is the connected peer.
-                    _ => {
-                        let dest = fd
-                            .and_then(|f| self.fds.socket_peer(pid, f))
-                            .map(|(ip, port)| (ip.map(ToString::to_string), port));
-                        (dest, args.get(1).cloned(), false)
-                    }
+                let peer = fd
+                    .and_then(|f| self.fds.socket_peer(pid, f))
+                    .map(|(ip, port)| (ip.map(ToString::to_string), port));
+
+                // A batch call needs every payload; the others have exactly one.
+                let payloads: Vec<(Option<String>, bool)> = match name {
+                    "sendmmsg" => extract_all_iov(args_text),
+                    "sendmsg" => vec![extract_iov(args_text)],
+                    _ => vec![(args.get(1).cloned(), false)],
                 };
 
-                let Some((dest_ip, dest_port)) = destination else {
+                let inline_destination = match name {
+                    "sendto" => args
+                        .get(4)
+                        .and_then(|a| parse_sockaddr(a))
+                        .map(|sa| (sa.ip, sa.port)),
+                    "sendmsg" | "sendmmsg" => extract_braced(args_text, "msg_name=")
+                        .and_then(|s| parse_sockaddr(&s))
+                        .map(|sa| (sa.ip, sa.port)),
+                    _ => None,
+                };
+
+                // NULL msg_name / NULL sendto address is legal on a connected socket, so fall back to
+                // the peer recorded when that descriptor was connected.
+                let Some((dest_ip, dest_port)) = inline_destination.or(peer) else {
                     return out;
                 };
                 if dest_port != Some(53) {
                     return out;
                 }
-                let Some(payload_arg) = payload_arg else {
-                    return out;
-                };
-                let Some(quoted) = read_quoted(&payload_arg, 0) else {
-                    return out;
-                };
-                let cut = truncated || quoted.truncated;
-                match parse_dns_question(&quoted.bytes) {
-                    Some(question) if !cut || question.qtype.is_some() => {
-                        self.emit(
-                            Event::observed(
-                                Self::meta(ts_ns, pid, name),
-                                Payload::DnsQuery(DnsQuery {
-                                    qname: question.qname,
-                                    qtype: question.qtype,
-                                    resolver_ip: dest_ip,
-                                    outcome,
-                                }),
-                            ),
-                            &mut out,
-                        );
-                    }
-                    _ => {
-                        self.stats.dns_undecodable += 1;
+
+                for (payload_arg, truncated) in payloads {
+                    let Some(payload_arg) = payload_arg else {
+                        continue;
+                    };
+                    let Some(quoted) = read_quoted(&payload_arg, 0) else {
+                        continue;
+                    };
+                    let cut = truncated || quoted.truncated;
+                    match parse_dns_question(&quoted.bytes) {
+                        Some(question) if !cut || question.qtype.is_some() => {
+                            self.emit(
+                                Event::observed(
+                                    Self::meta(ts_ns, pid, name),
+                                    Payload::DnsQuery(DnsQuery {
+                                        qname: question.qname,
+                                        qtype: question.qtype,
+                                        resolver_ip: dest_ip.clone(),
+                                        outcome: outcome.clone(),
+                                    }),
+                                ),
+                                &mut out,
+                            );
+                        }
+                        _ => {
+                            self.stats.dns_undecodable += 1;
+                        }
                     }
                 }
             }
@@ -1203,4 +1197,32 @@ fn extract_iov(text: &str) -> (Option<String>, bool) {
         }
         None => (None, true),
     }
+}
+
+/// Extracts every `iov_base="…"` payload from a rendering.
+///
+/// `sendmmsg` carries a batch of messages, and glibc uses it to send the A and AAAA queries for one
+/// hostname in a single call. Reading only the first would silently halve the recorded questions.
+fn extract_all_iov(text: &str) -> Vec<(Option<String>, bool)> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(idx) = text.get(cursor..).and_then(|s| s.find("iov_base=")) {
+        let start = cursor + idx + "iov_base=".len();
+        let Some(rest) = text.get(start..) else {
+            break;
+        };
+        let Some(q) = read_quoted(rest, 0) else {
+            // An unterminated quote means strace cut the line; record that the payload is unusable
+            // rather than looping on the same offset.
+            out.push((None, true));
+            break;
+        };
+        out.push((rest.get(..q.end).map(ToString::to_string), q.truncated));
+        cursor = start + q.end;
+        // A malformed rendering must not spin forever.
+        if cursor <= start {
+            break;
+        }
+    }
+    out
 }
