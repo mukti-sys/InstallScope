@@ -105,6 +105,7 @@ jobs:
 
           # Private HOME and cache so the recording reflects the package, not the runner image's
           # pre-warmed npm state.
+          set +e
           HOME="$work/home" \
           TMPDIR="$work/tmp" \
           npm_config_cache="$work/cache" \
@@ -116,10 +117,15 @@ jobs:
             --cache "$work/cache" \
             --timeout 300 \
             -- npm install "$PACKAGE" --no-audit --no-fund --foreground-scripts --loglevel=error \
-            2>&1 | tee artifacts/record.log || true
-          status="${PIPESTATUS[0]}"
+            > artifacts/record.log 2>&1
+          status=$?
+          set -e
+          cat artifacts/record.log
           echo "record_status=$status" >> "$GITHUB_OUTPUT"
-          exit 0
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            echo "::error title=Record failed::installscope record returned hard failure ($status)"
+            exit "$status"
+          fi
 
       - name: Verify the artifact independently
         # The recorder's own exit code is not taken on trust. `verify` re-reads the stream, which is
@@ -131,17 +137,19 @@ jobs:
             echo "::error title=No recording::events.jsonl was never written"
             exit 1
           fi
-          ./target/release/installscope verify artifacts/recording/events.jsonl \
-            2>&1 | tee artifacts/verify.log
-          verify_status="${PIPESTATUS[0]}"
+          set +e
+          ./target/release/installscope verify artifacts/recording/events.jsonl > artifacts/verify.log 2>&1
+          verify_status=$?
+          set -e
+          cat artifacts/verify.log
 
           case "$verify_status" in
             0) echo "recording is complete" ;;
             3) echo "::warning title=PARTIAL recording::the recording is incomplete; see verify.log for the reason" ;;
-            *) echo "::error title=Unreadable recording::verify could not read the stream"; exit 1 ;;
+            *) echo "::error title=Unreadable recording::verify could not read the stream (exit $verify_status)"; exit 1 ;;
           esac
 
-          if [ "$verify_status" != "${{ steps.record.outputs.record_status }}" ]; then
+          if [ "$verify_status" -ne "${{ steps.record.outputs.record_status }}" ]; then
             echo "::error title=Disagreement::record exited ${{ steps.record.outputs.record_status }} but verify exited $verify_status on the same stream"
             exit 1
           fi
