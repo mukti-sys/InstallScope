@@ -1,4 +1,5 @@
 # InstallScope
+[![G2 — strace receipts harness](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml/badge.svg)](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml)
 > Attestations verify *who signed* it. InstallScope records *what it did*.
 
 The flight recorder for package installs.
