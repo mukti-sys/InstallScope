@@ -50,14 +50,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         # --all-targets so tests are linted too; the golden fixtures are where correctness lives.
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace
 
       - name: cargo test
         run: cargo test --workspace --all-targets
