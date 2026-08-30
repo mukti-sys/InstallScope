@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn formats_rfc3339_from_epoch() {
         let epoch = UNIX_EPOCH + Duration::from_secs(1_719_245_678);
-        assert_eq!(rfc3339_utc(epoch), "2024-06-24T15:34:38Z");
+        assert_eq!(rfc3339_utc(epoch), "2024-06-24T16:14:38Z");
         assert_eq!(rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
     }
 
