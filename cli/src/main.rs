@@ -174,8 +174,8 @@ fn run_record(args: &RecordArgs) -> Result<ExitCode> {
     let project = args.project.clone().unwrap_or_else(|| cwd.clone());
 
     let mut zones = Zones {
-        project: path_to_string(&project),
-        cache: args.cache.as_deref().and_then(path_to_string),
+        project: absolute_zone(&project),
+        cache: args.cache.as_deref().and_then(absolute_zone),
         home: std::env::var("HOME").ok(),
         tmp: std::env::var("TMPDIR")
             .ok()
@@ -183,7 +183,7 @@ fn run_record(args: &RecordArgs) -> Result<ExitCode> {
         extra: args
             .expect
             .iter()
-            .filter_map(|p| path_to_string(p))
+            .filter_map(|p| absolute_zone(p))
             .collect(),
     };
     // An unset cache would make every cache write look like it landed somewhere unexpected. npm's
@@ -321,6 +321,26 @@ fn print_recording_report(
 #[cfg(target_os = "linux")]
 fn path_to_string(path: &std::path::Path) -> Option<String> {
     path.to_str().map(ToString::to_string)
+}
+
+/// Resolves a zone path to an absolute, symlink-free form.
+///
+/// Zones are compared against paths the kernel reports, which are always absolute and already have
+/// symlinks resolved. A relative `--project .` or a path through a symlink would therefore never
+/// match, and every write would look like it landed somewhere unexpected — turning a normal install
+/// into a page of critical findings. Falls back to lexical absolutization when the directory does not
+/// exist yet, which is honest: an approximate zone is better than none, and the failure mode is a
+/// missed match rather than a false one.
+#[cfg(target_os = "linux")]
+fn absolute_zone(path: &std::path::Path) -> Option<String> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return path_to_string(&canonical);
+    }
+    if path.is_absolute() {
+        return path_to_string(path);
+    }
+    let cwd = std::env::current_dir().ok()?;
+    path_to_string(&cwd.join(path))
 }
 
 #[cfg(test)]

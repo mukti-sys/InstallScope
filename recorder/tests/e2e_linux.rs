@@ -49,7 +49,7 @@ fn read_events(recording: &Recording) -> Vec<installscope_core::Event> {
 
 /// Builds a config that records `command` with `out` as both the working directory and the project
 /// zone, so writes land inside a zone the rules engine would consider expected.
-fn config_for(_name: &str, command: &[&str], out: &Path) -> RecordConfig {
+fn config_for(command: &[&str], out: &Path) -> RecordConfig {
     let mut config = RecordConfig::new(
         command.iter().map(|s| (*s).to_string()).collect(),
         out.join("recording"),
@@ -91,7 +91,7 @@ fn a_simple_command_records_cleanly() {
         return;
     }
     let dir = scratch("simple");
-    let config = config_for("simple", &["/bin/sh", "-c", "echo hello > out.txt"], &dir);
+    let config = config_for(&["/bin/sh", "-c", "echo hello > out.txt"], &dir);
 
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
 
@@ -132,7 +132,6 @@ fn byte_volumes_are_recorded_for_real_writes() {
     }
     let dir = scratch("bytes");
     let config = config_for(
-        "bytes",
         &[
             "/bin/sh",
             "-c",
@@ -183,7 +182,6 @@ fn records_a_real_npm_install_end_to_end() {
     .unwrap_or_else(|e| panic!("seeding package.json: {e}"));
 
     let mut config = config_for(
-        "npm",
         &[
             "npm",
             "install",
@@ -278,6 +276,111 @@ fn records_a_real_npm_install_end_to_end() {
     );
 }
 
+#[test]
+#[ignore = "needs Linux with strace installed"]
+fn a_relative_output_directory_still_records() {
+    // Regression test for a real CI failure (run 33294557064). strace is spawned with
+    // `current_dir(config.cwd)`, so a relative `-o` path was resolved against the *install's*
+    // directory instead of ours. strace failed with "Can't fopen", wrote no trace files, and the
+    // recording came back PARTIAL for a reason that had nothing to do with the package — the worst
+    // kind of false signal, since it looks like a finding about the install.
+    if !require("strace") {
+        return;
+    }
+    let dir = scratch("relative-out");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap_or_else(|e| panic!("mkdir: {e}"));
+
+    // out_dir is relative; cwd is a different directory entirely.
+    let mut config = RecordConfig::new(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo hi > touched.txt".to_string(),
+        ],
+        PathBuf::from("relative-recording"),
+    );
+    config.cwd = Some(elsewhere.clone());
+    config.zones = Zones {
+        project: elsewhere.to_str().map(ToString::to_string),
+        ..Zones::default()
+    };
+
+    // Run from `dir` so the relative out_dir resolves under it, not under `elsewhere`.
+    let previous = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+    std::env::set_current_dir(&dir).unwrap_or_else(|e| panic!("chdir: {e}"));
+    let result = strace::record(&config);
+    std::env::set_current_dir(previous).unwrap_or_else(|e| panic!("chdir back: {e}"));
+
+    let recording = result.unwrap_or_else(|e| panic!("recording failed: {e}"));
+    assert!(
+        !recording.is_partial(),
+        "a relative --out must not break the recording; got {:?}",
+        recording.session_end.incomplete_reasons
+    );
+    assert!(
+        recording.session_end.events_emitted > 0,
+        "the recording must contain events, not just a terminated stream"
+    );
+    assert!(
+        recording.events_path.is_absolute(),
+        "the reported stream path must be absolute so callers can find it regardless of cwd"
+    );
+}
+
+#[test]
+#[ignore = "needs Linux with strace installed"]
+fn the_recorders_own_output_directory_is_an_expected_zone() {
+    // The traced command's stdout and stderr are files inside out_dir, so npm's own chatter shows up
+    // as writes there. If out_dir were not declared a zone, `installscope record --out /tmp/x` run
+    // against a project elsewhere would produce a critical "wrote outside expected dirs" finding
+    // caused entirely by the recorder's plumbing — blaming the package for the observer.
+    if !require("strace") {
+        return;
+    }
+    let dir = scratch("outdir-zone");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap_or_else(|e| panic!("mkdir: {e}"));
+
+    let mut config = RecordConfig::new(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo chatter; echo more".to_string(),
+        ],
+        dir.join("separate-out"),
+    );
+    config.cwd = Some(project.clone());
+    config.zones = Zones {
+        project: project.to_str().map(ToString::to_string),
+        ..Zones::default()
+    };
+
+    let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
+
+    let contents = std::fs::read_to_string(&recording.events_path)
+        .unwrap_or_else(|e| panic!("reading the stream: {e}"));
+    let start = contents
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("empty stream"));
+    let event: installscope_core::Event =
+        installscope_core::Event::from_jsonl(start, 1).unwrap_or_else(|e| panic!("{e}"));
+
+    match event.payload {
+        Payload::SessionStart(s) => {
+            let out = dir.join("separate-out");
+            let out = out.to_str().unwrap_or_default();
+            assert!(
+                s.zones.extra.iter().any(|z| z == out),
+                "out_dir must be declared an expected zone; zones were {:?}",
+                s.zones
+            );
+        }
+        other => panic!("first event must be session_start, got {}", other.op()),
+    }
+}
+
 // =============================================================================================
 // crash → PARTIAL
 // =============================================================================================
@@ -289,7 +392,7 @@ fn a_timeout_records_as_partial_with_a_timeout_reason() {
         return;
     }
     let dir = scratch("timeout");
-    let mut config = config_for("timeout", &["/bin/sh", "-c", "sleep 30"], &dir);
+    let mut config = config_for(&["/bin/sh", "-c", "sleep 30"], &dir);
     config.timeout = Some(Duration::from_secs(2));
 
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
@@ -327,11 +430,7 @@ fn a_command_killed_by_a_signal_still_terminates_the_stream() {
         return;
     }
     let dir = scratch("signal");
-    let config = config_for(
-        "signal",
-        &["/bin/sh", "-c", "echo pre > pre.txt; kill -9 $$"],
-        &dir,
-    );
+    let config = config_for(&["/bin/sh", "-c", "echo pre > pre.txt; kill -9 $$"], &dir);
 
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
 
@@ -365,11 +464,7 @@ fn a_nonexistent_command_is_reported_rather_than_silently_empty() {
         return;
     }
     let dir = scratch("missing");
-    let config = config_for(
-        "missing",
-        &["/nonexistent/definitely-not-a-real-binary"],
-        &dir,
-    );
+    let config = config_for(&["/nonexistent/definitely-not-a-real-binary"], &dir);
 
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
 
@@ -399,7 +494,6 @@ fn the_event_cap_forces_partial() {
     }
     let dir = scratch("cap");
     let mut config = config_for(
-        "cap",
         &[
             "/bin/sh",
             "-c",
@@ -433,7 +527,7 @@ fn raw_traces_are_removed_unless_requested() {
         return;
     }
     let dir = scratch("raw");
-    let config = config_for("raw", &["/bin/sh", "-c", "true"], &dir);
+    let config = config_for(&["/bin/sh", "-c", "true"], &dir);
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
     let trace_dir = recording
         .events_path
@@ -446,7 +540,7 @@ fn raw_traces_are_removed_unless_requested() {
     );
 
     let dir2 = scratch("raw-kept");
-    let mut keep = config_for("raw-kept", &["/bin/sh", "-c", "true"], &dir2);
+    let mut keep = config_for(&["/bin/sh", "-c", "true"], &dir2);
     keep.keep_raw_traces = true;
     let kept = strace::record(&keep).unwrap_or_else(|e| panic!("recording failed: {e}"));
     let kept_dir = kept

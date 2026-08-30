@@ -136,6 +136,52 @@ fn parses_the_fixture_without_errors() {
 }
 
 #[test]
+fn strace_diagnostics_are_not_parse_errors() {
+    // The bug this guards against would have forced PARTIAL on every real recording. `-f` prints
+    // "strace: Process N attached" for every child, and npm always spawns children, so counting those
+    // as parse errors would mean no install could ever record as complete — making the PARTIAL badge
+    // meaningless precisely when it needs to be trustworthy.
+    let (_, stats) = parse_fixture("complete");
+    assert!(
+        stats.diagnostics >= 3,
+        "the fixture's attach lines must be recognized as diagnostics; {stats:?}"
+    );
+    assert_eq!(
+        stats.parse_errors, 0,
+        "diagnostics must not be counted as errors; {stats:?}"
+    );
+    assert_eq!(
+        stats.diagnostic_data_loss, 0,
+        "an attach notice is routine, not data loss; {stats:?}"
+    );
+}
+
+#[test]
+fn diagnostics_reporting_data_loss_are_distinguished_from_chatter() {
+    // Not every diagnostic is noise. strace detaching mid-recording, or failing to allocate, means the
+    // stream is genuinely missing events — and the strace backend turns this counter into an
+    // IncompleteReason so the report shows PARTIAL.
+    let mut parser = Parser::new(FIXTURE_START_EPOCH);
+
+    parser.feed_line("strace: Process 999 attached", 1);
+    assert_eq!(parser.stats().diagnostic_data_loss, 0);
+
+    parser.feed_line("strace: Out of memory", 1);
+    parser.feed_line("strace: detaching from 999", 1);
+    assert_eq!(
+        parser.stats().diagnostic_data_loss,
+        2,
+        "data-loss diagnostics must be counted separately; {:?}",
+        parser.stats()
+    );
+    assert_eq!(
+        parser.stats().parse_errors,
+        0,
+        "these are still diagnostics, not malformed lines"
+    );
+}
+
+#[test]
 fn timestamps_are_session_relative_and_ordered_within_a_process() {
     let (events, _) = parse_fixture("complete");
     // Epoch nanoseconds would exceed JSON's safe integer range, which is why the schema is relative.

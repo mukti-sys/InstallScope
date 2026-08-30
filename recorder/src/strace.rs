@@ -246,17 +246,54 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
 
     fs::create_dir_all(&config.out_dir)
         .map_err(|source| RecorderError::io(&config.out_dir, source))?;
-    let trace_dir = config.out_dir.join("trace");
+
+    // Everything below uses an ABSOLUTE output directory.
+    //
+    // strace is spawned with `current_dir(config.cwd)`, so a relative `-o` path would be resolved
+    // against the *install's* directory rather than ours — strace would fail with "Can't fopen", write
+    // no trace files, and the recording would come back PARTIAL for a reason that has nothing to do
+    // with the package. Resolving once here fixes the trace prefix, the event stream, the command log
+    // paths, and the zone comparison in one place.
+    let out_dir = fs::canonicalize(&config.out_dir)
+        .map_err(|source| RecorderError::io(&config.out_dir, source))?;
+
+    let trace_dir = out_dir.join("trace");
     // A stale trace directory would mix a previous recording's events into this one.
     if trace_dir.exists() {
         fs::remove_dir_all(&trace_dir).map_err(|source| RecorderError::io(&trace_dir, source))?;
     }
     fs::create_dir_all(&trace_dir).map_err(|source| RecorderError::io(&trace_dir, source))?;
 
-    let events_path = config.out_dir.join("events.jsonl");
+    let events_path = out_dir.join("events.jsonl");
     let events_file =
         fs::File::create(&events_path).map_err(|source| RecorderError::io(&events_path, source))?;
     let events_writer = std::io::BufWriter::new(events_file);
+
+    // The recorder's own output directory is an expected write location, and it must be declared as
+    // one.
+    //
+    // The traced command inherits stdout and stderr pointing at files inside `out_dir`, so every line
+    // npm prints becomes an observed write to that directory. Without this, a first-time user running
+    // `installscope record --out ./somewhere` outside their project would get a critical
+    // "wrote outside expected dirs" finding caused entirely by the recorder's own plumbing. Blaming
+    // the package for the observer's behavior is exactly the kind of false positive PRD.md:43 calls
+    // the religion to avoid.
+    let mut zones = config.zones.clone();
+    if let Some(out) = out_dir.to_str() {
+        let already_covered = [
+            zones.project.as_deref(),
+            zones.cache.as_deref(),
+            zones.home.as_deref(),
+            zones.tmp.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(zones.extra.iter().map(String::as_str))
+        .any(|zone| out == zone || out.starts_with(&format!("{}/", zone.trim_end_matches('/'))));
+        if !already_covered {
+            zones.extra.push(out.to_string());
+        }
+    }
 
     let start_time = SystemTime::now();
     let start_epoch = epoch_secs_f64(start_time);
@@ -267,7 +304,7 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         AGENT_VERSION,
         Backend::Strace,
         config.command.clone(),
-        config.zones.clone(),
+        zones,
         Some(host_info(&strace_version)),
     )?;
 
@@ -302,8 +339,8 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     // until the timeout and be reported as PARTIAL. Files cannot deadlock, and they keep the install's
     // own narration available next to the evidence — useful when a human is reconciling a finding
     // against what npm claimed it was doing.
-    let stdout_path = config.out_dir.join("command-stdout.log");
-    let stderr_path = config.out_dir.join("command-stderr.log");
+    let stdout_path = out_dir.join("command-stdout.log");
+    let stderr_path = out_dir.join("command-stderr.log");
     let stdout_file =
         fs::File::create(&stdout_path).map_err(|source| RecorderError::io(&stdout_path, source))?;
     let stderr_file =
@@ -456,6 +493,16 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     if stats.parse_errors > 0 {
         reasons.push(IncompleteReason::ParseErrors {
             count: stats.parse_errors,
+        });
+    }
+    if stats.diagnostic_data_loss > 0 {
+        // strace said it lost data. Distinct from a parse error: the trace file is well-formed, it is
+        // just missing events we know about.
+        reasons.push(IncompleteReason::TraceTruncated {
+            detail: format!(
+                "strace reported losing data {} time(s)",
+                stats.diagnostic_data_loss
+            ),
         });
     }
     if stats.unmatched_unfinished > 0 {

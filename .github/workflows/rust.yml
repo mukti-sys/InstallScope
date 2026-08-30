@@ -32,7 +32,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 concurrency:
   group: rust-${{ github.ref }}
@@ -50,21 +49,25 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Restores ~/.cargo and target/. Without it every push rebuilds the whole dependency tree,
+      # which is most of the job's runtime.
+      - uses: Swatinem/rust-cache@v2
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         # --all-targets so tests are linted too; the golden fixtures are where correctness lives.
+        #
+        # `-D warnings` is passed to clippy rather than set as a global RUSTFLAGS env var on purpose:
+        # RUSTFLAGS applies to dependency compilation as well, so a warning in any upstream crate
+        # would fail this build for reasons unrelated to our code.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Install strace
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends strace
-
       - name: cargo test
-        run: cargo test --workspace
+        # No strace needed. Every test that touches a real process is both #[ignore]d and
+        # #![cfg(target_os = "linux")]; those run in phase1-e2e.yml, which installs strace.
+        run: cargo test --workspace --all-targets
 
       - name: Verify the no-unwrap rule covers non-test code
         # Belt and braces over the crate-level lints: a future `#[allow]` would silence clippy

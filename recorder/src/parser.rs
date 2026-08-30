@@ -53,8 +53,61 @@ pub struct ParseStats {
     pub exits: u64,
     /// DNS payloads that could not be decoded without guessing. Counted, never guessed at.
     pub dns_undecodable: u64,
+    /// strace's own diagnostic lines (`strace: Process N attached`, and similar). Not syscalls and
+    /// not errors; counted so the total accounts for every line read.
+    pub diagnostics: u64,
+    /// Diagnostics that specifically report strace losing data. Unlike ordinary chatter these do
+    /// force PARTIAL, because the stream is then genuinely missing events.
+    pub diagnostic_data_loss: u64,
     /// Events produced.
     pub events_emitted: u64,
+}
+
+/// True for strace's own commentary rather than a traced syscall.
+///
+/// These are unavoidable in real output: `-f` announces every process it attaches to, so any install
+/// that spawns a child produces them. The list is matched conservatively — an unrecognized line still
+/// counts as a parse error, because quietly accepting anything would hide a genuine format change.
+fn is_strace_diagnostic(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    // strace's own messages are prefixed with the program name.
+    if trimmed.starts_with("strace:") {
+        return true;
+    }
+    // Older builds emit these without the prefix.
+    if trimmed.starts_with("Process ")
+        && (trimmed.contains(" attached") || trimmed.contains(" detached"))
+    {
+        return true;
+    }
+    // `<pid> +++ killed by SIGKILL +++` is handled by the +++ path; this covers the bare form some
+    // builds print when the tracee is killed before any syscall is recorded.
+    if trimmed.starts_with("killed by SIG") {
+        return true;
+    }
+    false
+}
+
+/// True when a diagnostic reports lost trace data rather than routine bookkeeping.
+///
+/// The distinction matters: `Process 123 attached` is noise, but `... detached` mid-recording or an
+/// out-of-memory message means the stream is incomplete, and a recording that lost events must never
+/// render as clean (`Rules.md` §2).
+fn diagnostic_indicates_data_loss(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "detaching",
+        "out of memory",
+        "cannot allocate",
+        "could not write",
+        "write error",
+        "umovestr",
+        "invalid",
+        "unavailable",
+        "lost",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Paths whose *reads* are worth recording.
@@ -231,6 +284,22 @@ impl Parser {
             return Vec::new();
         }
 
+        // strace's own diagnostics, not syscalls. Recognized explicitly and counted separately,
+        // because treating them as parse errors would force PARTIAL on essentially every real
+        // recording: `strace: Process N attached` appears whenever an install spawns a child, which
+        // every npm install does. A recorder that cried wolf on all valid output would make the
+        // PARTIAL badge meaningless, which is worse than not having one.
+        if is_strace_diagnostic(line) {
+            self.stats.diagnostics += 1;
+            // A few diagnostics are not merely noise: they say strace lost data. Those must reach
+            // the PARTIAL decision rather than being filed as chatter.
+            if diagnostic_indicates_data_loss(line) {
+                self.stats.diagnostic_data_loss += 1;
+                tracing::warn!(line, "strace reported losing trace data");
+            }
+            return Vec::new();
+        }
+
         let (pid, ts_and_rest) = split_pid_prefix(line, default_pid);
         let Some((ts, rest)) = split_timestamp(ts_and_rest) else {
             // Lines without a timestamp are exit/signal notices in some strace builds.
@@ -241,6 +310,7 @@ impl Parser {
                 self.stats.signals += 1;
             } else {
                 self.stats.parse_errors += 1;
+                tracing::debug!(line, "unparseable trace line");
             }
             return Vec::new();
         };
