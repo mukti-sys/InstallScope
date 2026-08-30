@@ -257,6 +257,29 @@ fn records_a_real_npm_install_end_to_end() {
         "fetching from the registry must produce DNS or connect evidence"
     );
 
+    // DNS specifically. Asserted separately because a connect alone gives only an IP, and a report
+    // that can say "resolved telemetry.example.com" is worth far more than one that says "connected to
+    // 104.16.2.34". Run 33296408610 showed a connect to 127.0.0.53:53 with zero DNS events, which is
+    // how the missing `send` handling was found; this guards the regression.
+    let dns_names: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            Payload::DnsQuery(d) => Some(d.qname.as_str()),
+            _ => None,
+        })
+        .collect();
+    eprintln!("resolved names: {dns_names:?}");
+    assert!(
+        !dns_names.is_empty(),
+        "an install that fetches from the registry must produce at least one dns_query; \
+         a connect to port 53 without a decoded question means the resolver's syscall shape is \
+         unhandled"
+    );
+    assert!(
+        dns_names.iter().any(|n| n.contains("npmjs")),
+        "the registry hostname must be among the resolved names, got {dns_names:?}"
+    );
+
     // Byte volumes must be present for at least one written file.
     let has_bytes = events.iter().any(|e| match &e.payload {
         Payload::FsWrite(w) => w.kind == WriteKind::Write && w.bytes.unwrap_or(0) > 0,

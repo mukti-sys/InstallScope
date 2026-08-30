@@ -402,6 +402,25 @@ fn decodes_dns_questions_from_sendto() {
 }
 
 #[test]
+fn decodes_dns_questions_sent_on_a_connected_socket() {
+    // Regression test for a real gap found in run 33296408610: the recording showed a connect to
+    // 127.0.0.53:53 and zero dns_query events. glibc's resolver connects its UDP socket to the
+    // nameserver and then calls `send`, which carries no destination address — so a parser that only
+    // reads `sendto`/`sendmsg` destinations sees an anonymous datagram and discards it. The peer must
+    // come from the fd table instead.
+    let (events, _) = parse_fixture("complete");
+    let query = dns(&events)
+        .into_iter()
+        .find(|d| d.qname == "resolvers.example.net")
+        .expect("a DNS question sent via send() on a connected socket");
+    assert_eq!(
+        query.resolver_ip.as_deref(),
+        Some("127.0.0.53"),
+        "the resolver address must come from the connect recorded against that descriptor"
+    );
+}
+
+#[test]
 fn preserves_argv_for_spawns() {
     let (events, _) = parse_fixture("complete");
     let all = spawns(&events);
@@ -483,8 +502,10 @@ fn a_truncated_dns_payload_produces_no_event() {
     let (events, stats) = parse_fixture("complete");
     let names: Vec<&str> = dns(&events).iter().map(|d| d.qname.as_str()).collect();
     assert!(
-        !names.iter().any(|n| *n != "registry.npmjs.org"),
-        "only the fully decodable question may appear, got {names:?}"
+        !names
+            .iter()
+            .any(|n| n.starts_with("registry.npm") && *n != "registry.npmjs.org"),
+        "a partially decoded name must never appear, got {names:?}"
     );
     assert!(
         stats.dns_undecodable >= 1,

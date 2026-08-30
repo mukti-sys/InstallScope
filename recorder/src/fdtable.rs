@@ -27,6 +27,14 @@ pub enum FdTarget {
     Socket {
         /// strace's rendering of the socket arguments, for evidence display.
         description: String,
+        /// Peer address recorded at `connect`, when it succeeded.
+        ///
+        /// This is what makes `send` on a *connected* socket attributable. glibc's resolver connects
+        /// its UDP socket to the nameserver and then sends without repeating the address, so without
+        /// the peer here a DNS query would be an anonymous write to an unknown destination.
+        peer_ip: Option<String>,
+        /// Peer port recorded at `connect`.
+        peer_port: Option<u16>,
     },
 }
 
@@ -70,8 +78,50 @@ impl FdTable {
             fd,
             FdTarget::Socket {
                 description: description.into(),
+                peer_ip: None,
+                peer_port: None,
             },
         );
+    }
+
+    /// Records the peer a socket was connected to.
+    ///
+    /// Creates the entry if the `socket` call itself was not observed, which happens whenever a
+    /// descriptor was inherited or the trace begins mid-process.
+    pub fn set_socket_peer(&mut self, pid: u32, fd: i32, ip: Option<String>, port: Option<u16>) {
+        if fd < 0 {
+            return;
+        }
+        let entry = self.per_pid.entry(pid).or_default();
+        match entry.get_mut(&fd) {
+            Some(FdTarget::Socket {
+                peer_ip, peer_port, ..
+            }) => {
+                *peer_ip = ip;
+                *peer_port = port;
+            }
+            _ => {
+                entry.insert(
+                    fd,
+                    FdTarget::Socket {
+                        description: String::new(),
+                        peer_ip: ip,
+                        peer_port: port,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The peer address a socket descriptor is connected to, if known.
+    #[must_use]
+    pub fn socket_peer(&self, pid: u32, fd: i32) -> Option<(Option<&str>, Option<u16>)> {
+        match self.get(pid, fd)? {
+            FdTarget::Socket {
+                peer_ip, peer_port, ..
+            } => Some((peer_ip.as_deref(), *peer_port)),
+            FdTarget::File { .. } => None,
+        }
     }
 
     /// Forgets `fd` for `pid`.

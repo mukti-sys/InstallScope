@@ -606,8 +606,15 @@ impl Parser {
                             Some(FdTarget::File { path, origin }) => {
                                 self.fds.open_file(pid, new, path, origin);
                             }
-                            Some(FdTarget::Socket { description }) => {
+                            Some(FdTarget::Socket {
+                                description,
+                                peer_ip,
+                                peer_port,
+                            }) => {
                                 self.fds.open_socket(pid, new, description);
+                                if peer_ip.is_some() || peer_port.is_some() {
+                                    self.fds.set_socket_peer(pid, new, peer_ip, peer_port);
+                                }
                             }
                             None => {}
                         }
@@ -876,6 +883,14 @@ impl Parser {
                 let Some(sa) = args.get(1).and_then(|a| parse_sockaddr(a)) else {
                     return out;
                 };
+                // Remember the peer regardless of family. glibc's resolver connects its UDP socket to
+                // the nameserver and then uses `send`, which carries no address — so without this the
+                // DNS query would be an anonymous datagram to nowhere.
+                if let Some(fd) = args.first().and_then(|a| fd_number(a)) {
+                    if ret.ok == Some(true) {
+                        self.fds.set_socket_peer(pid, fd, sa.ip.clone(), sa.port);
+                    }
+                }
                 match sa.family {
                     SockFamily::Unix => {
                         self.emit(
@@ -925,24 +940,54 @@ impl Parser {
                 }
             }
 
-            "sendto" | "sendmsg" => {
+            "sendto" | "sendmsg" | "send" => {
                 // Only DNS is extracted. Recording every datagram would add noise without adding
                 // findings; the connect event already establishes that traffic occurred.
-                let (sockaddr_text, payload_arg, truncated) = if name == "sendto" {
-                    (
-                        args.get(4).cloned().unwrap_or_default(),
-                        args.get(1).cloned(),
-                        false,
-                    )
-                } else {
-                    let name_field = extract_braced(args_text, "msg_name=").unwrap_or_default();
-                    let (iov, iov_truncated) = extract_iov(args_text);
-                    (name_field, iov, iov_truncated)
+                //
+                // Three call shapes reach here. `sendto` and `sendmsg` name their destination inline.
+                // `send` does not — it is only legal on a connected socket — so its destination comes
+                // from the fd table's recorded peer. Real installs take the third path: glibc's
+                // resolver connects its UDP socket and then calls `send`, which is why a recording can
+                // show a connect to :53 and still produce no DNS evidence if only the first two are
+                // handled.
+                let fd = args.first().and_then(|a| fd_number(a));
+                let (destination, payload_arg, truncated) = match name {
+                    "sendto" => {
+                        let inline = args
+                            .get(4)
+                            .and_then(|a| parse_sockaddr(a))
+                            .map(|sa| (sa.ip, sa.port));
+                        // sendto on a connected socket passes NULL for the address.
+                        let dest = inline.or_else(|| {
+                            fd.and_then(|fd| self.fds.socket_peer(pid, fd))
+                                .map(|(ip, port)| (ip.map(ToString::to_string), port))
+                        });
+                        (dest, args.get(1).cloned(), false)
+                    }
+                    "sendmsg" => {
+                        let inline = extract_braced(args_text, "msg_name=")
+                            .and_then(|s| parse_sockaddr(&s))
+                            .map(|sa| (sa.ip, sa.port));
+                        let dest = inline.or_else(|| {
+                            fd.and_then(|f| self.fds.socket_peer(pid, f))
+                                .map(|(ip, port)| (ip.map(ToString::to_string), port))
+                        });
+                        let (iov, iov_truncated) = extract_iov(args_text);
+                        (dest, iov, iov_truncated)
+                    }
+                    // `send(fd, buf, len, flags)` — destination is the connected peer.
+                    _ => {
+                        let dest = fd
+                            .and_then(|f| self.fds.socket_peer(pid, f))
+                            .map(|(ip, port)| (ip.map(ToString::to_string), port));
+                        (dest, args.get(1).cloned(), false)
+                    }
                 };
-                let Some(sa) = parse_sockaddr(&sockaddr_text) else {
+
+                let Some((dest_ip, dest_port)) = destination else {
                     return out;
                 };
-                if sa.port != Some(53) {
+                if dest_port != Some(53) {
                     return out;
                 }
                 let Some(payload_arg) = payload_arg else {
@@ -960,7 +1005,7 @@ impl Parser {
                                 Payload::DnsQuery(DnsQuery {
                                     qname: question.qname,
                                     qtype: question.qtype,
-                                    resolver_ip: sa.ip,
+                                    resolver_ip: dest_ip,
                                     outcome,
                                 }),
                             ),

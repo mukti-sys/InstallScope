@@ -187,6 +187,17 @@ jobs:
           if (!byOp.proc_spawn) problems.push("no proc_spawn events — npm spawns at minimum itself");
           if (!byOp.dns_query && !byOp.net_connect) problems.push("no network evidence at all");
 
+          // DNS is checked separately from connects. A connect alone yields only an IP, and "connected
+          // to 104.16.2.34" is far weaker evidence than "resolved registry.npmjs.org". Run
+          // 33296408610 recorded a connect to 127.0.0.53:53 and zero dns_query events, which is how
+          // the unhandled `send` syscall was found — so absence of DNS is treated as a defect, not a
+          // quiet install.
+          const names = events.filter((e) => e.op === "dns_query").map((e) => e.qname);
+          console.log("resolved names:", JSON.stringify([...new Set(names)]));
+          if (names.length === 0) {
+            problems.push("no dns_query events — a registry fetch must produce a decoded question");
+          }
+
           // Byte accounting is the Phase 0 gap this phase closed; assert it produced real numbers.
           const bytes = events
             .filter((e) => e.op === "fs_write" && typeof e.bytes === "number")
