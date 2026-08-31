@@ -219,8 +219,9 @@ jobs:
           set -uo pipefail
           work="$RUNNER_TEMP/parity-work"
           # Clean the strace run's leftovers so the aya recording starts fresh.
+          # sudo because the strace step ran under sudo and created root-owned files.
           # rm itself is not recorded — it runs before the recorder starts.
-          rm -rf "$work"
+          sudo rm -rf "$work"
           mkdir -p "$work"
           # Same directory path as the strace run: the parity classifier needs identical mkdir -p
           # components so its structural matching works. Cleaning between runs prevents cross-
