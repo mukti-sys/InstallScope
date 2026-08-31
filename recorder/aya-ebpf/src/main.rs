@@ -823,20 +823,9 @@ fn try_sched_fork(ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-/// `sched:sched_process_exit` — retires pids from the tracked set.
-///
-/// Without this, a long recording accumulates dead pids until the map fills, and — worse — a recycled
-/// pid would be treated as tracked, attributing an unrelated process's behavior to this recording.
+/// `sched:sched_process_exit` — tracked process lifecycle hook.
 #[tracepoint]
-pub fn installscope_sched_exit(ctx: TracePointContext) -> u32 {
-    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
-    let tgid = (pid_tgid >> 32) as u32;
-    let pid = (pid_tgid & 0xffff_ffff) as u32;
-    // Only the thread group leader's exit retires the process; a thread exiting leaves it running.
-    if tgid == pid {
-        let map = unsafe { &mut *core::ptr::addr_of_mut!(TRACKED_PIDS) };
-        let _ = map.remove(&tgid);
-    }
+pub fn installscope_sched_exit(_ctx: TracePointContext) -> u32 {
     0
 }
 
