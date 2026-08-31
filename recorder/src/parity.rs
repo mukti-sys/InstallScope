@@ -328,6 +328,25 @@ fn normalize_path(path: &str) -> String {
 /// difference rather than a filter for inconvenient results.
 fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) -> Expectation {
     match fact {
+        // /dev/null is a character device; writing to it is a no-op that produces no filesystem
+        // mutation. The aya backend may or may not see the write depending on whether the fd was
+        // opened during the recording, but either way it is not evidence worth comparing.
+        Fact::Wrote { path, .. } if path == "/dev/null" => Expectation::Expected(
+            "/dev/null is a character device, not a filesystem mutation; the aya backend may not \
+             track inherited device descriptors",
+        ),
+        // The recorder redirects the child's stdout/stderr to files in the artifacts directory.
+        // The child inherits these fds — it never opens them itself — so the aya fd table has no
+        // open record and writes to them are unattributable. strace sees them because it traces
+        // the write(2) call with a resolved fd path.
+        Fact::Wrote { path, .. }
+            if path.contains("command-stderr.log") || path.contains("command-stdout.log") =>
+        {
+            Expectation::Expected(
+                "the recorder's own stderr/stdout redirect files are inherited fds the child did \
+                 not open; the aya fd table has no open record for them",
+            )
+        }
         // aya reads the userspace path argument, so a relative open stays relative while strace's `-yy`
         // reports the kernel's resolved absolute path. The same write therefore appears as two facts.
         // Only accepted when the counterpart is actually present — otherwise a genuinely missed write
@@ -377,6 +396,60 @@ fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) 
 /// Explains why a fact might be missing from the strace side.
 fn expectation_for_missing_from_strace(fact: &Fact, counterparts: &BTreeSet<Fact>) -> Expectation {
     match fact {
+        // aya hooks sys_enter_mkdirat (entry-side, before the kernel returns a result). When
+        // `mkdir -p /a/b/c` creates each component, the calls for already-existing directories
+        // return EEXIST. strace records the failure and facts_of() filters it. aya has no exit
+        // probe for mkdir, so the attempt looks successful. These phantom mkdirs are always path
+        // components of a longer path that IS matched — either as a shared fact or as an
+        // expected relative/absolute pair.
+        Fact::Wrote {
+            kind: WriteKind::Mkdir,
+            path,
+        } => {
+            // Check if this path is a component/prefix of any other Mkdir fact in counterparts
+            // (the strace side). If strace has a longer mkdir whose path contains this as a
+            // prefix component, then this is an intermediate directory from mkdir -p.
+            let is_intermediate = counterparts.iter().any(|other| {
+                if let Fact::Wrote {
+                    kind: WriteKind::Mkdir,
+                    path: other_path,
+                } = other
+                {
+                    // Check if other_path contains this path as a component.
+                    // e.g. path="runner", other_path="/home/runner/work/..." → match
+                    // e.g. path="/home", other_path="/home/runner/work/..." → match
+                    if path.starts_with('/') {
+                        other_path.starts_with(path) && other_path.len() > path.len()
+                    } else {
+                        // Relative path — check if it's a component in any counterpart path
+                        let component = format!("/{path}/");
+                        other_path.contains(&component)
+                            || other_path.ends_with(&format!("/{path}"))
+                    }
+                } else {
+                    false
+                }
+            });
+            // Also check the aya-side facts themselves for longer paths
+            let is_intermediate = is_intermediate || {
+                // Fall back: for relative paths, check if the strace side has the absolute
+                // counterpart for this mkdir (same as regular relative/absolute pairing)
+                if path.starts_with('/') {
+                    has_relative_counterpart(counterparts, path, Some(WriteKind::Mkdir))
+                } else {
+                    has_absolute_counterpart(counterparts, path, Some(WriteKind::Mkdir))
+                }
+            };
+            if is_intermediate {
+                Expectation::Expected(
+                    "aya hooks sys_enter_mkdirat (entry-side, before knowing the outcome); mkdir -p \
+                     intermediate directories that already exist return EEXIST which strace filters \
+                     but aya cannot",
+                )
+            } else {
+                Expectation::Unexpected
+            }
+        }
         // The mirror of the path pair: aya reports a relative path that strace resolved to an absolute
         // one. Accepted only when that absolute counterpart exists.
         Fact::Wrote { path, kind } if !path.starts_with('/') => {
