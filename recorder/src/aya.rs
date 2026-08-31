@@ -903,10 +903,7 @@ mod tests {
     fn the_program_list_covers_every_event_class_phase_2_promises() {
         // Phases.md:23 names fs write, tcp connect, and proc spawn. A missing probe would produce a
         // recording that looks clean because it never watched.
-        let events: Vec<&str> = PROGRAMS
-            .iter()
-            .map(|(_, _, event, _)| *event)
-            .collect();
+        let events: Vec<&str> = PROGRAMS.iter().map(|(_, _, event, _)| *event).collect();
         for required in [
             "sys_enter_openat",
             "sys_exit_openat",
