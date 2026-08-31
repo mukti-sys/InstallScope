@@ -140,20 +140,32 @@ jobs:
         # authoritative while being wrong. Regenerating here and diffing means the committed counts are
         # always what the suite actually produced.
         #
-        # The generator runs the full suite again, which is a few seconds and buys the guarantee that the
-        # numbers in the repo were not typed by hand.
+        # Two lines are excluded from the comparison, both because they legitimately differ per run
+        # rather than indicating drift: the timestamp, and the lint target (set only on the Windows dev
+        # machine, which has no MSVC linker). Everything else — including the counts — must match, and the
+        # committed copy is generated on Linux since that is where the full suite exists.
         run: |
           set -uo pipefail
           cp TESTS.md /tmp/TESTS.md.committed 2>/dev/null || touch /tmp/TESTS.md.committed
           node scripts/test-log.mjs
-          # The timestamp line differs on every run by design, so it is excluded from the comparison.
-          if ! diff <(grep -v '^- Generated:' /tmp/TESTS.md.committed) \
-                    <(grep -v '^- Generated:' TESTS.md) > /tmp/tests-diff.txt; then
+          normalize() { grep -vE '^- (Generated|Lint/check target):' "$1"; }
+          if ! diff <(normalize /tmp/TESTS.md.committed) <(normalize TESTS.md) > /tmp/tests-diff.txt; then
             cat /tmp/tests-diff.txt
-            echo "::error title=TESTS.md is stale::Run \`node scripts/test-log.mjs\` and commit the result."
+            echo "::error title=TESTS.md is stale::The committed counts do not match this run. Download the regenerated TESTS.md from this job's artifact, or run \`node scripts/test-log.mjs\` on Linux, and commit the result."
             exit 1
           fi
           echo "TESTS.md matches the suite"
+
+      - name: Upload the regenerated TESTS.md
+        # So a stale committed copy can be refreshed from an authoritative Linux run rather than by
+        # hand-editing numbers, which is exactly what generating the file is meant to prevent.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-md
+          path: TESTS.md
+          retention-days: 14
+          if-no-files-found: warn
 
   cross-check:
     name: build the recorder for linux release

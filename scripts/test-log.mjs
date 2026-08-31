@@ -15,6 +15,19 @@
 // recorder's load/attach path has never executed. A transparency artifact that omits that is marketing.
 // So the generated file leads with what is *not* covered.
 //
+// WHY THE PLATFORM IS RECORDED IN THE OUTPUT
+//
+// The counts are host-dependent and there is no way around it: `recorder/src/strace.rs` tests are
+// `cfg(target_os = "linux")`, the E2E suite is Linux-only, and the aya-backend tests cannot even link on
+// Windows because aya-obj uses std::os::fd. A Linux run therefore reports more tests than a Windows run
+// of the same commit — not because anything changed, but because more of the suite exists there.
+//
+// So the file names its platform, and CI's drift check only compares like with like. The alternative —
+// a single "true" count — would require either pretending the skipped tests do not exist or hand-editing
+// numbers in, and both defeat the purpose. Linux is the authoritative platform because it is where the
+// product runs; the workflow uploads its output so the committed copy can be refreshed from it rather
+// than typed.
+//
 // Node rather than shell because the dev machine is Windows and CI is Linux, and harness/g2 already
 // establishes .mjs as the cross-platform choice here.
 //
@@ -301,10 +314,18 @@ lines.push(
 );
 lines.push("");
 lines.push(`- Generated: \`${new Date().toISOString()}\``);
+lines.push(`- Host platform: \`${process.platform}\``);
 lines.push(`- Toolchain: \`${rustcVersion ?? "unknown"}\``);
 if (TARGET) lines.push(`- Lint/check target: \`${TARGET}\``);
 lines.push(
   `- Overall: ${everythingPassed ? "**all checks passed**" : "**one or more checks FAILED**"}`
+);
+lines.push("");
+lines.push(
+  "**Counts are host-dependent.** `recorder/src/strace.rs` tests are `cfg(target_os = \"linux\")`, the " +
+    "E2E suite is Linux-only, and the aya-backend tests cannot link on Windows at all. A Linux run of " +
+    "this commit therefore reports more tests than a Windows run — more of the suite exists there. The " +
+    "committed copy of this file is generated on Linux, which is the platform the product runs on."
 );
 lines.push("");
 
