@@ -883,7 +883,7 @@ mod tests {
     fn every_program_has_a_distinct_name_and_tracepoint() {
         // A duplicated program name would silently attach one probe twice and leave another unattached,
         // producing double-counted events for one class and none for another.
-        let mut names: Vec<&str> = PROGRAMS.iter().map(|(name, _, _)| *name).collect();
+        let mut names: Vec<&str> = PROGRAMS.iter().map(|(name, _, _, _)| *name).collect();
         names.sort_unstable();
         let count = names.len();
         names.dedup();
@@ -891,7 +891,7 @@ mod tests {
 
         let mut targets: Vec<(&str, &str)> = PROGRAMS
             .iter()
-            .map(|(_, category, event)| (*category, *event))
+            .map(|(_, category, event, _)| (*category, *event))
             .collect();
         targets.sort_unstable();
         let count = targets.len();
@@ -903,7 +903,10 @@ mod tests {
     fn the_program_list_covers_every_event_class_phase_2_promises() {
         // Phases.md:23 names fs write, tcp connect, and proc spawn. A missing probe would produce a
         // recording that looks clean because it never watched.
-        let events: Vec<&str> = PROGRAMS.iter().map(|(_, _, event)| *event).collect();
+        let events: Vec<&str> = PROGRAMS
+            .iter()
+            .map(|(_, _, event, _)| *event)
+            .collect();
         for required in [
             "sys_enter_openat",
             "sys_exit_openat",
