@@ -148,8 +148,8 @@ jobs:
           set -uo pipefail
           cp TESTS.md /tmp/TESTS.md.committed 2>/dev/null || touch /tmp/TESTS.md.committed
           node scripts/test-log.mjs
-          normalize() { grep -vE '^- (Generated|Lint/check target):' "$1"; }
-          if ! diff <(normalize /tmp/TESTS.md.committed) <(normalize TESTS.md) > /tmp/tests-diff.txt; then
+          normalize() { grep -vE '^- (Generated|Host platform|Toolchain|Lint/check target):' "$1" | grep -v 'were \*\*skipped on this host\*\*'; }
+          if ! diff -u <(normalize /tmp/TESTS.md.committed) <(normalize TESTS.md) > /tmp/tests-diff.txt; then
             cat /tmp/tests-diff.txt
             echo "::error title=TESTS.md is stale::The committed counts do not match this run. Download the regenerated TESTS.md from this job's artifact, or run \`node scripts/test-log.mjs\` on Linux, and commit the result."
             exit 1

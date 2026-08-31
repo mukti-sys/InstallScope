@@ -231,6 +231,7 @@ jobs:
             -- ./harness/parity/parity-workload.sh "$work" \
             > artifacts/record-aya.log 2>&1
           status=$?
+          sudo chown -R "$(id -u):$(id -g)" artifacts "$work" 2>/dev/null || true
           cat artifacts/record-aya.log
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit 0
@@ -336,6 +337,7 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          sudo chown -R "$(id -u):$(id -g)" artifacts 2>/dev/null || true
           for backend in strace aya; do
             if [ -f "artifacts/$backend/events.jsonl" ]; then
               gzip -9 -c "artifacts/$backend/events.jsonl" > "artifacts/$backend-events.jsonl.gz"
