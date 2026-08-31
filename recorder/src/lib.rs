@@ -18,21 +18,35 @@
 //! - a dead recording surfaces as PARTIAL, never as silence (§2) — see [`session`];
 //! - no LLM, cloud, or telemetry dependency (§1).
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied rather than forbidden, so the aya backend can opt in with an explicit
+// `#[allow]` and a safety comment per block. `forbid` cannot be overridden, and reading a
+// `#[repr(C)]` record out of a perf buffer genuinely requires a pointer cast — there is no safe
+// equivalent. Every other module in this crate remains unsafe-free, and the exception is one
+// module wide rather than crate wide.
+#![deny(unsafe_code)]
 // Rules.md §2 bans unwrap/expect in *non-test* code; in tests a panic is the correct response to a
 // broken invariant.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![warn(clippy::pedantic, missing_docs, rust_2018_idioms)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod clock;
 pub mod decode;
 pub mod fdtable;
+pub mod merge;
+pub mod parity;
 pub mod parser;
 pub mod session;
+pub mod translate;
 
 #[cfg(target_os = "linux")]
 pub mod strace;
 
+/// The aya eBPF backend. Requires Linux, the `aya-backend` feature, and a compiled eBPF object.
+#[cfg(all(target_os = "linux", feature = "aya-backend"))]
+pub mod aya;
+
+pub use merge::{MergeStats, Merged, Merger};
 pub use parser::{ParseStats, Parser, DEFAULT_EVENT_CAP};
 pub use session::{summarize_stream, SessionWriter, StreamSummary};
 

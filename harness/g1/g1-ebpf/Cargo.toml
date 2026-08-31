@@ -9,10 +9,14 @@ publish = false
 [workspace]
 
 [dependencies]
-# TODO-verify: pins are unverified against a real build — this dev machine has no cargo toolchain.
-# If the workflow fails on an API mismatch, read the docs for the resolved version rather than
-# guessing (Rules.md §5). aya-ebpf is the current name; older material says `aya-bpf`.
-aya-ebpf = "0.1.1"
+# Pins reconciled against the passing G1 run #33297876067 (artifact `ebpf-Cargo.lock`). These are the
+# versions that actually compiled for bpfel-unknown-none and loaded on ubuntu24 / kernel
+# 6.17.0-1022-azure, so they are recorded facts rather than the earlier TODO-verify guesses.
+#
+# aya-ebpf 0.2.1 exists; 0.1.1 is kept deliberately. The proven version is the one that loaded, and
+# Rules.md §5 asks for admitted uncertainty over plausible-looking changes on kernel APIs. Upgrading
+# is a Phase 2 decision with its own verification run, not a drive-by bump.
+aya-ebpf = "=0.1.1"
 g1-common = { path = "../g1-common" }
 
 [[bin]]

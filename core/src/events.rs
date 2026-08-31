@@ -196,7 +196,11 @@ impl TracedPath {
 }
 
 /// The kind of mutation a write-class syscall performed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord` is derived so callers can put these in sorted collections — the parity harness needs a total
+/// order to compare fact sets deterministically. The ordering itself carries no meaning; do not read
+/// severity into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteKind {
     /// Opened with write intent (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/`O_APPEND`).

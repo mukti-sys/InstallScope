@@ -1,10 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["core", "recorder", "cli"]
+members = ["abi", "core", "recorder", "cli"]
 
 # harness/ is Phase 0 gate tooling with its own toolchain requirements (nightly + build-std for the
 # eBPF crate) and is deliberately not part of the product workspace.
-exclude = ["harness"]
+#
+# recorder/aya-ebpf/ is excluded for the same reason: it targets bpfel-unknown-none, is no_std with
+# panic=abort, and needs `-Z build-std=core` on nightly. A single workspace cannot express two such
+# different build configurations, which is why the standard aya layout splits them.
+exclude = ["harness", "recorder/aya-ebpf"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +18,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/mukti-sys/InstallScope"
 
 [workspace.dependencies]
+installscope-abi = { path = "abi" }
 installscope-core = { path = "core" }
 installscope-recorder = { path = "recorder" }
 

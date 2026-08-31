@@ -9,11 +9,23 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+installscope-abi = { workspace = true }
 installscope-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# The aya backend is optional and Linux-only. Gated behind a feature so `cargo build` on a machine
+# without a kernel — or a user who only wants the strace backend — pulls in none of it. Pinned exactly
+# to the version proven by G1 run #33297876067.
+aya = { version = "=0.13.1", optional = true }
+bytes = { version = "1", optional = true }
+
+[features]
+default = []
+# Enables recorder::aya. Requires Linux and a compiled eBPF object.
+aya-backend = ["dep:aya", "dep:bytes"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

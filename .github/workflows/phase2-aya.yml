@@ -1,0 +1,389 @@
+name: Phase 2 — aya backend parity
+
+# Phase 2's Done condition (Phases.md:24): "parity on synthetic workload in VM; ubuntu-latest Action
+# runs full record; agent stamps backend."
+#
+# This workflow is the first thing that has ever compiled or loaded the eBPF programs. Everything in
+# recorder/aya-ebpf/ was written on a machine with no Linux kernel and no bpfel-unknown-none target, so
+# the first run is expected to fail. It is built to fail *diagnosably*:
+#
+#   - every tracepoint format file is dumped BEFORE the build, because argument offsets are the
+#     load-bearing assumption in the probes and the format files are the authoritative source;
+#   - the verifier's rejection log is captured verbatim rather than summarized;
+#   - the strace recording runs regardless, so a failed aya run still produces the baseline half of the
+#     comparison and the artifact is useful either way.
+#
+# Manual dispatch only: it needs sudo to load BPF programs, and a gate is run deliberately.
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_going:
+        description: "Continue to the parity comparison even if some probes fail to attach (a partial attach is still evidence)"
+        required: false
+        default: "true"
+      rust_toolchain:
+        description: "Nightly toolchain for the eBPF crate (bpfel-unknown-none has no prebuilt core)"
+        required: false
+        default: "nightly"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: phase2-aya-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: build probes, record both backends, compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- environment, captured before anything is built ------------------------------------
+      - name: Record runner environment
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          {
+            echo "=== runner ==="
+            echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "kernel: $(uname -r)"
+            echo "arch: $(uname -m)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo ""
+            echo "=== BPF preconditions ==="
+            if [ -r /sys/kernel/btf/vmlinux ]; then
+              echo "btf_vmlinux: present ($(stat -c%s /sys/kernel/btf/vmlinux) bytes)"
+            else
+              echo "btf_vmlinux: MISSING"
+            fi
+            echo "unprivileged_bpf_disabled: $(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo unavailable)"
+            echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unavailable)"
+            echo "kernel_lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)"
+            echo "nproc: $(nproc)"
+          } | tee artifacts/runner-env.txt
+
+      - name: Dump tracepoint format files
+        # THE most important diagnostic step in this workflow.
+        #
+        # The probes read syscall arguments at hardcoded byte offsets into each tracepoint's format
+        # record. Those offsets were derived from the conventional x86-64 layout without a kernel to
+        # check against, and they are the single most likely thing to be wrong. These files are the
+        # authoritative answer, so they are captured before the build — if a probe reads garbage, the
+        # fix is right here rather than a guessing game.
+        run: |
+          set -uo pipefail
+          sudo mkdir -p artifacts/tracepoint-formats
+          for tp in \
+            syscalls/sys_enter_openat \
+            syscalls/sys_exit_openat \
+            syscalls/sys_enter_write \
+            syscalls/sys_enter_close \
+            syscalls/sys_enter_mkdirat \
+            syscalls/sys_enter_renameat2 \
+            syscalls/sys_enter_connect \
+            syscalls/sys_enter_execve \
+            sched/sched_process_fork \
+            sched/sched_process_exit
+          do
+            name="${tp//\//_}"
+            for base in /sys/kernel/tracing/events /sys/kernel/debug/tracing/events; do
+              if sudo test -r "$base/$tp/format"; then
+                sudo cat "$base/$tp/format" | sudo tee "artifacts/tracepoint-formats/$name.txt" > /dev/null
+                break
+              fi
+            done
+            if [ ! -f "artifacts/tracepoint-formats/$name.txt" ]; then
+              echo "MISSING: $tp" | sudo tee "artifacts/tracepoint-formats/$name.txt" > /dev/null
+              echo "::warning title=Tracepoint missing::$tp is not available on this kernel"
+            fi
+          done
+          sudo chown -R "$(id -u):$(id -g)" artifacts/tracepoint-formats
+
+          echo "--- offsets the probes assume, vs what the kernel reports ---"
+          {
+            echo "The probes assume ARG0=16 with an 8-byte stride for syscalls/sys_enter_*."
+            echo "For sched_process_fork they assume parent_pid=24 and child_pid=44."
+            echo ""
+            for f in artifacts/tracepoint-formats/*.txt; do
+              echo "### $(basename "$f" .txt)"
+              grep -E '^\s+field:' "$f" 2>/dev/null || echo "  (no field lines)"
+              echo ""
+            done
+          } | tee artifacts/offset-comparison.txt
+
+      # ---- toolchains -------------------------------------------------------------------------
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          components: rust-src
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker and strace
+        run: |
+          set -euo pipefail
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall -y bpf-linker
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace
+          strace -V | head -n 1
+
+      # ---- build ------------------------------------------------------------------------------
+      - name: Build the eBPF programs
+        id: build_ebpf
+        # First compilation ever. A failure here is the expected outcome, not a surprise, so the log is
+        # captured in full and the workflow continues to produce the strace baseline regardless.
+        continue-on-error: true
+        working-directory: recorder/aya-ebpf
+        run: |
+          set -uo pipefail
+          cargo +${{ inputs.rust_toolchain }} build --release 2>&1 | tee ../../artifacts/build-ebpf.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Inspect the compiled object
+        if: steps.build_ebpf.outputs.status == '0'
+        run: |
+          set -uo pipefail
+          OBJ=recorder/aya-ebpf/target/bpfel-unknown-none/release/installscope-ebpf
+          {
+            echo "object: $OBJ"
+            ls -l "$OBJ"
+            file "$OBJ"
+            echo ""
+            echo "=== program sections (one per probe) ==="
+            readelf -S "$OBJ" 2>/dev/null | grep -E 'tracepoint|maps|license' || true
+            echo ""
+            echo "=== maps ==="
+            readelf -x .maps "$OBJ" 2>/dev/null | head -n 20 || echo "(no .maps section dump)"
+          } | tee artifacts/object-info.txt
+
+      - name: Build the CLI with the aya backend
+        id: build_cli
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cargo build --release --features installscope/aya-backend 2>&1 \
+            | tee artifacts/build-cli.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # ---- record the baseline: strace ---------------------------------------------------------
+      # Runs even if the eBPF build failed. A parity comparison needs two sides, but a strace recording
+      # of the parity workload is independently useful — it establishes what the workload actually does,
+      # which is the reference the aya side will eventually be judged against.
+      - name: Record the workload under strace
+        id: record_strace
+        run: |
+          set -uo pipefail
+          chmod +x harness/parity/parity-workload.sh
+          work="$RUNNER_TEMP/parity-strace"
+          mkdir -p "$work"
+          sudo ./target/release/installscope record \
+            --backend strace \
+            --out artifacts/strace \
+            --cwd "$work" \
+            --project "$work" \
+            --timeout 120 \
+            -- ./harness/parity/parity-workload.sh "$work" \
+            > artifacts/record-strace.log 2>&1
+          status=$?
+          cat artifacts/record-strace.log
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # 0 = complete, 3 = PARTIAL. Both leave a usable stream.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            echo "::error title=strace baseline failed::exit $status"
+            exit "$status"
+          fi
+
+      # ---- record with aya --------------------------------------------------------------------
+      - name: Record the workload under aya
+        id: record_aya
+        if: steps.build_ebpf.outputs.status == '0' && steps.build_cli.outputs.status == '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          work="$RUNNER_TEMP/parity-aya"
+          mkdir -p "$work"
+          # A separate work directory from the strace run: sharing one would make this recording observe
+          # the other's leftovers, and cleaning between runs would itself be recorded.
+          sudo ./target/release/installscope -vv record \
+            --backend aya \
+            --ebpf-object recorder/aya-ebpf/target/bpfel-unknown-none/release/installscope-ebpf \
+            --out artifacts/aya \
+            --cwd "$work" \
+            --project "$work" \
+            --timeout 120 \
+            -- ./harness/parity/parity-workload.sh "$work" \
+            > artifacts/record-aya.log 2>&1
+          status=$?
+          cat artifacts/record-aya.log
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report what the aya backend managed
+        if: always() && steps.record_aya.outcome != 'skipped'
+        # Separated from the recording step so the diagnosis is legible even when the run failed. The
+        # distinction that matters: did the programs load at all, did they attach, did events arrive.
+        run: |
+          set -uo pipefail
+          {
+            echo "=== aya recording outcome ==="
+            echo "record exit status: ${{ steps.record_aya.outputs.status }}"
+            echo ""
+            if [ -f artifacts/aya/events.jsonl ]; then
+              echo "events.jsonl lines: $(wc -l < artifacts/aya/events.jsonl)"
+              echo ""
+              echo "--- event counts by op ---"
+              node -e '
+                const fs = require("node:fs");
+                const lines = fs.readFileSync("artifacts/aya/events.jsonl", "utf8")
+                  .split("\n").filter((l) => l.trim() !== "");
+                const byOp = {};
+                for (const line of lines) {
+                  try { const e = JSON.parse(line); byOp[e.op] = (byOp[e.op] ?? 0) + 1; }
+                  catch { byOp["<malformed>"] = (byOp["<malformed>"] ?? 0) + 1; }
+                }
+                console.log(JSON.stringify(byOp, null, 2));
+              '
+            else
+              echo "no events.jsonl was written — the programs did not load or did not attach"
+            fi
+          } | tee artifacts/aya-outcome.txt
+
+      # ---- the comparison ---------------------------------------------------------------------
+      - name: Compare the two recordings
+        id: parity
+        if: always() && hashFiles('artifacts/aya/events.jsonl') != '' && hashFiles('artifacts/strace/events.jsonl') != ''
+        continue-on-error: ${{ inputs.keep_going == 'true' }}
+        run: |
+          set -uo pipefail
+          ./target/release/installscope parity \
+            --strace artifacts/strace/events.jsonl \
+            --aya artifacts/aya/events.jsonl \
+            --show-expected \
+            > artifacts/parity.txt 2>&1
+          status=$?
+          cat artifacts/parity.txt
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Step summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "# Phase 2 — aya backend parity"
+            echo ""
+            echo "**This workflow is the first thing to compile or load the eBPF programs.** Everything"
+            echo "in \`recorder/aya-ebpf/\` was written without a kernel to test against, so a failure"
+            echo "here is an expected step rather than a regression."
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| eBPF build | ${{ steps.build_ebpf.outputs.status == '0' && 'ok' || '**failed**' }} |"
+            echo "| CLI build (aya feature) | ${{ steps.build_cli.outputs.status == '0' && 'ok' || '**failed**' }} |"
+            echo "| strace baseline | exit ${{ steps.record_strace.outputs.status || 'n/a' }} |"
+            echo "| aya recording | exit ${{ steps.record_aya.outputs.status || 'skipped' }} |"
+            echo "| parity | exit ${{ steps.parity.outputs.status || 'not run' }} |"
+            echo ""
+            if [ -f artifacts/parity.txt ]; then
+              echo "## Parity"
+              echo ""
+              echo '```'
+              cat artifacts/parity.txt
+              echo '```'
+            fi
+            if [ -f artifacts/aya-outcome.txt ]; then
+              echo ""
+              echo "## aya outcome"
+              echo ""
+              echo '```'
+              cat artifacts/aya-outcome.txt
+              echo '```'
+            fi
+            if [ "${{ steps.build_ebpf.outputs.status }}" != "0" ] && [ -f artifacts/build-ebpf.log ]; then
+              echo ""
+              echo "## eBPF build failure (last 60 lines)"
+              echo ""
+              echo '```'
+              tail -n 60 artifacts/build-ebpf.log
+              echo '```'
+              echo ""
+              echo "The tracepoint format files in the artifact are the authoritative source for the"
+              echo "argument offsets the probes assume. Compare them against \`offset-comparison.txt\`."
+            fi
+            echo ""
+            echo "Full logs, both event streams, and every tracepoint format file are in the"
+            echo "\`phase2-aya\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compress event streams
+        if: always()
+        run: |
+          set -uo pipefail
+          for backend in strace aya; do
+            if [ -f "artifacts/$backend/events.jsonl" ]; then
+              gzip -9 -c "artifacts/$backend/events.jsonl" > "artifacts/$backend-events.jsonl.gz"
+              rm -f "artifacts/$backend/events.jsonl"
+            fi
+            rm -rf "artifacts/$backend/trace"
+          done
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-aya
+          path: artifacts
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Gate on the result
+        if: always()
+        # Last step, so the artifact is uploaded first and a failure is diagnosable.
+        run: |
+          set -uo pipefail
+          ebpf="${{ steps.build_ebpf.outputs.status }}"
+          cli="${{ steps.build_cli.outputs.status }}"
+          aya="${{ steps.record_aya.outputs.status }}"
+          parity="${{ steps.parity.outputs.status }}"
+
+          if [ "$ebpf" != "0" ]; then
+            echo "::error title=eBPF build failed::The probes did not compile. Check build-ebpf.log and the tracepoint format files in the artifact. Phase 2 remains open; Scope.md:59 pre-authorizes falling back to libbpf-rs or to a strace-only product."
+            exit 1
+          fi
+          if [ "$cli" != "0" ]; then
+            echo "::error title=CLI build failed::The aya backend did not compile into the binary."
+            exit 1
+          fi
+          if [ -z "$aya" ]; then
+            echo "::error title=aya recording skipped::A build step failed before it could run."
+            exit 1
+          fi
+          if [ "$aya" != "0" ] && [ "$aya" != "3" ]; then
+            echo "::error title=aya recording failed::exit $aya — see record-aya.log and aya-outcome.txt"
+            exit 1
+          fi
+          if [ "$aya" = "3" ]; then
+            echo "::warning title=PARTIAL::the aya recording is incomplete; see the reasons in record-aya.log"
+          fi
+          if [ "$parity" != "0" ]; then
+            echo "::error title=Parity failed::The two backends disagree in ways nothing explains. Unexplained differences are listed in parity.txt. Do not widen the expected-difference list in recorder/src/parity.rs to make this pass without a stated reason."
+            exit 1
+          fi
+          echo "Phase 2 parity holds. Record the run id and the parity output in Memory.md."

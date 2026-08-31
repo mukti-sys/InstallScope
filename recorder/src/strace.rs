@@ -22,7 +22,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use installscope_core::{Backend, HostInfo, IncompleteReason, SessionEnd, Zones};
 
@@ -185,48 +185,7 @@ fn host_info(strace_version: &str) -> HostInfo {
     }
 }
 
-fn rfc3339_utc(time: SystemTime) -> String {
-    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let seconds_of_day = secs % 86_400;
-    let (hour, minute, second) = (
-        seconds_of_day / 3600,
-        (seconds_of_day % 3600) / 60,
-        seconds_of_day % 60,
-    );
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days`. Public-domain algorithm, used to avoid a date dependency in a
-/// crate whose dependency list is a stated constraint (`Rules.md` §1).
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let shifted = days_since_epoch + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = u64::try_from(shifted - era * 146_097).unwrap_or(0);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = i64::try_from(year_of_era).unwrap_or(0) + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = u32::try_from(day_of_year - (153 * month_prime + 2) / 5 + 1).unwrap_or(1);
-    let month = u32::try_from(if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    })
-    .unwrap_or(1);
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
-fn epoch_secs_f64(time: SystemTime) -> f64 {
-    time.duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
-}
+use crate::clock::{epoch_secs_f64, rfc3339_utc};
 
 /// Records `config.command` under strace.
 ///
@@ -617,13 +576,6 @@ mod tests {
         let config = RecordConfig::new(Vec::new(), PathBuf::from("/tmp/does-not-matter"));
         let err = record(&config).expect_err("must reject");
         assert!(matches!(err, RecorderError::EmptyCommand));
-    }
-
-    #[test]
-    fn formats_rfc3339_from_epoch() {
-        let epoch = UNIX_EPOCH + Duration::from_secs(1_719_245_678);
-        assert_eq!(rfc3339_utc(epoch), "2024-06-24T16:14:38Z");
-        assert_eq!(rfc3339_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
     }
 
     #[test]

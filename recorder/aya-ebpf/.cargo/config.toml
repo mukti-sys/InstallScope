@@ -1,0 +1,8 @@
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+# bpfel-unknown-none ships no prebuilt core, so it is compiled from source. Requires nightly with the
+# rust-src component. Verified by G1 run #33297876067.

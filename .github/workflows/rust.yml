@@ -11,6 +11,7 @@ name: rust
 on:
   push:
     paths:
+      - "abi/**"
       - "core/**"
       - "recorder/**"
       - "cli/**"
@@ -19,6 +20,7 @@ on:
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
+      - "abi/**"
       - "core/**"
       - "recorder/**"
       - "cli/**"
@@ -69,19 +71,47 @@ jobs:
         # #![cfg(target_os = "linux")]; those run in phase1-e2e.yml, which installs strace.
         run: cargo test --workspace --all-targets
 
+      - name: cargo clippy (aya backend)
+        # The aya backend is feature-gated, so the default clippy run above never sees it. Without this
+        # step, a warning in recorder/src/aya.rs would only surface on the Phase 2 workflow — which is
+        # manual-dispatch only, so it could sit unnoticed for days.
+        #
+        # This lints the loader, not the eBPF programs: those need nightly plus bpfel-unknown-none and
+        # are built in phase2-aya.yml.
+        run: cargo clippy --workspace --all-targets --features installscope/aya-backend -- -D warnings
+
+      - name: cargo test (aya backend)
+        run: cargo test --workspace --features installscope/aya-backend
+
       - name: Verify the no-unwrap rule covers non-test code
         # Belt and braces over the crate-level lints: a future `#[allow]` would silence clippy
         # locally without anyone noticing. This catches the attribute itself.
         run: |
           set -uo pipefail
           hits="$(grep -rn 'allow(clippy::unwrap_used\|allow(clippy::expect_used' \
-            core/src recorder/src cli/src 2>/dev/null || true)"
+            abi/src core/src recorder/src cli/src 2>/dev/null || true)"
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error title=Rules.md §2::unwrap/expect lints must not be allowed in product code"
             exit 1
           fi
           echo "no unwrap/expect allow-attributes in product code"
+
+      - name: Verify unsafe stays confined to the eBPF boundary
+        # recorder/src/lib.rs uses deny(unsafe_code) rather than forbid, so recorder/src/aya.rs can opt
+        # in: reading a #[repr(C)] record out of an untyped perf-buffer slice has no safe equivalent.
+        # That exception must stay one module wide. A second `allow(unsafe_code)` appearing elsewhere is
+        # exactly the drift this catches.
+        run: |
+          set -uo pipefail
+          hits="$(grep -rln 'allow(unsafe_code)' abi/src core/src recorder/src cli/src 2>/dev/null || true)"
+          expected="recorder/src/aya.rs"
+          if [ "$hits" != "$expected" ] && [ -n "$hits" ]; then
+            printf 'files opting into unsafe:\n%s\n' "$hits"
+            echo "::error title=Unsafe boundary::only $expected may allow unsafe_code; see its module docs for why"
+            exit 1
+          fi
+          echo "unsafe is confined to ${hits:-nothing}"
 
       - name: Confirm the dependency tree has no LLM, cloud, or telemetry crates
         # Rules.md §1 bans these outright: "this product's entire moral claim is 'we watch packages,
@@ -100,6 +130,30 @@ jobs:
             exit 1
           fi
           echo "dependency tree is clean"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Regenerate TESTS.md and fail if it is stale
+        # TESTS.md is generated, and a generated file that drifts is worse than no file: it looks
+        # authoritative while being wrong. Regenerating here and diffing means the committed counts are
+        # always what the suite actually produced.
+        #
+        # The generator runs the full suite again, which is a few seconds and buys the guarantee that the
+        # numbers in the repo were not typed by hand.
+        run: |
+          set -uo pipefail
+          cp TESTS.md /tmp/TESTS.md.committed 2>/dev/null || touch /tmp/TESTS.md.committed
+          node scripts/test-log.mjs
+          # The timestamp line differs on every run by design, so it is excluded from the comparison.
+          if ! diff <(grep -v '^- Generated:' /tmp/TESTS.md.committed) \
+                    <(grep -v '^- Generated:' TESTS.md) > /tmp/tests-diff.txt; then
+            cat /tmp/tests-diff.txt
+            echo "::error title=TESTS.md is stale::Run \`node scripts/test-log.mjs\` and commit the result."
+            exit 1
+          fi
+          echo "TESTS.md matches the suite"
 
   cross-check:
     name: build the recorder for linux release

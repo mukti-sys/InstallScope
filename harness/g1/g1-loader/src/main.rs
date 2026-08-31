@@ -13,23 +13,25 @@
 //! It always writes the result file, including on failure — a gate that fails without leaving
 //! diagnostics costs another hour to re-run (Rules.md §2: fail loud).
 //!
-//! # Unverified API assumptions (Rules.md §5)
+//! # API surface, now verified
 //!
-//! This was written without a local cargo toolchain, so the aya API surface used below is
-//! **unverified**. Each assumption is listed here so the first failing build is a five-minute fix
-//! against `Cargo.lock` rather than a guessing game:
+//! Every aya call below was unverified when written; run #33297876067 proved the set that follows
+//! against `aya 0.13.1` / `aya-ebpf 0.1.1` on kernel 6.17.0-1022-azure, and the manifests now pin
+//! those exact versions:
 //!
-//! - `aya::EbpfLoader::new().load_file(path)` returns `Ebpf`. Older releases name the type `Bpf`
-//!   and the loader `BpfLoader`; aya 0.13 renamed them.
-//! - `Ebpf::program_mut(name)` yields something convertible to `&mut TracePoint` via `try_into`,
-//!   and `TracePoint::attach(category, name)` takes two `&str`.
-//! - `Ebpf::take_map(name)` returns `Option<Map>`, and `PerfEventArray::try_from(map)` works on it.
-//! - `aya::util::online_cpus()` returns `Result<Vec<u32>, _>`.
-//! - `PerfEventArray::open(cpu, None)` returns a buffer with
+//! - `aya::EbpfLoader::new().load_file(path)` returns `Ebpf`;
+//! - `Ebpf::program_mut(name)` converts to `&mut TracePoint` via `try_into`, and
+//!   `TracePoint::attach(category, name)` takes two `&str`;
+//! - `Ebpf::take_map(name)` returns `Option<Map>` convertible to `PerfEventArray`;
+//! - `aya::util::online_cpus()` returns `Result<Vec<u32>, _>`;
+//! - `PerfEventArray::open(cpu, None)` yields a buffer with
 //!   `read_events(&mut [BytesMut]) -> Result<Events, _>` where `Events { read, lost }`.
 //!
 //! The program name looked up at runtime is `g1_execve`, matching the `#[tracepoint]` function in
-//! `g1-ebpf`. aya derives the ELF section name from that function name.
+//! `g1-ebpf`; aya derives the ELF section name from that function name.
+//!
+//! What the run did **not** establish, and Phase 2 must verify separately per program type: kprobe
+//! and fentry attachment, CO-RE struct reads, and BTF-dependent field access.
 
 use std::fs;
 use std::io::Write;
@@ -175,7 +177,7 @@ fn collect_env() -> EnvInfo {
         euid: unsafe { libc_geteuid() },
         runner_image_os: std::env::var("ImageOS").ok(),
         runner_image_version: std::env::var("ImageVersion").ok(),
-        aya_version: "see Cargo.lock — pins in Cargo.toml are TODO-verify",
+        aya_version: "aya 0.13.1 / aya-ebpf 0.1.1 (verified by run 33297876067; pinned exactly)",
     }
 }
 

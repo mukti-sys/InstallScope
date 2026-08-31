@@ -26,7 +26,11 @@ task structs works, or that the runner image will still allow this next month. P
 re-verify per program type. Recording `uname -r` and the runner image version in the artifact
 exists so a later regression is diagnosable rather than mysterious.
 
-## Toolchain reality (TODO-verify each pin against a real run)
+This is the gate's real limitation, and Phase 2 inherits it: `sys_enter_execve` was chosen
+*because* it needs no struct access. Reading a file path or a socket address requires exactly the
+capabilities this run left untested.
+
+## Toolchain reality (verified by run #33297876067)
 
 - The eBPF crate needs **nightly** plus `rust-src`, because `bpfel-unknown-none` has no prebuilt
   `core`: it is compiled with `-Z build-std=core`.
@@ -34,10 +38,26 @@ exists so a later regression is diagnosable rather than mysterious.
   the two crates need different targets, panic strategies, and `no_std` settings, and a single
   workspace cannot express that cleanly.
 - Loading requires `CAP_BPF`/`CAP_PERFMON` (Architecture.md:97), so the loader runs under `sudo`.
-- Versions in the manifests are pinned. They are **unverified against a real build** — this machine
-  has no cargo. Every pin carries a `TODO-verify`. Per Rules.md §5, admitted uncertainty beats
-  confident-looking wrong code: if the workflow fails on an API mismatch, the fix is to read the
-  aya version's docs, not to guess harder.
+- Versions are pinned **exactly** to what actually built and loaded: `aya 0.13.1`,
+  `aya-ebpf 0.1.1` (with `aya-ebpf-bindings 0.1.2`, `aya-ebpf-macros 0.1.2`, `aya-ebpf-cty 0.2.3`),
+  on kernel `6.17.0-1022-azure` / `ubuntu24` runner image `20260823.283.1`. The earlier
+  `TODO-verify` markers are resolved.
+- `aya-ebpf 0.2.1` exists and is deliberately **not** adopted. The proven version is the one that
+  loaded; upgrading is a Phase 2 decision that earns its own verification run rather than a
+  drive-by bump (Rules.md §5: ask, don't guess, on kernel APIs).
+
+## Observed runner facts worth carrying into Phase 2
+
+From the passing run's `g1-result.json`:
+
+| Fact | Value | Why it matters |
+|---|---|---|
+| BTF at `/sys/kernel/btf/vmlinux` | present, 6,841,206 bytes | CO-RE is possible in principle |
+| `unprivileged_bpf_disabled` | `2` | unprivileged BPF is off; sudo is mandatory, not optional |
+| `perf_event_paranoid` | `4` | most restrictive setting; perf buffers worked anyway under root |
+| online CPUs | 4 | one perf buffer per CPU |
+| events lost | 0 | the perf ring kept up with a trivial workload — says nothing about a real install |
+| object size | 2,504 bytes | a tracepoint-only program; real probes will be larger |
 
 ## Layout
 

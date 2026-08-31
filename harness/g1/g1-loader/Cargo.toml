@@ -5,14 +5,14 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# TODO-verify: every pin below is unverified against a real build — this dev machine has no cargo
-# toolchain. If the workflow fails on an API mismatch, read the resolved version's docs rather than
-# guessing (Rules.md §5).
+# Pins reconciled against the passing G1 run #33297876067 (artifact `loader-Cargo.lock`). These are
+# the versions that built and successfully loaded + attached + received events on ubuntu24 /
+# kernel 6.17.0-1022-azure — recorded facts, not the earlier TODO-verify guesses.
 #
 # Deliberately using aya's SYNCHRONOUS PerfEventArray and std::process, not the async variant: the
-# async one sits behind an `async_tokio` feature flag whose exact name varies across aya versions,
-# and a gate probe should depend on as little unverified API surface as possible.
-aya = "0.13"
+# async one sits behind a feature flag whose exact name varies across aya versions, and a gate probe
+# should depend on as little unverified API surface as possible.
+aya = "=0.13.1"
 anyhow = "1"                      # Rules.md §2: anyhow at the CLI boundary only — this is one
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

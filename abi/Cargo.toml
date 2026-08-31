@@ -1,0 +1,13 @@
+[package]
+name = "installscope-abi"
+description = "Fixed-layout event structs shared between InstallScope's eBPF programs and userspace loader."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Dependency-free and no_std by construction. Anything added here must compile for
+# bpfel-unknown-none, which rules out essentially everything — that constraint is the point.
+[dependencies]
