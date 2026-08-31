@@ -360,7 +360,9 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<(), i64> {
     // 512-byte BPF stack — which is how run 33388924684 failed, with LLVM naming this function but not
     // the temporary. Both sides of the copy below are pointers into per-CPU maps, so nothing large is
     // ever a local.
-    let Some(pending) = unsafe { map.get(&key) } else {
+    //
+    // Parenthesized because rustc rejects a bare `}` immediately before `else` in a `let...else`.
+    let Some(pending) = (unsafe { map.get(&key) }) else {
         return Ok(()); // not a write-intent open, or the entry was dropped
     };
     let pending_mode = pending.mode;
