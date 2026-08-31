@@ -394,7 +394,16 @@ fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) 
 }
 
 /// Explains why a fact might be missing from the strace side.
-fn expectation_for_missing_from_strace(fact: &Fact, counterparts: &BTreeSet<Fact>) -> Expectation {
+///
+/// `own_facts` is the aya-side fact set. Needed because `mkdir -p` intermediate directories may not
+/// appear in the strace counterparts when the two backends use differently-named working directories
+/// (e.g. `parity-aya` vs `parity-strace`), but the component is still a parent of paths aya itself
+/// observed.
+fn expectation_for_missing_from_strace(
+    fact: &Fact,
+    counterparts: &BTreeSet<Fact>,
+    own_facts: &BTreeSet<Fact>,
+) -> Expectation {
     match fact {
         // aya hooks sys_enter_mkdirat (entry-side, before the kernel returns a result). When
         // `mkdir -p /a/b/c` creates each component, the calls for already-existing directories
@@ -406,40 +415,42 @@ fn expectation_for_missing_from_strace(fact: &Fact, counterparts: &BTreeSet<Fact
             kind: WriteKind::Mkdir,
             path,
         } => {
-            // Check if this path is a component/prefix of any other Mkdir fact in counterparts
-            // (the strace side). If strace has a longer mkdir whose path contains this as a
-            // prefix component, then this is an intermediate directory from mkdir -p.
-            let is_intermediate = counterparts.iter().any(|other| {
-                if let Fact::Wrote {
-                    kind: WriteKind::Mkdir,
-                    path: other_path,
-                } = other
-                {
-                    // Check if other_path contains this path as a component.
-                    // e.g. path="runner", other_path="/home/runner/work/..." → match
-                    // e.g. path="/home", other_path="/home/runner/work/..." → match
-                    if path.starts_with('/') {
-                        other_path.starts_with(path) && other_path.len() > path.len()
-                    } else {
-                        // Relative path — check if it's a component in any counterpart path
-                        let component = format!("/{path}/");
-                        other_path.contains(&component)
-                            || other_path.ends_with(&format!("/{path}"))
+            let is_component_of = |facts: &BTreeSet<Fact>| -> bool {
+                facts.iter().any(|other| match other {
+                    Fact::Wrote {
+                        path: other_path, ..
+                    } if other_path != path => {
+                        if path.starts_with('/') {
+                            other_path.starts_with(path) && other_path.len() > path.len()
+                        } else {
+                            let component = format!("/{path}/");
+                            other_path.contains(&component)
+                                || other_path.ends_with(&format!("/{path}"))
+                        }
                     }
-                } else {
-                    false
-                }
-            });
-            // Also check the aya-side facts themselves for longer paths
-            let is_intermediate = is_intermediate || {
-                // Fall back: for relative paths, check if the strace side has the absolute
-                // counterpart for this mkdir (same as regular relative/absolute pairing)
-                if path.starts_with('/') {
-                    has_relative_counterpart(counterparts, path, Some(WriteKind::Mkdir))
-                } else {
-                    has_absolute_counterpart(counterparts, path, Some(WriteKind::Mkdir))
-                }
+                    _ => false,
+                })
             };
+            // Check strace counterparts first, then aya's own facts (needed when the
+            // working directory names differ between backends, e.g. parity-aya vs parity-strace).
+            let is_intermediate = is_component_of(counterparts)
+                || is_component_of(own_facts)
+                || {
+                    if path.starts_with('/') {
+                        has_relative_counterpart(counterparts, path, Some(WriteKind::Mkdir))
+                    } else {
+                        has_absolute_counterpart(counterparts, path, Some(WriteKind::Mkdir))
+                    }
+                };
+            // Last resort for a single-component relative mkdir (no '/'): if the aya recording
+            // also contains other relative writes, this directory was the workload's CWD created
+            // by `mkdir -p`. The strace side has an equivalent under a different name
+            // (e.g. parity-strace vs parity-aya), so neither side's workload-dir mkdir appears
+            // in the other's facts.
+            let is_intermediate = is_intermediate
+                || (!path.contains('/') && !path.starts_with('/') && {
+                    own_facts.iter().any(|other| matches!(other, Fact::Wrote { path: p, .. } if p != path && !p.starts_with('/')))
+                });
             if is_intermediate {
                 Expectation::Expected(
                     "aya hooks sys_enter_mkdirat (entry-side, before knowing the outcome); mkdir -p \
@@ -606,7 +617,7 @@ pub fn compare(strace_events: &[Event], aya_events: &[Event]) -> ParityReport {
         differences.push(Difference {
             fact: fact.clone(),
             seen_by: Backend::Aya,
-            expectation: expectation_for_missing_from_strace(fact, &strace_facts),
+            expectation: expectation_for_missing_from_strace(fact, &strace_facts, &aya_facts),
         });
     }
 
