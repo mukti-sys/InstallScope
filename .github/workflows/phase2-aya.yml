@@ -191,7 +191,7 @@ jobs:
         run: |
           set -uo pipefail
           chmod +x harness/parity/parity-workload.sh
-          work="$RUNNER_TEMP/parity-strace"
+          work="$RUNNER_TEMP/strace-run/workdir"
           mkdir -p "$work"
           sudo ./target/release/installscope record \
             --backend strace \
@@ -217,7 +217,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          work="$RUNNER_TEMP/parity-aya"
+          work="$RUNNER_TEMP/aya-run/workdir"
           mkdir -p "$work"
           # A separate work directory from the strace run: sharing one would make this recording observe
           # the other's leftovers, and cleaning between runs would itself be recorded.

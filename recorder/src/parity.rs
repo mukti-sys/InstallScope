@@ -442,15 +442,11 @@ fn expectation_for_missing_from_strace(
                         has_absolute_counterpart(counterparts, path, Some(WriteKind::Mkdir))
                     }
                 };
-            // Last resort for a single-component relative mkdir (no '/'): if the aya recording
-            // also contains other relative writes, this directory was the workload's CWD created
-            // by `mkdir -p`. The strace side has an equivalent under a different name
-            // (e.g. parity-strace vs parity-aya), so neither side's workload-dir mkdir appears
-            // in the other's facts.
-            let is_intermediate = is_intermediate
-                || (!path.contains('/') && !path.starts_with('/') && {
-                    own_facts.iter().any(|other| matches!(other, Fact::Wrote { path: p, .. } if p != path && !p.starts_with('/')))
-                });
+            // NOTE: the CI workflow (`phase2-aya.yml`) must use the same workdir basename for both
+            // backends so that mkdir -p intermediates can be structurally matched. An earlier version
+            // had a broad fallback here that accepted any single-component relative mkdir whenever
+            // the aya recording contained any other relative write — that let fabricated directory
+            // names through. Removed in favour of the structural check above.
             if is_intermediate {
                 Expectation::Expected(
                     "aya hooks sys_enter_mkdirat (entry-side, before knowing the outcome); mkdir -p \
@@ -1154,5 +1150,84 @@ mod tests {
             .join("\n");
         let parsed = parse_stream(&contents).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(parsed.len(), 2);
+    }
+
+    fn mkdir_event(backend: Backend, path: &str, origin: PathOrigin) -> Event {
+        let mut event = write_event(backend, path, origin);
+        if let Payload::FsWrite(write) = &mut event.payload {
+            write.kind = WriteKind::Mkdir;
+        }
+        event
+    }
+
+    #[test]
+    fn an_unrelated_aya_only_mkdir_is_a_defect() {
+        // aya-only single-component mkdir that is not a parent of any other path
+        // on either side. Another relative write must not excuse it.
+        let strace = vec![
+            write_event(
+                Backend::Strace,
+                "/tmp/work/project/created.txt",
+                PathOrigin::Kernel,
+            ),
+            complete_end(Backend::Strace),
+        ];
+        let aya = vec![
+            write_event(Backend::Aya, "project/created.txt", PathOrigin::Unresolved),
+            mkdir_event(Backend::Aya, "totally-unrelated-name", PathOrigin::Unresolved),
+            complete_end(Backend::Aya),
+        ];
+
+        let report = compare(&strace, &aya);
+        assert!(
+            !report.passed(),
+            "an aya-only mkdir with no parent in either stream must fail: {}",
+            report.summary()
+        );
+        let mkdir_failures: Vec<_> = report
+            .failures()
+            .into_iter()
+            .filter(|d| {
+                d.seen_by == Backend::Aya
+                    && matches!(
+                        &d.fact,
+                        Fact::Wrote {
+                            path,
+                            kind: WriteKind::Mkdir
+                        } if path == "totally-unrelated-name"
+                    )
+            })
+            .collect();
+        assert_eq!(
+            mkdir_failures.len(),
+            1,
+            "the planted mkdir must be Unexpected, not Expected: {}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn mkdir_p_parent_of_a_relative_write_is_still_expected() {
+        // Control: mkdir -p still produces an entry-side mkdir for a real parent.
+        let strace = vec![
+            write_event(
+                Backend::Strace,
+                "/tmp/work/project/created.txt",
+                PathOrigin::Kernel,
+            ),
+            complete_end(Backend::Strace),
+        ];
+        let aya = vec![
+            mkdir_event(Backend::Aya, "project", PathOrigin::Unresolved),
+            write_event(Backend::Aya, "project/created.txt", PathOrigin::Unresolved),
+            complete_end(Backend::Aya),
+        ];
+
+        let report = compare(&strace, &aya);
+        assert!(
+            report.passed(),
+            "a mkdir that is a path prefix of another aya write is the mkdir -p case: {}",
+            report.summary()
+        );
     }
 }
