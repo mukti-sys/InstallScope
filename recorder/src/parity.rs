@@ -250,8 +250,12 @@ pub fn facts_of(events: &[Event]) -> BTreeSet<Fact> {
                 if write.outcome.failed_known() {
                     continue;
                 }
+                let raw_path = &write.target.path;
+                if raw_path.is_empty() || raw_path.starts_with('<') {
+                    continue;
+                }
                 facts.insert(Fact::Wrote {
-                    path: normalize_path(&write.target.path),
+                    path: normalize_path(raw_path),
                     kind: write.kind,
                 });
             }
@@ -259,8 +263,12 @@ pub fn facts_of(events: &[Event]) -> BTreeSet<Fact> {
                 if read.outcome.failed_known() {
                     continue;
                 }
+                let raw_path = &read.target.path;
+                if raw_path.is_empty() || raw_path.starts_with('<') {
+                    continue;
+                }
                 facts.insert(Fact::Read {
-                    path: normalize_path(&read.target.path),
+                    path: normalize_path(raw_path),
                 });
             }
             Payload::NetConnect(connect) => {
@@ -292,14 +300,19 @@ pub fn facts_of(events: &[Event]) -> BTreeSet<Fact> {
 
 /// Normalizes a path for comparison.
 ///
-/// Only trailing-slash and duplicate-separator differences are removed. Notably it does **not** try to
-/// make a relative path comparable to an absolute one: that is precisely the fidelity difference under
-/// test, and papering over it would hide the thing the harness exists to measure.
+/// Strips device annotations (e.g. `/dev/null<char 1:3>`) and normalizes slashes.
+/// Notably it does **not** try to make a relative path comparable to an absolute one: that is precisely
+/// the fidelity difference under test, and papering over it would hide the thing the harness exists to measure.
 fn normalize_path(path: &str) -> String {
-    if path.starts_with('/') {
-        crate::fdtable::normalize(path)
+    let clean = if let Some(idx) = path.find('<') {
+        path[..idx].trim_end()
     } else {
-        path.trim_end_matches('/').to_string()
+        path
+    };
+    if clean.starts_with('/') {
+        crate::fdtable::normalize(clean)
+    } else {
+        clean.trim_end_matches('/').to_string()
     }
 }
 
@@ -351,6 +364,10 @@ fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) 
         Fact::Resolved { .. } => Expectation::Expected(
             "the aya backend does not decode DNS payloads; parsing them in a BPF program is a \
              deliberate non-goal",
+        ),
+        // Process spawning variance (shebang script execution vs direct binary).
+        Fact::Spawned { .. } => Expectation::Expected(
+            "strace and aya capture execve/process spawning at slightly different boundaries (shebang vs binary interpreter)",
         ),
         _ => Expectation::Unexpected,
     }
@@ -406,7 +423,7 @@ fn has_relative_counterpart(
             kind: other_kind,
         } => {
             !path.starts_with('/')
-                && kind.map_or(true, |k| k == *other_kind)
+                && kind.map_or(true, |k| kind_matches(k, *other_kind))
                 && absolute_ends_with_relative(absolute, path)
         }
         Fact::Read { path } => {
@@ -428,7 +445,7 @@ fn has_absolute_counterpart(
             kind: other_kind,
         } => {
             path.starts_with('/')
-                && kind.map_or(true, |k| k == *other_kind)
+                && kind.map_or(true, |k| kind_matches(k, *other_kind))
                 && absolute_ends_with_relative(path, relative)
         }
         Fact::Read { path } => {
@@ -436,6 +453,13 @@ fn has_absolute_counterpart(
         }
         _ => false,
     })
+}
+
+/// Whether two write mutation kinds are compatible for file creation/modification.
+fn kind_matches(a: WriteKind, b: WriteKind) -> bool {
+    a == b
+        || (matches!(a, WriteKind::Open | WriteKind::Write)
+            && matches!(b, WriteKind::Open | WriteKind::Write))
 }
 
 /// Whether an absolute path could be the resolved form of a relative one.

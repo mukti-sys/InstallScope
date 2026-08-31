@@ -137,16 +137,47 @@ impl Merged {
     }
 }
 
+/// A record waiting in the reorder window, still unprocessed.
+///
+/// Buffered *before* any fd-table work, which is the whole point: per-CPU rings deliver out of order, so
+/// a write frequently arrives before the open that gives it a path. Run 33398685709 showed the cost of
+/// getting this wrong — 83 writes and 262 KB unattributable because the open had not been seen yet.
+#[derive(Debug, Clone)]
+enum Buffered {
+    Fs(Box<FsRecord>),
+    Close { header: Header, fd: i32 },
+    Net(installscope_abi::NetRecord),
+    Proc(Box<installscope_abi::ProcRecord>),
+}
+
+impl Buffered {
+    const fn ktime_ns(&self) -> u64 {
+        match self {
+            Self::Fs(record) => record.header.ktime_ns,
+            Self::Close { header, .. } => header.ktime_ns,
+            Self::Net(record) => record.header.ktime_ns,
+            Self::Proc(record) => record.header.ktime_ns,
+        }
+    }
+}
+
 /// Buffers, orders, and aggregates records from a perf-buffer backend.
 ///
 /// Feed records in arrival order; drain with [`Self::drain_ready`] periodically and [`Self::finish`]
 /// once at the end.
+///
+/// # Why the fd table is updated on drain, not on push
+///
+/// Descriptor state is inherently ordered: an open establishes `fd -> path`, later writes accumulate
+/// against it, a close finalizes the total. Applying those in arrival order gives wrong answers whenever
+/// the ring buffers hand them over out of order, which they routinely do. So records are buffered raw,
+/// released in timestamp order, and only *then* interpreted.
 #[derive(Debug, Default)]
 pub struct Merger {
     /// Pending records keyed by `(ktime_ns, sequence)`. The sequence disambiguates identical timestamps,
     /// which are common because `bpf_ktime_get_ns` has coarse resolution on some kernels — without it,
     /// a `BTreeMap` would silently drop the second event of a pair.
-    pending: BTreeMap<(u64, u64), Merged>,
+    pending: BTreeMap<(u64, u64), Buffered>,
     sequence: u64,
     /// Open descriptors per pid. Keyed by tgid because that is the process userspace means.
     files: HashMap<(u32, i32), OpenFile>,
@@ -177,17 +208,59 @@ impl Merger {
     }
 
     /// Accepts a filesystem record.
-    ///
-    /// Opens and closes update the fd table and produce no event of their own beyond the open itself;
-    /// writes accumulate and are emitted on close or at end of session.
     pub fn push_fs(&mut self, record: &FsRecord) {
         self.stats.accepted += 1;
+        self.enqueue(Buffered::Fs(Box::new(*record)));
+    }
+
+    /// Accepts a descriptor close.
+    pub fn push_close(&mut self, header: &Header, fd: i32) {
+        self.stats.accepted += 1;
+        self.enqueue(Buffered::Close {
+            header: *header,
+            fd,
+        });
+    }
+
+    /// Accepts a network record.
+    pub fn push_net(&mut self, record: installscope_abi::NetRecord) {
+        self.stats.accepted += 1;
+        self.enqueue(Buffered::Net(record));
+    }
+
+    /// Accepts a process spawn.
+    pub fn push_proc(&mut self, record: installscope_abi::ProcRecord) {
+        self.stats.accepted += 1;
+        self.enqueue(Buffered::Proc(Box::new(record)));
+    }
+
+    fn enqueue(&mut self, buffered: Buffered) {
+        let ktime = buffered.ktime_ns();
+        if ktime < self.last_released_ns {
+            self.stats.late_events += 1;
+        }
+        self.sequence += 1;
+        self.pending.insert((ktime, self.sequence), buffered);
+    }
+
+    /// Interprets one released record, updating descriptor state and producing events.
+    fn process(&mut self, buffered: Buffered, out: &mut Vec<Merged>) {
+        match buffered {
+            Buffered::Fs(record) => self.process_fs(&record, out),
+            Buffered::Close { header, fd } => match self.files.remove(&(header.tgid, fd)) {
+                Some(file) => Self::flush_file(header.tgid, &file, out),
+                None => self.stats.closes_without_open += 1,
+            },
+            Buffered::Net(record) => out.push(Merged::Net(record)),
+            Buffered::Proc(record) => out.push(Merged::Proc(record)),
+        }
+    }
+
+    fn process_fs(&mut self, record: &FsRecord, out: &mut Vec<Merged>) {
         let tgid = record.header.tgid;
 
         match record.write_kind {
-            installscope_abi::WRITE_WRITE => {
-                self.accumulate_write(record, tgid);
-            }
+            installscope_abi::WRITE_WRITE => self.accumulate_write(record, tgid, out),
             installscope_abi::WRITE_OPEN => {
                 let path = String::from_utf8_lossy(record.path_bytes())
                     .trim_end_matches('\0')
@@ -200,7 +273,7 @@ impl Merger {
                     // Reusing a descriptor without an intervening close (dup2, or a close we missed)
                     // must flush the old total rather than merge two files' bytes.
                     if let Some(previous) = self.files.remove(&(tgid, record.fd)) {
-                        self.flush_file(tgid, &previous);
+                        Self::flush_file(tgid, &previous, out);
                     }
                     self.files.insert(
                         (tgid, record.fd),
@@ -214,7 +287,7 @@ impl Merger {
                     );
                 }
 
-                self.enqueue(Merged::Fs {
+                out.push(Merged::Fs {
                     header: record.header,
                     write_kind: installscope_abi::WRITE_OPEN,
                     path: Some(path),
@@ -229,7 +302,7 @@ impl Merger {
                 let path = String::from_utf8_lossy(record.path_bytes())
                     .trim_end_matches('\0')
                     .to_string();
-                self.enqueue(Merged::Fs {
+                out.push(Merged::Fs {
                     header: record.header,
                     write_kind: record.write_kind,
                     path: (!path.is_empty()).then_some(path),
@@ -242,19 +315,19 @@ impl Merger {
         }
     }
 
-    fn accumulate_write(&mut self, record: &FsRecord, tgid: u32) {
+    fn accumulate_write(&mut self, record: &FsRecord, tgid: u32, out: &mut Vec<Merged>) {
         if let Some(file) = self.files.get_mut(&(tgid, record.fd)) {
             file.bytes = file.bytes.saturating_add(record.bytes);
             file.writes += 1;
             file.last_ktime_ns = record.header.ktime_ns;
             return;
         }
-        // No known path. Common and expected: descriptors inherited across fork, or opened before the
-        // recording started. Counted so the total is honest about what could not be attributed, and
-        // emitted with `path: None` rather than guessed at.
+        // No known path. Expected for descriptors inherited across fork or opened before the recording
+        // started — stdout and stderr are the common case. Counted so the total is honest about what
+        // could not be attributed, and emitted with `path: None` rather than guessed at.
         self.stats.writes_without_path += 1;
         self.stats.unattributed_bytes = self.stats.unattributed_bytes.saturating_add(record.bytes);
-        self.enqueue(Merged::Fs {
+        out.push(Merged::Fs {
             header: record.header,
             write_kind: installscope_abi::WRITE_WRITE,
             path: None,
@@ -265,29 +338,8 @@ impl Merger {
         });
     }
 
-    /// Accepts a descriptor close, flushing that descriptor's accumulated write volume.
-    pub fn push_close(&mut self, header: &Header, fd: i32) {
-        self.stats.accepted += 1;
-        match self.files.remove(&(header.tgid, fd)) {
-            Some(file) => self.flush_file(header.tgid, &file),
-            None => self.stats.closes_without_open += 1,
-        }
-    }
-
-    /// Accepts a network record.
-    pub fn push_net(&mut self, record: installscope_abi::NetRecord) {
-        self.stats.accepted += 1;
-        self.enqueue(Merged::Net(record));
-    }
-
-    /// Accepts a process spawn.
-    pub fn push_proc(&mut self, record: installscope_abi::ProcRecord) {
-        self.stats.accepted += 1;
-        self.enqueue(Merged::Proc(Box::new(record)));
-    }
-
     /// Emits the aggregated byte total for a closed descriptor.
-    fn flush_file(&mut self, tgid: u32, file: &OpenFile) {
+    fn flush_file(tgid: u32, file: &OpenFile, out: &mut Vec<Merged>) {
         if file.writes == 0 {
             return; // opened but never written; the open event already recorded it
         }
@@ -296,7 +348,7 @@ impl Merger {
         header.ktime_ns = file.last_ktime_ns;
         header.tgid = tgid;
         header.pid = tgid;
-        self.enqueue(Merged::Fs {
+        out.push(Merged::Fs {
             header,
             write_kind: installscope_abi::WRITE_WRITE,
             path: Some(file.path.clone()),
@@ -307,19 +359,10 @@ impl Merger {
         });
     }
 
-    fn enqueue(&mut self, event: Merged) {
-        let ktime = event.ktime_ns();
-        if ktime < self.last_released_ns {
-            self.stats.late_events += 1;
-        }
-        self.sequence += 1;
-        self.pending.insert((ktime, self.sequence), event);
-    }
-
     /// Releases every buffered record older than the reorder window.
     ///
     /// `now_ktime_ns` is the newest timestamp seen from any CPU; records more than
-    /// [`REORDER_WINDOW_NS`] older than it are safe to emit.
+    /// [`REORDER_WINDOW_NS`] older than it are safe to interpret.
     pub fn drain_ready(&mut self, now_ktime_ns: u64) -> Vec<Merged> {
         let cutoff = now_ktime_ns.saturating_sub(REORDER_WINDOW_NS);
         let mut out = Vec::new();
@@ -328,13 +371,13 @@ impl Merger {
         let ready: Vec<(u64, u64)> = self
             .pending
             .range(..=(cutoff, u64::MAX))
-            .map(|(k, _)| *k)
+            .map(|(key, _)| *key)
             .collect();
         for key in ready {
-            if let Some(event) = self.pending.remove(&key) {
+            if let Some(buffered) = self.pending.remove(&key) {
                 self.last_released_ns = self.last_released_ns.max(key.0);
                 self.stats.released += 1;
-                out.push(event);
+                self.process(buffered, &mut out);
             }
         }
 
@@ -343,14 +386,18 @@ impl Merger {
             let Some(key) = self.pending.keys().next().copied() else {
                 break;
             };
-            if let Some(event) = self.pending.remove(&key) {
+            if let Some(buffered) = self.pending.remove(&key) {
                 self.stats.forced_releases += 1;
                 self.last_released_ns = self.last_released_ns.max(key.0);
                 self.stats.released += 1;
-                out.push(event);
+                self.process(buffered, &mut out);
             }
         }
 
+        // An aggregated write carries the timestamp of its last write, which can predate a plain event
+        // released alongside it. Sorting the batch keeps the stream monotonic; a stable sort preserves
+        // the relative order of events that share a timestamp.
+        out.sort_by_key(Merged::ktime_ns);
         out
     }
 
@@ -359,21 +406,24 @@ impl Merger {
     /// Must be called once at end of session: the accumulated byte totals for files never explicitly
     /// closed exist only here, and losing them would silently understate write volume.
     pub fn finish(&mut self) -> Vec<Merged> {
+        let mut out = Vec::new();
+
+        let keys: Vec<(u64, u64)> = self.pending.keys().copied().collect();
+        for key in keys {
+            if let Some(buffered) = self.pending.remove(&key) {
+                self.stats.released += 1;
+                self.process(buffered, &mut out);
+            }
+        }
+
         let mut open: Vec<((u32, i32), OpenFile)> = self.files.drain().collect();
         // Deterministic order so a parity comparison is stable across runs.
         open.sort_by_key(|((tgid, fd), _)| (*tgid, *fd));
         for ((tgid, _), file) in open {
-            self.flush_file(tgid, &file);
+            Self::flush_file(tgid, &file, &mut out);
         }
 
-        let mut out = Vec::new();
-        let keys: Vec<(u64, u64)> = self.pending.keys().copied().collect();
-        for key in keys {
-            if let Some(event) = self.pending.remove(&key) {
-                self.stats.released += 1;
-                out.push(event);
-            }
-        }
+        out.sort_by_key(Merged::ktime_ns);
         out
     }
 
@@ -674,7 +724,9 @@ mod tests {
         let mut merger = Merger::new();
         merger.push_fs(&fs_record(1_000, 7, WRITE_OPEN, 3, "/work/unclosed", 0));
         merger.push_fs(&fs_record(1_100, 7, WRITE_WRITE, 3, "", 999));
-        assert_eq!(merger.tracked_files(), 1);
+        // Nothing is in the fd table yet: records are buffered raw and only interpreted on release, so
+        // that out-of-order arrivals can be reordered before descriptor state is applied.
+        assert_eq!(merger.tracked_files(), 0);
 
         let released = merger.finish();
         assert_eq!(merger.tracked_files(), 0);
@@ -685,6 +737,65 @@ mod tests {
             )),
             "an unclosed file's total must still be emitted"
         );
+    }
+
+    #[test]
+    fn a_write_arriving_before_its_open_still_resolves() {
+        // THE case this design exists for. Per-CPU rings deliver out of order, so a write frequently
+        // arrives before the open that names its descriptor. Run 33398685709 interpreted records on
+        // arrival and lost 262 KB across 83 writes to "<unknown descriptor>" for exactly this reason.
+        let mut merger = Merger::new();
+        // Write first, open second — reversed arrival, correct timestamps.
+        merger.push_fs(&fs_record(2_000, 7, WRITE_WRITE, 3, "", 4096));
+        merger.push_fs(&fs_record(
+            1_000,
+            7,
+            WRITE_OPEN,
+            3,
+            "/work/reordered.bin",
+            0,
+        ));
+
+        let released = merger.finish();
+        let attributed = released.iter().find_map(|e| match e {
+            Merged::Fs {
+                path: Some(path),
+                bytes: Some(bytes),
+                ..
+            } => Some((path.clone(), *bytes)),
+            _ => None,
+        });
+        assert_eq!(
+            attributed,
+            Some(("/work/reordered.bin".to_string(), 4096)),
+            "the write must resolve against an open that arrived later"
+        );
+        assert_eq!(
+            merger.stats().writes_without_path,
+            0,
+            "nothing should be unattributable once ordering is applied"
+        );
+    }
+
+    #[test]
+    fn released_batches_are_monotonic_in_time() {
+        // An aggregated write carries the timestamp of its last write, which can predate a plain event
+        // released in the same batch. Without the sort the stream would step backwards, breaking the one
+        // guarantee a forensic reader relies on.
+        let mut merger = Merger::new();
+        merger.push_fs(&fs_record(1_000, 7, WRITE_OPEN, 3, "/work/a", 0));
+        merger.push_fs(&fs_record(1_100, 7, WRITE_WRITE, 3, "", 10));
+        merger.push_fs(&fs_record(1_500, 7, WRITE_MKDIR, NO_FD, "/work/dir", 0));
+        let mut header = Header::zeroed();
+        header.tgid = 7;
+        header.ktime_ns = 1_600;
+        merger.push_close(&header, 3);
+
+        let released = merger.drain_ready(2_000 + REORDER_WINDOW_NS);
+        let times: Vec<u64> = released.iter().map(Merged::ktime_ns).collect();
+        let mut sorted = times.clone();
+        sorted.sort_unstable();
+        assert_eq!(times, sorted, "a released batch must be ordered: {times:?}");
     }
 
     #[test]

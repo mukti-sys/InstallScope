@@ -89,7 +89,8 @@ use installscope_abi::{
     FsRecord, Header, NetRecord, ProcRecord, AF_INET4, AF_INET6, ARGV_ARG_LEN, ARGV_MAX_ARGS,
     FLAG_ADDR_UNKNOWN,
     FLAG_ARGV_TRUNCATED, FLAG_FAILED, FLAG_PATH_TRUNCATED, KIND_FD_CLOSE, KIND_FS_WRITE,
-    KIND_NET_CONNECT, KIND_PROC_SPAWN, NO_FD, PATH_BUF_LEN, WRITE_MKDIR, WRITE_OPEN, WRITE_RENAME,
+    KIND_NET_CONNECT, KIND_PROC_SPAWN, NO_FD, PATH_BUF_LEN, WRITE_CHMOD, WRITE_DELETE,
+    WRITE_HARDLINK, WRITE_MKDIR, WRITE_OPEN, WRITE_RENAME, WRITE_SYMLINK, WRITE_TRUNCATE,
     WRITE_WRITE,
 };
 
@@ -488,10 +489,103 @@ pub fn installscope_mkdirat(ctx: TracePointContext) -> u32 {
     0
 }
 
-/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)` — the destination is what matters.
+/// `mkdir(pathname, mode)` — the legacy form, without a `dirfd`.
+///
+/// Both variants are traced because which one a program uses is not predictable. Run 33398685709 showed
+/// why it matters: strace reported four `mkdir` calls from the parity workload that this backend missed
+/// entirely, because coreutils `mkdir` and bash's `mkdir -p` issue the plain syscall while only the
+/// `*at` form was attached. A probe set narrower than reality produces a recording that looks clean.
+#[tracepoint]
+pub fn installscope_mkdir(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_MKDIR, 0);
+    0
+}
+
+/// `renameat2(olddfd, oldname, newdfd, newname, flags)` — the destination is what matters.
 #[tracepoint]
 pub fn installscope_renameat(ctx: TracePointContext) -> u32 {
     let _ = try_path_only(&ctx, WRITE_RENAME, 3);
+    0
+}
+
+/// `rename(oldname, newname)` — the legacy form. Destination is argument 1.
+#[tracepoint]
+pub fn installscope_rename(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_RENAME, 1);
+    0
+}
+
+/// `unlinkat(dfd, pathname, flags)`.
+#[tracepoint]
+pub fn installscope_unlinkat(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_DELETE, 1);
+    0
+}
+
+/// `unlink(pathname)` — the legacy form, which `rm` actually uses.
+#[tracepoint]
+pub fn installscope_unlink(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_DELETE, 0);
+    0
+}
+
+/// `rmdir(pathname)`. Reported as a delete: for evidence purposes removing a directory and removing a
+/// file are the same claim.
+#[tracepoint]
+pub fn installscope_rmdir(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_DELETE, 0);
+    0
+}
+
+/// `symlinkat(oldname, newdfd, newname)` — the *link* is what was created, so argument 2.
+#[tracepoint]
+pub fn installscope_symlinkat(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_SYMLINK, 2);
+    0
+}
+
+/// `symlink(oldname, newname)` — the legacy form; the link is argument 1.
+#[tracepoint]
+pub fn installscope_symlink(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_SYMLINK, 1);
+    0
+}
+
+/// `linkat(olddfd, oldname, newdfd, newname, flags)` — the new link is argument 3.
+#[tracepoint]
+pub fn installscope_linkat(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_HARDLINK, 3);
+    0
+}
+
+/// `link(oldname, newname)` — the legacy form; the new link is argument 1.
+#[tracepoint]
+pub fn installscope_link(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_HARDLINK, 1);
+    0
+}
+
+/// `chmod(filename, mode)`.
+///
+/// Making a file executable is a finding in its own right (Architecture.md §4), so both forms are
+/// traced.
+#[tracepoint]
+pub fn installscope_chmod(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_CHMOD, 0);
+    0
+}
+
+/// `fchmodat(dfd, filename, mode)`.
+#[tracepoint]
+pub fn installscope_fchmodat(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_CHMOD, 1);
+    0
+}
+
+/// `truncate(path, length)`.
+#[tracepoint]
+pub fn installscope_truncate(ctx: TracePointContext) -> u32 {
+    let _ = try_path_only(&ctx, WRITE_TRUNCATE, 0);
     0
 }
 
