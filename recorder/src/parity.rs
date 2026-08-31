@@ -1174,7 +1174,11 @@ mod tests {
         ];
         let aya = vec![
             write_event(Backend::Aya, "project/created.txt", PathOrigin::Unresolved),
-            mkdir_event(Backend::Aya, "totally-unrelated-name", PathOrigin::Unresolved),
+            mkdir_event(
+                Backend::Aya,
+                "totally-unrelated-name",
+                PathOrigin::Unresolved,
+            ),
             complete_end(Backend::Aya),
         ];
 

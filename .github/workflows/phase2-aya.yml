@@ -191,7 +191,7 @@ jobs:
         run: |
           set -uo pipefail
           chmod +x harness/parity/parity-workload.sh
-          work="$RUNNER_TEMP/strace-run/workdir"
+          work="$RUNNER_TEMP/parity-work"
           mkdir -p "$work"
           sudo ./target/release/installscope record \
             --backend strace \
@@ -217,10 +217,14 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          work="$RUNNER_TEMP/aya-run/workdir"
+          work="$RUNNER_TEMP/parity-work"
+          # Clean the strace run's leftovers so the aya recording starts fresh.
+          # rm itself is not recorded — it runs before the recorder starts.
+          rm -rf "$work"
           mkdir -p "$work"
-          # A separate work directory from the strace run: sharing one would make this recording observe
-          # the other's leftovers, and cleaning between runs would itself be recorded.
+          # Same directory path as the strace run: the parity classifier needs identical mkdir -p
+          # components so its structural matching works. Cleaning between runs prevents cross-
+          # contamination without introducing a basename mismatch.
           sudo ./target/release/installscope -vv record \
             --backend aya \
             --ebpf-object recorder/aya-ebpf/target/bpfel-unknown-none/release/installscope-ebpf \
