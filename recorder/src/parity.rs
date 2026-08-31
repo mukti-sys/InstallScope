@@ -309,6 +309,7 @@ fn normalize_path(path: &str) -> String {
     } else {
         path
     };
+    let clean = clean.strip_prefix("./").unwrap_or(clean);
     if clean.starts_with('/') {
         crate::fdtable::normalize(clean)
     } else {
@@ -388,10 +389,28 @@ fn expectation_for_missing_from_strace(fact: &Fact, counterparts: &BTreeSet<Fact
                 Expectation::Unexpected
             }
         }
+        Fact::Wrote { path, kind } if path.starts_with('/') => {
+            if has_relative_counterpart(counterparts, path, Some(*kind)) {
+                Expectation::Expected(
+                    "aya recorded an absolute path; strace recorded its relative counterpart",
+                )
+            } else {
+                Expectation::Unexpected
+            }
+        }
         Fact::Read { path } if !path.starts_with('/') => {
             if has_absolute_counterpart(counterparts, path, None) {
                 Expectation::Expected(
                     "strace resolves paths via -yy; the resolved form of this read is present instead",
+                )
+            } else {
+                Expectation::Unexpected
+            }
+        }
+        Fact::Read { path } if path.starts_with('/') => {
+            if has_relative_counterpart(counterparts, path, None) {
+                Expectation::Expected(
+                    "aya recorded an absolute path for a read; strace recorded its relative counterpart",
                 )
             } else {
                 Expectation::Unexpected
@@ -458,19 +477,28 @@ fn has_absolute_counterpart(
 /// Whether two write mutation kinds are compatible for file creation/modification.
 fn kind_matches(a: WriteKind, b: WriteKind) -> bool {
     a == b
-        || (matches!(a, WriteKind::Open | WriteKind::Write)
-            && matches!(b, WriteKind::Open | WriteKind::Write))
+        || (matches!(
+            a,
+            WriteKind::Open | WriteKind::Write | WriteKind::Create | WriteKind::Truncate
+        ) && matches!(
+            b,
+            WriteKind::Open | WriteKind::Write | WriteKind::Create | WriteKind::Truncate
+        ))
 }
 
 /// Whether an absolute path could be the resolved form of a relative one.
 ///
 /// Requires a component boundary, so `/work/other.txt` does not match `her.txt`.
 fn absolute_ends_with_relative(absolute: &str, relative: &str) -> bool {
-    if relative.is_empty() {
+    let rel = relative
+        .strip_prefix("./")
+        .unwrap_or(relative)
+        .trim_end_matches('/');
+    if rel.is_empty() {
         return false;
     }
     absolute
-        .strip_suffix(relative)
+        .strip_suffix(rel)
         .is_some_and(|prefix| prefix.ends_with('/'))
 }
 
