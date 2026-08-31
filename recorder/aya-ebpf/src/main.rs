@@ -355,10 +355,17 @@ pub fn installscope_openat_exit(ctx: TracePointContext) -> u32 {
 fn try_openat_exit(ctx: &TracePointContext) -> Result<(), i64> {
     let key = unsafe { bpf_get_current_pid_tgid() };
     let map = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_INFLIGHT) };
-    let Some(pending) = unsafe { map.get(&key) }.copied() else {
+
+    // Borrowed, never copied. `.copied()` here would pull all 528 bytes of PendingOpen onto the
+    // 512-byte BPF stack — which is how run 33388924684 failed, with LLVM naming this function but not
+    // the temporary. Both sides of the copy below are pointers into per-CPU maps, so nothing large is
+    // ever a local.
+    let Some(pending) = unsafe { map.get(&key) } else {
         return Ok(()); // not a write-intent open, or the entry was dropped
     };
-    let _ = map.remove(&key);
+    let pending_mode = pending.mode;
+    let pending_flags = pending.flags;
+    let pending_path_len = pending.path_len.min(PATH_BUF_LEN as u32);
 
     let ret: i64 = unsafe { ctx.read_at(EXIT_RET) }?;
 
@@ -369,11 +376,27 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<(), i64> {
     *record = FsRecord::zeroed();
     record.header = header(KIND_FS_WRITE);
     record.write_kind = WRITE_OPEN;
-    record.mode = pending.mode;
-    record.path_len = pending.path_len.min(PATH_BUF_LEN as u32);
-    record.path = pending.path;
+    record.mode = pending_mode;
+    record.path_len = pending_path_len;
 
-    if pending.flags & TRUNCATED_MARKER != 0 {
+    // Map-to-map copy. A struct assignment (`record.path = pending.path`) would give LLVM licence to
+    // stage the 512 bytes through the stack; copying explicitly between two map pointers does not.
+    //
+    // Safety: both pointers address per-CPU map slots of at least PATH_BUF_LEN bytes, exclusively ours
+    // for this program's duration, and the regions do not overlap — they are different maps.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            pending.path.as_ptr(),
+            record.path.as_mut_ptr(),
+            PATH_BUF_LEN,
+        );
+    }
+
+    // The map entry is dead once its contents have been transferred. Removed after the copy rather than
+    // before, so a concurrent lookup on another CPU cannot observe a half-retired entry.
+    let _ = map.remove(&key);
+
+    if pending_flags & TRUNCATED_MARKER != 0 {
         record.header.flags |= FLAG_PATH_TRUNCATED;
     }
 
