@@ -385,7 +385,12 @@ jobs:
             echo "::warning title=PARTIAL::the aya recording is incomplete; see the reasons in record-aya.log"
           fi
           if [ "$parity" != "0" ]; then
-            echo "::error title=Parity failed::The two backends disagree in ways nothing explains. Unexplained differences are listed in parity.txt. Do not widen the expected-difference list in recorder/src/parity.rs to make this pass without a stated reason."
+            echo "::error title=Parity failed::The two backends disagree in ways nothing explains."
+            if [ -f artifacts/parity.txt ]; then
+              echo "================ PARITY REPORT ================"
+              cat artifacts/parity.txt
+              echo "==============================================="
+            fi
             exit 1
           fi
           echo "Phase 2 parity holds. Record the run id and the parity output in Memory.md."
