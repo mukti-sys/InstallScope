@@ -255,6 +255,10 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     if config.command.is_empty() {
         return Err(RecorderError::EmptyCommand);
     }
+    // Same resolution as the strace backend, for the same reason: the child runs with a caller-chosen
+    // working directory, so a relative program path would be resolved against the wrong one. Failing here
+    // names the command line instead of leaving an empty recording that blames the backend.
+    let resolved_command = crate::resolve_program(&config.command, config.cwd.as_deref())?;
     let capabilities = check_available(&config.object)?;
 
     std::fs::create_dir_all(&config.out_dir)
@@ -285,7 +289,7 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         crate::clock::rfc3339_utc(wall_clock),
         AGENT_VERSION,
         Backend::Aya,
-        config.command.clone(),
+        resolved_command.clone(),
         zones,
         Some(host_info(&capabilities)),
     )?;
@@ -387,8 +391,8 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     drop(sender);
 
     // ---- spawn the command ----------------------------------------------------------------------
-    let mut command = Command::new(&config.command[0]);
-    command.args(&config.command[1..]);
+    let mut command = Command::new(&resolved_command[0]);
+    command.args(&resolved_command[1..]);
     if let Some(dir) = &config.cwd {
         command.current_dir(dir);
     }

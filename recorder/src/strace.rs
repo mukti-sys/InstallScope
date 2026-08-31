@@ -207,6 +207,15 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
 
     let strace_version = check_available()?;
 
+    // The program is resolved to an absolute path before anything else happens.
+    //
+    // strace runs with `current_dir(config.cwd)`, so a relative program path like
+    // `./harness/parity/parity-workload.sh` is resolved against the *recorded command's* directory, not
+    // the recorder's. Left alone it fails with "Cannot stat", produces no trace files, and the recording
+    // comes back PARTIAL blaming the backend — the same class of misleading diagnosis as the relative
+    // `-o` bug, and equally the recorder's fault rather than the package's.
+    let command = crate::resolve_program(&config.command, config.cwd.as_deref())?;
+
     fs::create_dir_all(&config.out_dir)
         .map_err(|source| RecorderError::io(&config.out_dir, source))?;
 
@@ -266,7 +275,7 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         rfc3339_utc(start_time),
         AGENT_VERSION,
         Backend::Strace,
-        config.command.clone(),
+        command.clone(),
         zones,
         Some(host_info(&strace_version)),
     )?;
@@ -285,7 +294,7 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         .arg("-o")
         .arg(&trace_prefix)
         .arg("--");
-    for part in &config.command {
+    for part in &command {
         cmd.arg(OsStr::new(part));
     }
     if let Some(dir) = &config.cwd {
@@ -576,6 +585,27 @@ mod tests {
         let config = RecordConfig::new(Vec::new(), PathBuf::from("/tmp/does-not-matter"));
         let err = record(&config).expect_err("must reject");
         assert!(matches!(err, RecorderError::EmptyCommand));
+    }
+
+    #[test]
+    fn a_nonexistent_program_is_named_rather_than_blamed_on_the_backend() {
+        // Run 33390145890 failed as "strace produced no trace files" because the workflow passed a
+        // relative script path that resolved against --cwd instead of the recorder's directory. That
+        // message is true and useless: it points at the recorder when the fault is the command line.
+        let config = RecordConfig::new(
+            vec!["./definitely/not/here.sh".to_string()],
+            PathBuf::from("/tmp/does-not-matter"),
+        );
+        match record(&config) {
+            Err(RecorderError::CommandNotExecutable { program, .. }) => {
+                assert_eq!(program, "./definitely/not/here.sh");
+            }
+            Err(RecorderError::BackendMissing { .. }) => {
+                // No strace on this host; the resolution check is still exercised by the unit tests in
+                // lib.rs, which need no external binary.
+            }
+            other => panic!("expected CommandNotExecutable, got {other:?}"),
+        }
     }
 
     #[test]
