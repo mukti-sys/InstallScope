@@ -86,7 +86,8 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use installscope_abi::{
-    FsRecord, Header, NetRecord, ProcRecord, AF_INET4, AF_INET6, ARGV_BUF_LEN, FLAG_ADDR_UNKNOWN,
+    FsRecord, Header, NetRecord, ProcRecord, AF_INET4, AF_INET6, ARGV_ARG_LEN, ARGV_MAX_ARGS,
+    FLAG_ADDR_UNKNOWN,
     FLAG_ARGV_TRUNCATED, FLAG_FAILED, FLAG_PATH_TRUNCATED, KIND_FD_CLOSE, KIND_FS_WRITE,
     KIND_NET_CONNECT, KIND_PROC_SPAWN, NO_FD, PATH_BUF_LEN, WRITE_MKDIR, WRITE_OPEN, WRITE_RENAME,
     WRITE_WRITE,
@@ -590,10 +591,6 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
 // Process spawns
 // ---------------------------------------------------------------------------------------------
 
-/// Maximum argv entries copied. Bounded because the verifier requires a compile-time loop bound, and
-/// because an unbounded copy would let one pathological process fill the perf buffer.
-const MAX_ARGV: usize = 20;
-
 /// `execve(filename, argv, envp)`.
 ///
 /// envp is deliberately not read. Environment variables routinely contain tokens and credentials, and
@@ -626,56 +623,55 @@ fn try_execve(ctx: &TracePointContext) -> Result<(), i64> {
         record.header.flags |= FLAG_PATH_TRUNCATED;
     }
 
-    // argv is a NULL-terminated array of pointers; each string is copied into one flat buffer,
-    // NUL-separated, which is what the ABI documents.
-    let mut cursor = 0usize;
+    // Each argument goes into its own fixed-width slot.
+    //
+    // The obvious design — pack them into one buffer behind a running cursor — is what run 33392879818
+    // was rejected for:
+    //
+    //   invalid access to map value, value_size=1600 off=595 size=1023
+    //   R1 min value is outside of the allowed memory range
+    //
+    // A cursor makes every write a variable-offset, variable-size access into a map value, and the
+    // verifier cannot prove those in bounds. With `i` a constant after unrolling, `i * ARGV_ARG_LEN` is
+    // a constant offset and the slot length is a constant size, so the check is trivial. The cost is
+    // wasted space in short arguments, which is the right trade for a program that has to load at all.
     let mut argc = 0u32;
     let mut argv_truncated = false;
 
-    for i in 0..MAX_ARGV {
-        if argv_addr == 0 {
-            break;
-        }
-        let slot = argv_addr + (i * core::mem::size_of::<u64>()) as u64;
-        // Parenthesized because rustc rejects a bare `}` immediately before `else` in a `let...else`.
-        let Ok(str_ptr) = (unsafe { bpf_probe_read_user(slot as *const u64) }) else {
-            argv_truncated = true;
-            break;
-        };
-        if str_ptr == 0 {
-            break; // end of argv
-        }
-        // Leave room for the separator; bail rather than write a partial argument.
-        if cursor + 2 >= ARGV_BUF_LEN {
-            argv_truncated = true;
-            break;
-        }
-        let Some(dest) = record.argv.get_mut(cursor..ARGV_BUF_LEN - 1) else {
-            argv_truncated = true;
-            break;
-        };
-        match unsafe { bpf_probe_read_user_str_bytes(str_ptr as *const u8, dest) } {
-            Ok(read) => {
-                let n = read.len();
-                cursor += n;
-                if let Some(slot) = record.argv.get_mut(cursor) {
-                    *slot = 0; // explicit separator
-                    cursor += 1;
-                }
-                argc += 1;
+    if argv_addr != 0 {
+        for index in 0..ARGV_MAX_ARGS {
+            let slot_addr = argv_addr + (index * core::mem::size_of::<u64>()) as u64;
+            // Parenthesized because rustc rejects a bare `}` immediately before `else` in a `let...else`.
+            let Ok(str_ptr) = (unsafe { bpf_probe_read_user(slot_addr as *const u64) }) else {
+                argv_truncated = true;
+                break;
+            };
+            if str_ptr == 0 {
+                break; // end of argv
             }
-            Err(_) => {
+
+            let start = index * ARGV_ARG_LEN;
+            let Some(dest) = record.argv.get_mut(start..start + ARGV_ARG_LEN) else {
+                argv_truncated = true;
+                break;
+            };
+            if unsafe { bpf_probe_read_user_str_bytes(str_ptr as *const u8, dest) }.is_err() {
                 argv_truncated = true;
                 break;
             }
-        }
-        if i == MAX_ARGV - 1 {
-            // Hit the entry cap; there may be more arguments we did not see.
-            argv_truncated = true;
+            argc += 1;
+
+            if index == ARGV_MAX_ARGS - 1 {
+                // Hit the slot cap; there may be more arguments we did not see. A rule matching a
+                // command line must know whether it saw all of it.
+                argv_truncated = true;
+            }
         }
     }
 
-    record.argv_len = cursor as u32;
+    // The whole buffer is meaningful now that slots are fixed-width: `argc` says how many are live, and
+    // `ProcRecord::arg` bounds each read at its own NUL.
+    record.argv_len = (argc as usize * ARGV_ARG_LEN) as u32;
     record.argc = argc;
     if argv_truncated {
         record.header.flags |= FLAG_ARGV_TRUNCATED;

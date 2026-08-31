@@ -92,21 +92,17 @@ pub fn format_addr(family: u32, addr: &[u8; installscope_abi::ADDR_LEN]) -> Opti
     }
 }
 
-/// Splits a NUL-separated argv buffer into arguments.
+/// Reads argv out of a [`installscope_abi::ProcRecord`]'s fixed-width slots.
 ///
-/// Trailing empty entries are dropped, since the kernel side writes a separator after each argument.
-/// Interior empty arguments are preserved: `sh -c ''` is a real invocation, and silently dropping the
-/// empty string would change what a rule sees.
+/// Slots rather than a packed buffer because the BPF verifier rejects variable-offset writes into a map
+/// value; see [`installscope_abi::ARGV_ARG_LEN`]. Reading stops at `argc`, so a slot that was never
+/// written is never reported as an empty argument — `sh -c ''` and `sh -c` are different invocations.
 #[must_use]
-pub fn split_argv(buffer: &[u8]) -> Vec<String> {
-    let mut out: Vec<String> = buffer
-        .split(|b| *b == 0)
-        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-        .collect();
-    while out.last().is_some_and(String::is_empty) {
-        out.pop();
-    }
-    out
+pub fn read_argv(record: &installscope_abi::ProcRecord) -> Vec<String> {
+    (0..installscope_abi::ARGV_MAX_ARGS)
+        .filter_map(|index| record.arg(index))
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .collect()
 }
 
 /// Translates one merged record into a schema v1 event.
@@ -221,7 +217,7 @@ pub fn to_event(merged: &Merged, session_start_ktime_ns: u64) -> Option<Event> {
                 meta,
                 Payload::ProcSpawn(ProcSpawn {
                     bin: (!bin.is_empty()).then_some(bin),
-                    argv: split_argv(record.argv_bytes()),
+                    argv: read_argv(record),
                     argv_truncated: record.header.has(installscope_abi::FLAG_ARGV_TRUNCATED),
                     outcome: Outcome::success(),
                 }),
@@ -509,17 +505,46 @@ mod tests {
         }
     }
 
+    /// Writes `args` into a record's fixed-width slots, as the eBPF side does.
+    fn set_argv(record: &mut ProcRecord, args: &[&str]) {
+        for (index, text) in args.iter().enumerate() {
+            let start = index * installscope_abi::ARGV_ARG_LEN;
+            let bytes = text.as_bytes();
+            record.argv[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        record.argc = u32::try_from(args.len()).unwrap_or(0);
+        record.argv_len =
+            u32::try_from(args.len() * installscope_abi::ARGV_ARG_LEN).unwrap_or(u32::MAX);
+    }
+
     #[test]
-    fn splits_nul_separated_argv() {
-        assert_eq!(
-            split_argv(b"sh\0-c\0curl x | sh\0"),
-            vec!["sh", "-c", "curl x | sh"]
-        );
-        assert_eq!(split_argv(b""), Vec::<String>::new());
-        // An interior empty argument is real: `sh -c ''` is a valid invocation, and dropping it would
-        // change what a rule matches against.
-        assert_eq!(split_argv(b"sh\0-c\0\0"), vec!["sh", "-c"]);
-        assert_eq!(split_argv(b"a\0\0b\0"), vec!["a", "", "b"]);
+    fn reads_argv_from_fixed_slots() {
+        // Fixed slots exist because the verifier rejects variable-offset map writes; run 33392879818 was
+        // rejected for exactly that. The reader must therefore index by slot, not scan for separators.
+        let mut record = ProcRecord::zeroed();
+        set_argv(&mut record, &["sh", "-c", "curl x | sh"]);
+        assert_eq!(read_argv(&record), vec!["sh", "-c", "curl x | sh"]);
+
+        assert_eq!(read_argv(&ProcRecord::zeroed()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_interior_empty_argument_survives() {
+        // `sh -c ''` is a real invocation. Dropping the empty string would change what a rule matches.
+        let mut record = ProcRecord::zeroed();
+        set_argv(&mut record, &["sh", "", "x"]);
+        assert_eq!(read_argv(&record), vec!["sh", "", "x"]);
+    }
+
+    #[test]
+    fn slots_past_argc_are_not_read_as_arguments() {
+        // Leftover bytes in an unused slot must not become a phantom argument. argc is the authority on
+        // how many were written.
+        let mut record = ProcRecord::zeroed();
+        set_argv(&mut record, &["one"]);
+        let stale = installscope_abi::ARGV_ARG_LEN;
+        record.argv[stale..stale + 5].copy_from_slice(b"stale");
+        assert_eq!(read_argv(&record), vec!["one"]);
     }
 
     #[test]
@@ -530,10 +555,7 @@ mod tests {
         let bin = b"/bin/sh";
         record.filename[..bin.len()].copy_from_slice(bin);
         record.filename_len = u32::try_from(bin.len()).unwrap_or(0);
-        let argv = b"sh\0-c\0curl https://x | sh\0";
-        record.argv[..argv.len()].copy_from_slice(argv);
-        record.argv_len = u32::try_from(argv.len()).unwrap_or(0);
-        record.argc = 3;
+        set_argv(&mut record, &["sh", "-c", "curl https://x | sh"]);
         record.header.flags |= installscope_abi::FLAG_ARGV_TRUNCATED;
 
         let event = to_event(&Merged::Proc(Box::new(record)), 0).expect("event");

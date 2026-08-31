@@ -43,12 +43,33 @@
 /// Paths longer than this are recorded with [`FLAG_PATH_TRUNCATED`] set.
 pub const PATH_BUF_LEN: usize = 512;
 
-/// Bytes reserved for a flattened argv, NUL-separated.
+/// Arguments captured per spawn.
 ///
-/// Deliberately generous: the single most valuable finding shape in the corpus is a shell command that
-/// pipes a download into an interpreter, and truncating that string is exactly how a rule would miss
-/// it. Overruns set [`FLAG_ARGV_TRUNCATED`].
-pub const ARGV_BUF_LEN: usize = 1024;
+/// Eight is enough for the shapes that matter: `sh -c '<script>'` is three, and a package manager
+/// invocation is rarely more than six. Overruns set [`FLAG_ARGV_TRUNCATED`].
+pub const ARGV_MAX_ARGS: usize = 8;
+
+/// Bytes reserved per argument, including its NUL terminator.
+///
+/// Fixed-width slots rather than a packed buffer, and the reason is the BPF verifier rather than
+/// taste. A packed layout needs a running cursor, which makes each write a variable-offset,
+/// variable-size access into a map value — and the verifier rejects those outright:
+///
+/// ```text
+/// invalid access to map value, value_size=1600 off=595 size=1023
+/// R1 min value is outside of the allowed memory range
+/// ```
+///
+/// With fixed slots the offset is `i * ARGV_ARG_LEN` for a constant `i` after loop unrolling, and the
+/// size is a constant, so the check is trivial.
+///
+/// 256 bytes because the highest-value finding shape in the corpus is a shell command piping a
+/// download into an interpreter, and those are typically well under 200 characters. A longer argument
+/// is truncated with [`FLAG_ARGV_TRUNCATED`] set — never silently shortened.
+pub const ARGV_ARG_LEN: usize = 256;
+
+/// Total argv buffer: [`ARGV_MAX_ARGS`] slots of [`ARGV_ARG_LEN`] bytes.
+pub const ARGV_BUF_LEN: usize = ARGV_MAX_ARGS * ARGV_ARG_LEN;
 
 /// `TASK_COMM_LEN` in the kernel.
 pub const COMM_LEN: usize = 16;
@@ -310,7 +331,10 @@ pub struct ProcRecord {
     pub _pad: u32,
     /// Executable path.
     pub filename: [u8; PATH_BUF_LEN],
-    /// Arguments, NUL-separated, in order.
+    /// Arguments in fixed-width slots of [`ARGV_ARG_LEN`] bytes, each NUL-terminated.
+    ///
+    /// Slot `i` starts at `i * ARGV_ARG_LEN`. Fixed slots rather than a packed buffer because the BPF
+    /// verifier rejects variable-offset writes into a map value; see [`ARGV_ARG_LEN`].
     pub argv: [u8; ARGV_BUF_LEN],
 }
 
@@ -341,6 +365,21 @@ impl ProcRecord {
     pub fn argv_bytes(&self) -> &[u8] {
         let len = (self.argv_len as usize).min(ARGV_BUF_LEN);
         self.argv.get(..len).unwrap_or(&[])
+    }
+
+    /// Argument `index`, up to its NUL terminator.
+    ///
+    /// Returns `None` past [`Self::argc`], so a slot that was never written is never read as an empty
+    /// argument — `sh -c ''` and `sh -c` are different invocations and a rule may treat them differently.
+    #[must_use]
+    pub fn arg(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.argc as usize || index >= ARGV_MAX_ARGS {
+            return None;
+        }
+        let start = index * ARGV_ARG_LEN;
+        let slot = self.argv.get(start..start + ARGV_ARG_LEN)?;
+        let end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+        slot.get(..end)
     }
 }
 
@@ -437,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             core::mem::size_of::<ProcRecord>(),
-            1600,
+            2624,
             "ProcRecord layout changed"
         );
         assert_eq!(MAX_RECORD_SIZE, core::mem::size_of::<ProcRecord>());
@@ -512,6 +551,49 @@ mod tests {
         assert_eq!(proc_record.argv_bytes().len(), ARGV_BUF_LEN);
         proc_record.filename_len = u32::MAX;
         assert_eq!(proc_record.filename_bytes().len(), PATH_BUF_LEN);
+    }
+
+    #[test]
+    fn arguments_read_from_fixed_slots() {
+        // Fixed-width slots exist because the verifier rejects variable-offset map writes. The accessor
+        // is the only sanctioned way in, so the slot arithmetic lives in one place.
+        let mut record = ProcRecord::zeroed();
+        record.argc = 3;
+        for (index, text) in [b"sh".as_slice(), b"-c", b"curl x | sh"].iter().enumerate() {
+            let start = index * ARGV_ARG_LEN;
+            record.argv[start..start + text.len()].copy_from_slice(text);
+        }
+
+        assert_eq!(record.arg(0), Some(b"sh".as_slice()));
+        assert_eq!(record.arg(1), Some(b"-c".as_slice()));
+        assert_eq!(record.arg(2), Some(b"curl x | sh".as_slice()));
+        // Past argc is None, not an empty argument: `sh -c ''` and `sh -c` are different invocations.
+        assert_eq!(record.arg(3), None);
+        assert_eq!(record.arg(ARGV_MAX_ARGS), None);
+        assert_eq!(record.arg(usize::MAX), None);
+    }
+
+    #[test]
+    fn an_empty_argument_is_preserved() {
+        // An interior empty argument is real. Reading it as absent would change what a rule matches.
+        let mut record = ProcRecord::zeroed();
+        record.argc = 2;
+        record.argv[..2].copy_from_slice(b"sh");
+        // Slot 1 left zeroed: an empty string.
+        assert_eq!(record.arg(0), Some(b"sh".as_slice()));
+        assert_eq!(record.arg(1), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn a_full_slot_reads_to_its_end() {
+        // A maximal argument has no NUL inside its slot, so the reader must stop at the slot boundary
+        // rather than running into the next argument.
+        let mut record = ProcRecord::zeroed();
+        record.argc = 2;
+        record.argv[..ARGV_ARG_LEN].fill(b'x');
+        record.argv[ARGV_ARG_LEN..ARGV_ARG_LEN + 3].copy_from_slice(b"end");
+        assert_eq!(record.arg(0).map(<[u8]>::len), Some(ARGV_ARG_LEN));
+        assert_eq!(record.arg(1), Some(b"end".as_slice()));
     }
 
     #[test]
