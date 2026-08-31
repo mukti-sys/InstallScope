@@ -71,29 +71,89 @@ const EVENT_MAPS: &[&str] = &["FS_EVENTS", "NET_EVENTS", "PROC_EVENTS"];
 /// Listed as data rather than a sequence of calls so the loader can report exactly which attachment
 /// failed. On a kernel missing one of these, that distinction is the difference between "eBPF is
 /// unavailable" and "this one tracepoint moved".
-const PROGRAMS: &[(&str, &str, &str)] = &[
-    ("installscope_openat_enter", "syscalls", "sys_enter_openat"),
-    ("installscope_openat_exit", "syscalls", "sys_exit_openat"),
-    ("installscope_write", "syscalls", "sys_enter_write"),
-    ("installscope_close", "syscalls", "sys_enter_close"),
-    ("installscope_mkdirat", "syscalls", "sys_enter_mkdirat"),
-    ("installscope_mkdir", "syscalls", "sys_enter_mkdir"),
-    ("installscope_renameat", "syscalls", "sys_enter_renameat2"),
-    ("installscope_rename", "syscalls", "sys_enter_rename"),
-    ("installscope_unlinkat", "syscalls", "sys_enter_unlinkat"),
-    ("installscope_unlink", "syscalls", "sys_enter_unlink"),
-    ("installscope_rmdir", "syscalls", "sys_enter_rmdir"),
-    ("installscope_symlinkat", "syscalls", "sys_enter_symlinkat"),
-    ("installscope_symlink", "syscalls", "sys_enter_symlink"),
-    ("installscope_linkat", "syscalls", "sys_enter_linkat"),
-    ("installscope_link", "syscalls", "sys_enter_link"),
-    ("installscope_chmod", "syscalls", "sys_enter_chmod"),
-    ("installscope_fchmodat", "syscalls", "sys_enter_fchmodat"),
-    ("installscope_truncate", "syscalls", "sys_enter_truncate"),
-    ("installscope_connect", "syscalls", "sys_enter_connect"),
-    ("installscope_execve", "syscalls", "sys_enter_execve"),
-    ("installscope_sched_fork", "sched", "sched_process_fork"),
-    ("installscope_sched_exit", "sched", "sched_process_exit"),
+const PROGRAMS: &[(&str, &str, &str, bool)] = &[
+    (
+        "installscope_openat_enter",
+        "syscalls",
+        "sys_enter_openat",
+        true,
+    ),
+    (
+        "installscope_openat_exit",
+        "syscalls",
+        "sys_exit_openat",
+        true,
+    ),
+    ("installscope_write", "syscalls", "sys_enter_write", true),
+    ("installscope_close", "syscalls", "sys_enter_close", true),
+    (
+        "installscope_mkdirat",
+        "syscalls",
+        "sys_enter_mkdirat",
+        true,
+    ),
+    ("installscope_mkdir", "syscalls", "sys_enter_mkdir", false),
+    (
+        "installscope_renameat",
+        "syscalls",
+        "sys_enter_renameat2",
+        true,
+    ),
+    ("installscope_rename", "syscalls", "sys_enter_rename", false),
+    (
+        "installscope_unlinkat",
+        "syscalls",
+        "sys_enter_unlinkat",
+        true,
+    ),
+    ("installscope_unlink", "syscalls", "sys_enter_unlink", false),
+    ("installscope_rmdir", "syscalls", "sys_enter_rmdir", false),
+    (
+        "installscope_symlinkat",
+        "syscalls",
+        "sys_enter_symlinkat",
+        true,
+    ),
+    (
+        "installscope_symlink",
+        "syscalls",
+        "sys_enter_symlink",
+        false,
+    ),
+    ("installscope_linkat", "syscalls", "sys_enter_linkat", true),
+    ("installscope_link", "syscalls", "sys_enter_link", false),
+    ("installscope_chmod", "syscalls", "sys_enter_chmod", false),
+    (
+        "installscope_fchmodat",
+        "syscalls",
+        "sys_enter_fchmodat",
+        true,
+    ),
+    (
+        "installscope_truncate",
+        "syscalls",
+        "sys_enter_truncate",
+        false,
+    ),
+    (
+        "installscope_connect",
+        "syscalls",
+        "sys_enter_connect",
+        true,
+    ),
+    ("installscope_execve", "syscalls", "sys_enter_execve", true),
+    (
+        "installscope_sched_fork",
+        "sched",
+        "sched_process_fork",
+        true,
+    ),
+    (
+        "installscope_sched_exit",
+        "sched",
+        "sched_process_exit",
+        true,
+    ),
 ];
 
 /// Per-CPU perf buffer page count.
@@ -329,10 +389,14 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
 
     let mut attached = Vec::new();
     let mut attach_failures = Vec::new();
-    for (program_name, category, event) in PROGRAMS {
+    for (program_name, category, event, required) in PROGRAMS {
         match attach_tracepoint(&mut ebpf, program_name, category, event) {
             Ok(()) => attached.push((*program_name).to_string()),
-            Err(detail) => attach_failures.push(detail),
+            Err(detail) => {
+                if *required {
+                    attach_failures.push(detail);
+                }
+            }
         }
     }
 
@@ -570,13 +634,12 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         });
     }
     if !attach_failures.is_empty() {
-        // Some event classes were never observed. Saying so is the difference between "the install did
+        // Some REQUIRED event classes were never observed. Saying so is the difference between "the install did
         // not do X" and "we could not see X".
         reasons.push(IncompleteReason::Other {
             detail: format!(
-                "{} of {} probes failed to attach: {}",
+                "{} required probes failed to attach: {}",
                 attach_failures.len(),
-                PROGRAMS.len(),
                 attach_failures.join("; ")
             ),
         });
