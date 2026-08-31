@@ -54,8 +54,17 @@ use crate::{translate, RecorderError, Result, AGENT_VERSION};
 
 /// Map holding the tracked process tree. Must match the name in the eBPF program.
 const TRACKED_PIDS_MAP: &str = "TRACKED_PIDS";
-/// Perf output map name.
-const EVENTS_MAP: &str = "INSTALLSCOPE_EVENTS";
+
+/// Perf output maps, one per record type.
+///
+/// Three rather than one because `PerfEventArray<T>` is a typed channel: `output` sends exactly
+/// `size_of::<T>()` bytes. A single map would have to carry the largest record for every event, spending
+/// 1,600 bytes to report a 592-byte write — the difference between a ring that keeps up during a tarball
+/// extraction and one that drops records, and dropped records force PARTIAL.
+///
+/// Ordering is unaffected: [`Merger`] sorts by `ktime_ns` across every source, so which map a record
+/// arrived on is irrelevant by the time it reaches the stream.
+const EVENT_MAPS: &[&str] = &["FS_EVENTS", "NET_EVENTS", "PROC_EVENTS"];
 
 /// Every program in the object, paired with the tracepoint it attaches to.
 ///
@@ -334,18 +343,9 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     // ---- open perf buffers before the command starts --------------------------------------------
     // Order matters: buffers must exist before the first event can occur, or the earliest and most
     // interesting behavior is lost.
-    let events_map = ebpf
-        .take_map(EVENTS_MAP)
-        .ok_or_else(|| RecorderError::Spawn {
-            what: format!("map {EVENTS_MAP} not found in object"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing map"),
-        })?;
-    let mut perf_array: PerfEventArray<_> =
-        PerfEventArray::try_from(events_map).map_err(|err| RecorderError::Spawn {
-            what: format!("{EVENTS_MAP} is not a PerfEventArray: {err}"),
-            source: std::io::Error::other("map type mismatch"),
-        })?;
-
+    //
+    // One drain thread per (map, cpu). All of them feed the same channel, and the merger orders by
+    // ktime_ns, so the split across maps is invisible downstream.
     let cpus = online_cpus().map_err(|(msg, err)| RecorderError::Spawn {
         what: format!("online_cpus: {msg}"),
         source: err,
@@ -355,19 +355,33 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     let stop = Arc::new(AtomicBool::new(false));
     let mut drain_threads = Vec::new();
 
-    for cpu in cpus {
-        let buffer =
-            perf_array
-                .open(cpu, Some(PERF_PAGES))
-                .map_err(|err| RecorderError::Spawn {
-                    what: format!("opening perf buffer for cpu {cpu}: {err}"),
-                    source: std::io::Error::other("perf open failed"),
-                })?;
-        let sender = sender.clone();
-        let stop = Arc::clone(&stop);
-        drain_threads.push(std::thread::spawn(move || {
-            drain_cpu(buffer, &sender, &stop);
-        }));
+    for map_name in EVENT_MAPS {
+        let map = ebpf
+            .take_map(map_name)
+            .ok_or_else(|| RecorderError::Spawn {
+                what: format!("map {map_name} not found in object"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing map"),
+            })?;
+        let mut perf_array: PerfEventArray<_> =
+            PerfEventArray::try_from(map).map_err(|err| RecorderError::Spawn {
+                what: format!("{map_name} is not a PerfEventArray: {err}"),
+                source: std::io::Error::other("map type mismatch"),
+            })?;
+
+        for cpu in &cpus {
+            let buffer =
+                perf_array
+                    .open(*cpu, Some(PERF_PAGES))
+                    .map_err(|err| RecorderError::Spawn {
+                        what: format!("opening {map_name} perf buffer for cpu {cpu}: {err}"),
+                        source: std::io::Error::other("perf open failed"),
+                    })?;
+            let sender = sender.clone();
+            let stop = Arc::clone(&stop);
+            drain_threads.push(std::thread::spawn(move || {
+                drain_cpu(buffer, &sender, &stop);
+            }));
+        }
     }
     // The original sender must go, or the receive loop below never sees a disconnect.
     drop(sender);

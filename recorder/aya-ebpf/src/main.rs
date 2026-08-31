@@ -11,19 +11,20 @@
 //! prove the capabilities this file needs. `Rules.md` §5 says admitted uncertainty beats
 //! plausible-looking wrong code, so the specific assumptions are listed below rather than buried:
 //!
-//! 1. **Syscall tracepoint argument offsets.** `TracePointContext::read_at` needs a byte offset into
-//!    the tracepoint's format record. The offsets used here are the conventional layout for
-//!    `syscalls/sys_enter_*` on x86-64 (8-byte header, then 8 bytes per argument), but the authoritative
-//!    source is `/sys/kernel/tracing/events/syscalls/sys_enter_openat/format` on the target kernel.
-//!    The workflow dumps those files, so a mismatch is diagnosable rather than mysterious.
-//! 2. **`bpf_probe_read_user_str_bytes` semantics.** Assumed to return the byte slice including the
-//!    NUL terminator, which is why lengths are adjusted below. Verify against the aya 0.1.1 docs.
-//! 3. **Per-CPU scratch maps.** Records exceed the 512-byte BPF stack, so they are built in a
+//! 1. **Syscall tracepoint argument offsets.** VERIFIED in run 33385367711 against kernel
+//!    6.17.0-1022-azure: `sys_enter_openat` reports `dfd@16 filename@24 flags@32 mode@40`, and
+//!    `sys_exit_openat` reports `ret@16`, so `ARG0 = 16` with an 8-byte stride is correct. The workflow
+//!    keeps dumping the format files because this is per-kernel, not universal.
+//! 2. **`sched_process_fork` field offsets.** Initially wrong. Its comm fields are `__data_loc char[]`
+//!    descriptors rather than inline arrays, so the pids sit at 12 and 20, not 24 and 44. Corrected.
+//! 3. **`bpf_probe_read_user_str_bytes` semantics.** Assumed to return the byte slice including the
+//!    NUL terminator, which is why lengths are adjusted below. Still unverified.
+//! 4. **Per-CPU scratch maps.** Records exceed the 512-byte BPF stack, so they are built in a
 //!    `PerCpuArray` and copied out. This is the standard workaround; the verifier's exact tolerance for
 //!    it on this kernel is unproven.
-//! 4. **Entry/exit correlation through a `HashMap`.** Standard practice, but map-in-tracepoint on this
+//! 5. **Entry/exit correlation through a `HashMap`.** Standard practice, but map-in-tracepoint on this
 //!    kernel is unproven, and a dropped entry silently loses one open.
-//! 5. **Verifier acceptance overall.** Loop bounds, bounds checks, and program size all have to satisfy
+//! 6. **Verifier acceptance overall.** Loop bounds, bounds checks, and program size all have to satisfy
 //!    the verifier, and no amount of local reasoning substitutes for loading it.
 //!
 //! Expect the first real build to fail. The point of writing it now is that the *shape* — which
@@ -89,9 +90,26 @@ use installscope_abi::{
     WRITE_WRITE,
 };
 
-/// Output channel to userspace. One perf buffer per CPU; the loader opens all of them.
-#[map(name = "INSTALLSCOPE_EVENTS")]
-static mut EVENTS: PerfEventArray<u8> = PerfEventArray::new(0);
+/// Output channels to userspace, one per record type.
+///
+/// Three maps rather than one because `PerfEventArray<T>::output` takes `&T` and sends exactly
+/// `size_of::<T>()` bytes — it is a typed channel, not a byte stream. A single map would therefore have
+/// to carry the largest record for every event, sending 1,600 bytes to report a 592-byte write. On a
+/// tarball extraction that is the difference between a ring that keeps up and one that drops records,
+/// and dropped records force PARTIAL.
+///
+/// Splitting them costs nothing in ordering: [`installscope_recorder::merge`] sorts by `ktime_ns` across
+/// every source, so which map a record arrived on is irrelevant by the time it reaches the stream.
+#[map(name = "FS_EVENTS")]
+static mut FS_EVENTS: PerfEventArray<FsRecord> = PerfEventArray::new(0);
+
+/// Network records. 80 bytes each, so a burst of connects costs a fraction of a write burst.
+#[map(name = "NET_EVENTS")]
+static mut NET_EVENTS: PerfEventArray<NetRecord> = PerfEventArray::new(0);
+
+/// Process spawns. The largest record, and by far the rarest.
+#[map(name = "PROC_EVENTS")]
+static mut PROC_EVENTS: PerfEventArray<ProcRecord> = PerfEventArray::new(0);
 
 /// Scratch space for building an [`FsRecord`], which is far larger than the 512-byte BPF stack.
 #[map(name = "FS_SCRATCH")]
@@ -215,18 +233,26 @@ fn header(kind: u32) -> Header {
     h
 }
 
-/// Emits a record's bytes to userspace.
+/// Emits a filesystem record to userspace.
 ///
-/// Safety: `EVENTS` is a static map, and aya requires a raw reference to hand it to the helper. The
-/// slice is derived from a `#[repr(C)]` value with no padding holes, so every byte is initialized —
-/// which matters because the verifier rejects programs that leak uninitialized stack memory into a map.
-unsafe fn emit<T>(ctx: &TracePointContext, record: &T) {
-    let bytes = core::slice::from_raw_parts(
-        core::ptr::from_ref::<T>(record).cast::<u8>(),
-        core::mem::size_of::<T>(),
-    );
-    let events = &mut *core::ptr::addr_of_mut!(EVENTS);
-    events.output(ctx, bytes, 0);
+/// Safety: `FS_EVENTS` is a static map, and aya requires a raw reference to hand it to the helper. The
+/// value is a `#[repr(C)]` struct with no padding holes, so every byte is initialized — which matters
+/// because the verifier rejects programs that leak uninitialized stack memory into a map.
+unsafe fn emit_fs(ctx: &TracePointContext, record: &FsRecord) {
+    let events = &mut *core::ptr::addr_of_mut!(FS_EVENTS);
+    events.output(ctx, record, 0);
+}
+
+/// Emits a network record. Safety as [`emit_fs`].
+unsafe fn emit_net(ctx: &TracePointContext, record: &NetRecord) {
+    let events = &mut *core::ptr::addr_of_mut!(NET_EVENTS);
+    events.output(ctx, record, 0);
+}
+
+/// Emits a process record. Safety as [`emit_fs`].
+unsafe fn emit_proc(ctx: &TracePointContext, record: &ProcRecord) {
+    let events = &mut *core::ptr::addr_of_mut!(PROC_EVENTS);
+    events.output(ctx, record, 0);
 }
 
 /// Copies a userspace string into `buf`, returning its length and whether it was truncated.
@@ -344,7 +370,7 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<(), i64> {
         record.fd = ret as i32;
     }
 
-    unsafe { emit(ctx, record) };
+    unsafe { emit_fs(ctx, record) };
     Ok(())
 }
 
@@ -380,7 +406,7 @@ fn try_write(ctx: &TracePointContext) -> Result<(), i64> {
     record.fd = fd as i32;
     record.path_len = 0;
 
-    unsafe { emit(ctx, record) };
+    unsafe { emit_fs(ctx, record) };
     Ok(())
 }
 
@@ -409,7 +435,7 @@ fn try_close(ctx: &TracePointContext) -> Result<(), i64> {
     record.header = header(KIND_FD_CLOSE);
     record.fd = fd as i32;
 
-    unsafe { emit(ctx, record) };
+    unsafe { emit_fs(ctx, record) };
     Ok(())
 }
 
@@ -448,7 +474,7 @@ fn try_path_only(ctx: &TracePointContext, write_kind: u32, path_arg: usize) -> R
         record.header.flags |= FLAG_PATH_TRUNCATED;
     }
 
-    unsafe { emit(ctx, record) };
+    unsafe { emit_fs(ctx, record) };
     Ok(())
 }
 
@@ -513,7 +539,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
         }
     }
 
-    unsafe { emit(ctx, &record) };
+    unsafe { emit_net(ctx, &record) };
     Ok(())
 }
 
@@ -568,7 +594,8 @@ fn try_execve(ctx: &TracePointContext) -> Result<(), i64> {
             break;
         }
         let slot = argv_addr + (i * core::mem::size_of::<u64>()) as u64;
-        let Ok(str_ptr) = unsafe { bpf_probe_read_user(slot as *const u64) } else {
+        // Parenthesized because rustc rejects a bare `}` immediately before `else` in a `let...else`.
+        let Ok(str_ptr) = (unsafe { bpf_probe_read_user(slot as *const u64) }) else {
             argv_truncated = true;
             break;
         };
@@ -611,7 +638,7 @@ fn try_execve(ctx: &TracePointContext) -> Result<(), i64> {
         record.header.flags |= FLAG_ARGV_TRUNCATED;
     }
 
-    unsafe { emit(ctx, record) };
+    unsafe { emit_proc(ctx, record) };
     Ok(())
 }
 
@@ -630,17 +657,25 @@ fn try_execve(ctx: &TracePointContext) -> Result<(), i64> {
 /// offsets used below. Unlike syscall tracepoints these are named fields in a struct, so the offsets
 /// differ; the authoritative source is
 /// `/sys/kernel/tracing/events/sched/sched_process_fork/format`, which the workflow dumps.
+///
+/// VERIFIED against kernel 6.17.0-1022-azure in run 33385367711 — see [`FORK_PARENT_PID`].
 #[tracepoint]
 pub fn installscope_sched_fork(ctx: TracePointContext) -> u32 {
     let _ = try_sched_fork(&ctx);
     0
 }
 
-/// Offset of `parent_pid` in the `sched_process_fork` record: 8-byte common header, then
-/// `parent_comm[16]`.
-const FORK_PARENT_PID: usize = 24;
-/// Offset of `child_pid`: after `parent_pid` (4 bytes) and `child_comm[16]`.
-const FORK_CHILD_PID: usize = 44;
+/// Offsets in the `sched_process_fork` record, confirmed against
+/// `/sys/kernel/tracing/events/sched/sched_process_fork/format` on kernel 6.17 (run 33385367711).
+///
+/// The comm fields are `__data_loc char[]` — a 4-byte offset/length descriptor, **not** an inline
+/// 16-byte buffer. An earlier version of this file assumed inline arrays and used 24/44, which would
+/// have read adjacent memory as pids: the filter would have tracked the wrong processes and the
+/// recording would have contained either nothing or the whole host, with no error to show for it.
+/// Dumping the format files before building is what caught it.
+const FORK_PARENT_PID: usize = 12;
+/// Child pid offset. See [`FORK_PARENT_PID`].
+const FORK_CHILD_PID: usize = 20;
 
 fn try_sched_fork(ctx: &TracePointContext) -> Result<(), i64> {
     let parent: u32 = unsafe { ctx.read_at(FORK_PARENT_PID) }?;
