@@ -19,9 +19,11 @@
 //!    descriptors rather than inline arrays, so the pids sit at 12 and 20, not 24 and 44. Corrected.
 //! 3. **`bpf_probe_read_user_str_bytes` semantics.** Assumed to return the byte slice including the
 //!    NUL terminator, which is why lengths are adjusted below. Still unverified.
-//! 4. **Per-CPU scratch maps.** Records exceed the 512-byte BPF stack, so they are built in a
-//!    `PerCpuArray` and copied out. This is the standard workaround; the verifier's exact tolerance for
-//!    it on this kernel is unproven.
+//! 4. **Per-CPU scratch maps.** Every record larger than a fraction of the 512-byte BPF stack is built in
+//!    a `PerCpuArray` and copied out: `FsRecord` is 592 bytes, `ProcRecord` 1,600, `PendingOpen` 528.
+//!    Only `NetRecord` (80) is a local. Getting this wrong surfaces at *link* time as LLVM's "Looks like
+//!    the BPF stack limit is exceeded", which names the function but not the variable — that is how run
+//!    33387878144 failed.
 //! 5. **Entry/exit correlation through a `HashMap`.** Standard practice, but map-in-tracepoint on this
 //!    kernel is unproven, and a dropped entry silently loses one open.
 //! 6. **Verifier acceptance overall.** Loop bounds, bounds checks, and program size all have to satisfy
@@ -118,6 +120,14 @@ static mut FS_SCRATCH: PerCpuArray<FsRecord> = PerCpuArray::with_max_entries(1, 
 /// Scratch space for a [`ProcRecord`].
 #[map(name = "PROC_SCRATCH")]
 static mut PROC_SCRATCH: PerCpuArray<ProcRecord> = PerCpuArray::with_max_entries(1, 0);
+
+/// Scratch space for building a [`PendingOpen`] before it goes into [`OPEN_INFLIGHT`].
+///
+/// A `PendingOpen` is 528 bytes and the BPF stack is 512, so it cannot be a local. LLVM reports this as
+/// "Looks like the BPF stack limit is exceeded" at link time rather than as a type error, which is how
+/// run 33387878144 failed — worth knowing because the message names the function but not the variable.
+#[map(name = "PENDING_SCRATCH")]
+static mut PENDING_SCRATCH: PerCpuArray<PendingOpen> = PerCpuArray::with_max_entries(1, 0);
 
 /// In-flight `openat` calls, keyed by `pid_tgid`.
 ///
@@ -306,7 +316,13 @@ fn try_openat_enter(ctx: &TracePointContext) -> Result<(), i64> {
     let path_addr: u64 = unsafe { ctx.read_at(arg_offset(1)) }?;
     let mode: u64 = unsafe { ctx.read_at(arg_offset(3)) }.unwrap_or(0);
 
-    let mut pending = PendingOpen::zeroed();
+    // Built in a per-CPU map rather than on the stack: PendingOpen carries a 512-byte path buffer, and
+    // the whole BPF stack is 512 bytes.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(PENDING_SCRATCH) };
+    let pending = scratch.get_ptr_mut(0).ok_or(-1i64)?;
+    // Safety: a per-CPU array slot is exclusively ours for the duration of this program.
+    let pending = unsafe { &mut *pending };
+    *pending = PendingOpen::zeroed();
     pending.flags = flags as u32;
     pending.mode = mode as u32;
     let (len, truncated) = read_user_path(&mut pending.path, path_addr);
@@ -320,7 +336,7 @@ fn try_openat_enter(ctx: &TracePointContext) -> Result<(), i64> {
     let map = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_INFLIGHT) };
     // Failure here means the map is full — the entry is dropped and this open goes unreported. Not
     // silently: the loader sees a write against an unknown descriptor and counts it.
-    let _ = map.insert(&pid_tgid, &pending, 0);
+    let _ = map.insert(&pid_tgid, pending, 0);
     Ok(())
 }
 
@@ -506,6 +522,8 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
     let family: u16 = unsafe { bpf_probe_read_user(addr_ptr as *const u16) }.map_err(|e| e as i64)?;
 
     let mut record = NetRecord::zeroed();
+    // 80 bytes, so this one genuinely fits on the 512-byte BPF stack — unlike FsRecord (592),
+    // ProcRecord (1600), and PendingOpen (528), which all live in per-CPU maps.
     record.header = header(KIND_NET_CONNECT);
 
     match u32::from(family) {
