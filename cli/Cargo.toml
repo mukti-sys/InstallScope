@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 installscope-core = { workspace = true }
 installscope-recorder = { workspace = true }
+installscope-report = { workspace = true }
 # Rules.md §2: anyhow is permitted at the CLI boundary ONLY. This crate is that boundary.
 anyhow = { workspace = true }
 clap = { workspace = true }

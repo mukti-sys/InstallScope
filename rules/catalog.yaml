@@ -1,0 +1,324 @@
+# InstallScope rule catalog
+#
+# Architecture.md:63 makes this a versioned, public, PR-able file — the community catalog. Comments are
+# part of the point: a rule whose reasoning is not written down cannot be argued with, and every entry
+# here is a claim about what deserves a maintainer's attention.
+#
+# WHAT A RULE MAY AND MAY NOT DO
+#
+# Every rule is deterministic and matches recorded evidence. No LLM, no heuristics that vary between
+# runs, no network lookups (Rules.md §1, PRD.md:60). If two people run InstallScope over the same
+# recording they must get the same findings, or the tool is not evidence.
+#
+# ADDING A RULE
+#
+# The bar is not "is this suspicious" but "would a maintainer reviewing a dependency PR want to know".
+# PRD.md:43 makes false-positive discipline the religion: a rule that fires on ordinary installs trains
+# people to ignore the report, which is worse than not having the rule. So:
+#
+#   1. Check it against the corpus before proposing it. A rule that fires on lodash is wrong.
+#   2. Say what a false positive looks like, in the `note`. If you cannot describe one, you do not
+#      understand the rule well enough yet.
+#   3. Prefer `medium` over `high` when unsure. Escalating later is easy; regaining trust is not.
+#
+# SEVERITY MEANS SOMETHING SPECIFIC
+#
+#   critical (×40)  Alarming in any install. Two of these reach 80, three reach 100.
+#   high     (×15)  Often legitimate, always worth a human look.
+#   medium   (×5)   Weak signal; meaningful alongside something else.
+#   low      (×1)   Informational. Does NOT contribute to the score — see core/src/findings.rs.
+#
+# Severities come from Architecture.md §4. Changing one moves every score in the corpus, so it is a
+# deliberate act rather than a tuning knob.
+
+version: 1
+
+# Registry hosts a package manager is expected to contact.
+#
+# TODO-verify: this list is derived from observed traffic in the Phase 0 corpus and Phase 1 recordings,
+# not from vendor documentation. Every addition must be justified by a recording, never by assumption —
+# an over-broad allowlist silently deletes findings, which is the failure mode that matters here.
+registry_hosts:
+  - registry.npmjs.org
+  - registry.npmjs.com
+  - registry.yarnpkg.com
+
+# Suffixes treated as registry infrastructure.
+#
+# Kept deliberately narrow. A CDN that serves package tarballs is install infrastructure; the same CDN
+# serving a vendor's telemetry endpoint is not, and suffix matching cannot tell them apart.
+registry_suffixes:
+  - .npmjs.org
+  - .npmjs.com
+  - .yarnpkg.com
+
+# Hosts that distribute prebuilt binaries.
+#
+# Not an allowlist. `node-gyp`, `sharp`, and `puppeteer` legitimately download binaries during install,
+# so this exists to score that behavior as `medium` rather than `high` — it is still reported, because a
+# package fetching an executable is worth knowing about even when it is expected.
+binary_distribution_suffixes:
+  - github.com
+  - githubusercontent.com
+  - nodejs.org
+  - storage.googleapis.com
+  - s3.amazonaws.com
+  - cloudfront.net
+  - jsdelivr.net
+  - unpkg.com
+  - azureedge.net
+
+# Paths whose contents are credentials or environment. Reading these is the finding.
+#
+# Matched as substrings against a resolved absolute path, so `/home/u/.ssh/id_rsa` and
+# `/root/.ssh/id_rsa` both match `/.ssh/`.
+credential_paths:
+  - /.ssh/
+  - /.aws/
+  - /.netrc
+  - /.docker/config.json
+  - /.git-credentials
+  - /.kube/
+  - /.config/gcloud/
+  - /etc/shadow
+
+# Credential-bearing filenames, matched regardless of directory.
+credential_filenames:
+  - id_rsa
+  - id_dsa
+  - id_ecdsa
+  - id_ed25519
+  - credentials
+  - .env
+
+# Binaries whose presence during an install is worth reporting.
+#
+# A package manager spawning `curl` is not proof of anything wrong — many build scripts fetch sources —
+# but it is the shape that matters, so it is reported at `high` for a human to judge.
+network_tools:
+  - curl
+  - wget
+  - nc
+  - ncat
+  - netcat
+  - ftp
+  - scp
+  - sftp
+  - ssh
+
+# Binaries a normal install legitimately spawns.
+#
+# Without this, `spawned_unexpected_binary` fires on every `mkdir` and the rule becomes noise. The list
+# is long because a native build genuinely runs a compiler toolchain; that is not suspicious, it is
+# `node-gyp` doing its job.
+expected_spawns:
+  - node
+  - npm
+  - npx
+  - pnpm
+  - yarn
+  - sh
+  - bash
+  - dash
+  - env
+  - which
+  - uname
+  - getconf
+  - getent
+  - node-gyp
+  - node-pre-gyp
+  - prebuild-install
+  - python
+  - python3
+  - make
+  - gmake
+  - cmake
+  - ninja
+  - cc
+  - gcc
+  - c++
+  - g++
+  - ld
+  - ar
+  - ranlib
+  - as
+  - cpp
+  - collect2
+  - cc1
+  - cc1plus
+  - nm
+  - objdump
+  - strip
+  - install
+  - libtool
+  - m4
+  - pkg-config
+  - ccache
+  - sccache
+  - sed
+  - grep
+  - egrep
+  - fgrep
+  - awk
+  - cat
+  - cp
+  - mv
+  - rm
+  - mkdir
+  - rmdir
+  - ln
+  - chmod
+  - chown
+  - touch
+  - true
+  - false
+  - test
+  - expr
+  - basename
+  - dirname
+  - printf
+  - echo
+  - pwd
+  - ls
+  - find
+  - xargs
+  - sort
+  - uniq
+  - head
+  - tail
+  - tr
+  - wc
+  - date
+  - hostname
+  - id
+  - sleep
+  - seq
+  - dd
+  - tar
+  - gzip
+  - gunzip
+  - unzip
+  - bzip2
+  - xz
+  - zstd
+  - git
+  - rustc
+  - cargo
+  - go
+
+rules:
+  # ---- filesystem ---------------------------------------------------------------------------------
+
+  - id: write_outside_expected_dirs
+    severity: critical
+    kind: write_outside_zones
+    title: wrote outside the project, cache, home, and temp directories
+    note: >-
+      The most severe rule in the catalog. Only fires on a path the recorder resolved to an absolute
+      form and placed outside every declared zone — an unresolved path is never scored, because
+      guessing would manufacture this finding out of an ordinary relative open. False positive: a
+      package legitimately writing to a shared toolchain directory the caller forgot to declare with
+      --expect.
+
+  - id: chmod_exec_outside_project
+    severity: high
+    kind: chmod_executable_outside_zones
+    title: made a file executable outside the project
+    note: >-
+      Setting an execute bit on something outside the project is how a dropped payload becomes
+      runnable. False positive: a build installing a helper into a declared toolchain prefix.
+
+  - id: credential_path_read
+    severity: high
+    kind: credential_read
+    title: read credentials or environment secrets
+    note: >-
+      Reading ~/.ssh, ~/.aws, or an .env file during a package install has no legitimate reason a
+      maintainer should not be told about. Only the strace backend can see this — the aya probes are
+      scoped to writes, connects, and spawns, so an aya recording reports nothing here and the report
+      must say so rather than implying the install was clean.
+
+  - id: credential_path_read_attempted
+    severity: medium
+    kind: credential_read_failed
+    title: attempted to read credentials and failed
+    note: >-
+      A failed read still shows intent, and intent is evidence. Scored lower than a successful read
+      because the file may simply not exist on this machine, which says nothing about what the package
+      would do elsewhere.
+
+  - id: npmrc_read
+    severity: low
+    kind: npmrc_read
+    title: read npm configuration, which may contain auth tokens
+    note: >-
+      Informational only. npm reads its own config on every run, so this fires on essentially every
+      recording; it is worth showing in evidence and worth nothing in a score. Interesting only when a
+      non-npm process does it, which this rule cannot yet distinguish.
+
+  # ---- network ------------------------------------------------------------------------------------
+
+  - id: dns_non_registry_host
+    severity: high
+    kind: dns_outside_registry
+    title: resolved a host that is not a package registry
+    note: >-
+      A hostname is far stronger evidence than an IP address, which is why this is the network rule
+      that matters. Only the strace backend decodes DNS; the aya probes do not, by design. False
+      positive: a package fetching from its own documented CDN.
+
+  - id: dns_binary_distribution_host
+    severity: medium
+    kind: dns_binary_distribution
+    title: resolved a binary distribution host during install
+    note: >-
+      node-gyp, sharp, and puppeteer all do this legitimately. Reported at medium because a package
+      downloading an executable is worth knowing about even when it is expected behavior.
+
+  - id: network_connect_unusual_port
+    severity: high
+    kind: connect_unusual_port
+    title: connected to an external address on an unusual port
+    note: >-
+      Ports 80 and 443 are ordinary; anything else during an install is not. Port 0 is explicitly
+      excluded — glibc probes candidate addresses with port 0 during resolution, and Phase 1 recordings
+      showed 24 such connects in a single lodash install. Treating those as unusual would fire this
+      rule on every recording.
+
+  - id: network_connect_external
+    severity: low
+    kind: connect_external
+    title: connected to an external address
+    note: >-
+      Informational. Every install that fetches a package does this, so it carries no score; it exists
+      so the evidence section can show where traffic went even when nothing is wrong.
+
+  # ---- processes ----------------------------------------------------------------------------------
+
+  - id: download_piped_to_shell
+    severity: critical
+    kind: download_piped_to_shell
+    title: piped a downloaded script into a shell
+    note: >-
+      The highest-value finding shape in the Phase 0 corpus. `curl … | sh` executes code the recording
+      cannot inspect, from a source the lockfile does not pin. There is no benign version of this in a
+      package install. Requires the full command line: a truncated argv sets a flag and the rule
+      declines to fire rather than guessing.
+
+  - id: spawned_network_tool
+    severity: high
+    kind: spawn_network_tool
+    title: spawned a network tool during install
+    note: >-
+      curl or wget during an install means fetching something the lockfile does not describe. Often
+      legitimate for source downloads, always worth a look. False positive: a build script fetching a
+      pinned tarball it verifies with a checksum.
+
+  - id: spawned_unexpected_binary
+    severity: medium
+    kind: spawn_unexpected
+    title: spawned a binary outside the expected toolchain
+    note: >-
+      Deliberately medium. The expected_spawns list cannot be complete, so this rule's job is to
+      surface the unfamiliar rather than to accuse — a native build runs a long tail of compiler
+      helpers, and treating each as high would drown the report.

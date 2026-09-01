@@ -20,12 +20,25 @@
 // exhaustively today and update deliberately when the schema version bumps.
 #![allow(clippy::module_name_repetitions)]
 
+pub mod catalog;
+pub mod coverage;
 pub mod error;
 pub mod events;
+pub mod findings;
+pub mod rules;
+pub mod zones;
 
+pub use catalog::{Catalog, CatalogError, Rule, RuleKind, CATALOG_VERSION};
+pub use coverage::{observability, Coverage, Observability, ObservationClass};
 pub use error::{CoreError, Result};
 pub use events::{
     AddrFamily, Backend, DnsQuery, Event, EventMeta, FsRead, FsWrite, Heartbeat, HostInfo,
     IncompleteReason, NetConnect, Outcome, PathOrigin, Payload, ProcSpawn, SessionEnd,
     SessionStart, TracedPath, WriteKind, Zones, SCHEMA_VERSION,
 };
+pub use findings::{
+    deduplicate, select_bullets, Evidence, Finding, Score, Severity, SeverityCounts, MAX_BULLETS,
+    SCORE_CAP,
+};
+pub use rules::{evaluate, Analysis};
+pub use zones::{placement_of, Placement, Zone};

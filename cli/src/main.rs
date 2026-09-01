@@ -6,18 +6,20 @@
 //! Subcommands:
 //! - `record -- <command>` — record an install and write a schema v1 JSONL stream;
 //! - `verify <events.jsonl>` — re-read a stream and say whether it is trustworthy;
+//! - `report <events.jsonl>` — evaluate a recording against the rule catalog and emit reports;
 //! - `parity --strace <a> --aya <b>` — compare two recordings of the same workload (Phase 2).
 //!
 //! `verify` exists because of `Rules.md` §2: the failure mode that matters is a recorder that dies
 //! quietly and leaves output that *looks* clean. A separate verification path means CI can assert the
 //! evidence is whole rather than trusting the recorder's own exit code.
 //!
+//! `report` evaluates a recording against the embedded YAML rule catalog and writes SARIF, Markdown,
+//! and/or HTML to the output directory. It is the pipeline entry point: `record` produces evidence,
+//! `report` produces findings.
+//!
 //! `parity` exists for the same reason at one level up: it decides whether two backends agree about
 //! what happened, and it lives here rather than as a CI script so the comparison logic is unit-tested
 //! Rust rather than shell that drifts.
-//!
-//! Deliberately absent: `report`, `diff`, and `push`. Those are Phases 3 and 4 (`Phases.md`), and
-//! stubbing them now would invite scope creep.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -77,6 +79,8 @@ enum Command {
     Record(RecordArgs),
     /// Re-read a recording and report whether it is complete or PARTIAL.
     Verify(VerifyArgs),
+    /// Evaluate a recording against the rule catalog and emit reports.
+    Report(ReportArgs),
     /// Compare two recordings of the same workload, made by different backends.
     Parity(ParityArgs),
 }
@@ -165,6 +169,53 @@ struct VerifyArgs {
     fail_on_partial: bool,
 }
 
+/// Which report formats to emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    /// SARIF 2.1.0 JSON for GitHub code scanning.
+    Sarif,
+    /// PR-comment Markdown.
+    Markdown,
+    /// Self-contained HTML artifact.
+    Html,
+    /// All three formats.
+    All,
+}
+
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// Path to an events.jsonl produced by `installscope record`.
+    events: PathBuf,
+
+    /// Output directory for generated reports.
+    #[arg(short, long, default_value = "installscope-report")]
+    out: PathBuf,
+
+    /// Which format(s) to emit.
+    #[arg(long, value_enum, default_value_t = ReportFormat::All)]
+    format: ReportFormat,
+
+    /// Package name, for the report header.
+    #[arg(long)]
+    package: Option<String>,
+
+    /// Package version, for the report header.
+    #[arg(long)]
+    version: Option<String>,
+
+    /// URL to the full evidence artifact.
+    #[arg(long)]
+    evidence_link: Option<String>,
+
+    /// URL to the uploaded SARIF file.
+    #[arg(long)]
+    sarif_link: Option<String>,
+
+    /// Exit non-zero when the score exceeds this threshold (0–100).
+    #[arg(long)]
+    fail_above: Option<u32>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
@@ -201,6 +252,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Command::Record(args) => run_record(args),
         Command::Verify(args) => run_verify(args),
+        Command::Report(args) => run_report(args),
         Command::Parity(args) => run_parity(args),
     }
 }
@@ -521,6 +573,93 @@ fn run_verify(args: &VerifyArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::from(EXIT_PARTIAL));
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Evaluates a recording against the rule catalog and emits reports.
+///
+/// Cross-platform: unlike `record`, this reads files rather than tracing syscalls, so it runs on
+/// any machine. A maintainer on macOS can evaluate a recording produced by a Linux runner.
+fn run_report(args: &ReportArgs) -> Result<ExitCode> {
+    let contents = std::fs::read_to_string(&args.events)
+        .with_context(|| format!("reading {}", args.events.display()))?;
+
+    let events: Vec<installscope_core::Event> = contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            installscope_core::Event::from_jsonl(line, index + 1)
+                .with_context(|| format!("{} line {}", args.events.display(), index + 1))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let catalog =
+        installscope_core::Catalog::embedded().context("loading the embedded rule catalog")?;
+    let analysis = installscope_core::evaluate(&catalog, &events);
+
+    let context = installscope_report::ReportContext {
+        package: args.package.clone(),
+        version: args.version.clone(),
+        command: Vec::new(),
+        evidence_link: args.evidence_link.clone(),
+        sarif_link: args.sarif_link.clone(),
+    };
+
+    // Create output directory.
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("creating output directory {}", args.out.display()))?;
+
+    let emit_sarif = matches!(args.format, ReportFormat::Sarif | ReportFormat::All);
+    let emit_markdown = matches!(args.format, ReportFormat::Markdown | ReportFormat::All);
+    let emit_html = matches!(args.format, ReportFormat::Html | ReportFormat::All);
+
+    if emit_sarif {
+        let sarif =
+            installscope_report::render_sarif(&analysis, &context).context("rendering SARIF")?;
+        let path = args.out.join("installscope.sarif.json");
+        std::fs::write(&path, &sarif).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+
+    if emit_markdown {
+        let md = installscope_report::render_markdown(&analysis, &context);
+        let path = args.out.join("installscope-comment.md");
+        std::fs::write(&path, &md).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+
+    if emit_html {
+        let html = installscope_report::render_html(&analysis, &context);
+        let path = args.out.join("installscope-report.html");
+        std::fs::write(&path, &html).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+
+    // Summary to stdout, machine-readable.
+    println!("score: {}", analysis.score.value);
+    println!("raw:   {}", analysis.score.raw);
+    println!(
+        "partial: {}",
+        if analysis.is_partial() {
+            "true"
+        } else {
+            "false"
+        }
+    );
+    println!("findings: {}", analysis.findings.len());
+
+    // Gate on score if requested.
+    if let Some(threshold) = args.fail_above {
+        if analysis.score.value > threshold {
+            eprintln!(
+                "installscope: score {} exceeds threshold {threshold}",
+                analysis.score.value
+            );
+            return Ok(ExitCode::from(EXIT_FAILURE));
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 

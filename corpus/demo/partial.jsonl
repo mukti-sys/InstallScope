@@ -1,0 +1,7 @@
+{"schema_version":1,"ts_ns":0,"backend":"strace","op":"session_start","wall_clock_utc":"2026-09-01T09:30:00Z","agent_version":"installscope-recorder-0.1.0","command":["npm","install","SYNTHETIC-slow-package"],"zones":{"project":"/work/project","cache":"/work/cache","home":"/home/runner","tmp":"/tmp","extra":["/work/out"]},"host":{"kernel":"6.17.0-1022-azure","os":"Ubuntu 24.04.4 LTS","arch":"x86_64","backend_version":"strace -- version 6.8"}}
+{"schema_version":1,"ts_ns":1000000,"pid":7100,"syscall":"execve","backend":"strace","op":"proc_spawn","bin":"/usr/bin/npm","argv":["npm","install","SYNTHETIC-slow-package"],"argv_truncated":false,"ok":true}
+{"schema_version":1,"ts_ns":2000000,"pid":7101,"syscall":"openat","backend":"strace","op":"fs_write","target":{"path":"/etc/ld.so.preload","origin":"kernel"},"kind":"open","flags":"O_WRONLY|O_CREAT","ok":true}
+{"schema_version":1,"ts_ns":2100000,"pid":7101,"syscall":"write","backend":"strace","op":"fs_write","target":{"path":"/etc/ld.so.preload","origin":"kernel"},"kind":"write","bytes":31,"ok":true}
+{"schema_version":1,"ts_ns":3000000,"backend":"strace","op":"heartbeat","seq":1,"events_so_far":3,"phase":"postinstall"}
+{"schema_version":1,"ts_ns":4000000,"backend":"strace","op":"heartbeat","seq":2,"events_so_far":3,"phase":"postinstall"}
+{"schema_version":1,"ts_ns":5000000,"backend":"strace","op":"session_end","complete":false,"incomplete_reasons":[{"timeout":{"limit_secs":120}}],"duration_ns":120000000000,"events_emitted":3,"heartbeats":2}

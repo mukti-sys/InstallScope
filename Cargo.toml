@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["abi", "core", "recorder", "cli"]
+members = ["abi", "core", "recorder", "report", "cli"]
 
 # harness/ is Phase 0 gate tooling with its own toolchain requirements (nightly + build-std for the
 # eBPF crate) and is deliberately not part of the product workspace.
@@ -21,6 +21,7 @@ repository = "https://github.com/mukti-sys/InstallScope"
 installscope-abi = { path = "abi" }
 installscope-core = { path = "core" }
 installscope-recorder = { path = "recorder" }
+installscope-report = { path = "report" }
 
 # clap without default features: `color` pulls in anstream/anstyle-query, which drag in windows-sys
 # for console detection. This is a forensic CLI whose output is read by CI and by scripts, so ANSI
@@ -34,6 +35,16 @@ clap = { version = "4.5", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The rule catalog format. Architecture.md:63 specifies YAML because the catalog is meant to be
+# community-editable, and comments matter for a file people send PRs against.
+#
+# `0.9.34+deprecated` is the final release: the author archived the crate rather than abandoning it
+# mid-bug, and Rules.md §1 names it as allowed. Recorded as a deliberate choice because shipping an
+# unmaintained parser in the one component that reads user-supplied input is a real risk, not a
+# neutral one. Mitigations: the loader validates everything the parser hands back rather than trusting
+# it (see core/src/rules.rs), the catalog is repo-controlled rather than fetched, and the parse happens
+# before any recording so a malformed file fails loudly and early.
+serde_yaml = "0.9.34"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"

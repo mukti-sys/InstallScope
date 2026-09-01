@@ -14,7 +14,10 @@ on:
       - "abi/**"
       - "core/**"
       - "recorder/**"
+      - "report/**"
       - "cli/**"
+      - "rules/**"
+      - "corpus/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
@@ -23,7 +26,10 @@ on:
       - "abi/**"
       - "core/**"
       - "recorder/**"
+      - "report/**"
       - "cli/**"
+      - "rules/**"
+      - "corpus/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
@@ -177,3 +183,19 @@ jobs:
           set -euo pipefail
           ./target/release/installscope --version
           ./target/release/installscope --help
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate SARIF demo reports against 2.1.0 schema
+        # Rules.md §6: Every rules-engine change ships with golden test fixtures + SARIF schema validation.
+        run: |
+          set -euo pipefail
+          ./target/release/installscope report corpus/demo/clean.jsonl --out /tmp/sarif-clean
+          ./target/release/installscope report corpus/demo/high.jsonl --out /tmp/sarif-high
+          ./target/release/installscope report corpus/demo/critical.jsonl --out /tmp/sarif-critical
+          ./target/release/installscope report corpus/demo/partial.jsonl --out /tmp/sarif-partial
+          ./target/release/installscope report corpus/demo/aya-clean.jsonl --out /tmp/sarif-aya-clean
+          npx --yes @microsoft/sarif-multitool validate /tmp/sarif-*/installscope.sarif.json
+

@@ -1,6 +1,6 @@
 [package]
-name = "installscope-core"
-description = "Event model and typed errors for InstallScope. No I/O, no LLM, no telemetry."
+name = "installscope-report"
+description = "Renders an analysis as SARIF 2.1.0, a self-contained HTML artifact, and PR-comment markdown."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+installscope-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

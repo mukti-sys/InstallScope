@@ -1,0 +1,492 @@
+//! Self-contained HTML report — one file, no external assets.
+//!
+//! The third rendering surface, after the PR comment and SARIF. Architecture.md:18 names it, and
+//! Rules.md §1 forbids external CDN links: everything must be inline so the artifact works when
+//! downloaded, shared, or opened offline.
+//!
+//! # Information hierarchy
+//!
+//! Design.md:28 requires the PR comment and the HTML report to present the same information in the
+//! same order. A reader who sees the comment and then opens the artifact is not re-orienting:
+//!
+//! 1. Score and verdict (with PARTIAL badge when applicable)
+//! 2. Top findings (bullets)
+//! 3. Coverage caveat (when the backend has blind spots)
+//! 4. Full findings table
+//! 5. Evidence detail (expandable per finding)
+//!
+//! # What this renderer refuses to do
+//!
+//! Same contract as the other two: it does not soften a PARTIAL recording, and it does not present
+//! a limited backend's clean result as an unqualified pass. Tests assert both.
+
+use std::fmt::Write as _;
+
+use installscope_core::{select_bullets, Analysis, Severity};
+
+use crate::{format_bullet, format_score, ReportContext, Verdict};
+
+/// Renders the analysis as a self-contained HTML document.
+///
+/// The output is a complete `<!DOCTYPE html>` page with inline CSS. No external stylesheets, no
+/// JavaScript CDN, no images — Rules.md §1 forbids external assets.
+#[must_use]
+pub fn render_html(analysis: &Analysis, context: &ReportContext) -> String {
+    let verdict = Verdict::of(analysis);
+    let mut out = String::with_capacity(4096);
+
+    render_head(&mut out, context);
+    render_header(&mut out, analysis, context, verdict);
+    render_partial_warning(&mut out, analysis, verdict);
+    render_summary(&mut out, analysis, verdict);
+    render_caveats(&mut out, analysis);
+    render_findings_table(&mut out, analysis);
+    render_skipped_rules(&mut out, analysis);
+    render_footer(&mut out, analysis);
+
+    out.push_str("\n</body>\n</html>\n");
+    out
+}
+
+/// Emits `<!DOCTYPE html>`, `<head>`, and the opening `<body>` tag.
+fn render_head(out: &mut String, context: &ReportContext) {
+    let _ = write!(
+        out,
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InstallScope — {subject}</title>
+{CSS}
+</head>
+<body>
+"#,
+        subject = escape(&context.subject_label()),
+        CSS = INLINE_CSS,
+    );
+}
+
+/// Emits the header block: title, subject label, score, and optional PARTIAL badge.
+fn render_header(out: &mut String, analysis: &Analysis, context: &ReportContext, verdict: Verdict) {
+    out.push_str("<header>\n");
+    let _ = writeln!(out, "<h1>InstallScope</h1>");
+    let _ = writeln!(
+        out,
+        "<p class=\"subject\">{}</p>",
+        escape(&context.subject_label())
+    );
+
+    let _ = write!(
+        out,
+        "<p class=\"score {class}\">{score}",
+        class = score_class(analysis),
+        score = escape(&format_score(&analysis.score)),
+    );
+    if verdict.shows_partial_badge() {
+        out.push_str(" <span class=\"badge partial\">PARTIAL</span>");
+    }
+    out.push_str("</p>\n");
+    out.push_str("</header>\n\n");
+}
+
+/// Emits the PARTIAL warning block when the recording was incomplete.
+fn render_partial_warning(out: &mut String, analysis: &Analysis, verdict: Verdict) {
+    if !verdict.shows_partial_badge() {
+        return;
+    }
+    out.push_str("<div class=\"callout warning\">\n");
+    out.push_str(
+        "<p><strong>This recording is incomplete.</strong> The findings below are real, but \
+         they are not the whole picture — absence of a finding here is not evidence it did \
+         not happen.</p>\n",
+    );
+    if !analysis.partial_reasons.is_empty() {
+        out.push_str("<ul>\n");
+        for reason in &analysis.partial_reasons {
+            let _ = writeln!(out, "<li>{}</li>", escape(reason));
+        }
+        out.push_str("</ul>\n");
+    }
+    out.push_str("</div>\n\n");
+}
+
+/// Emits the bullet summary section.
+fn render_summary(out: &mut String, analysis: &Analysis, verdict: Verdict) {
+    let scorable_bullets: Vec<_> = select_bullets(&analysis.findings)
+        .into_iter()
+        .filter(|f| f.severity.contributes_to_score())
+        .collect();
+    out.push_str("<section class=\"summary\">\n");
+    if scorable_bullets.is_empty() {
+        let _ = writeln!(
+            out,
+            "<p class=\"headline\">{}</p>",
+            escape(&capitalise(verdict.headline()))
+        );
+    } else {
+        out.push_str("<ul class=\"bullets\">\n");
+        for finding in &scorable_bullets {
+            let _ = writeln!(out, "<li>{}</li>", escape(&format_bullet(finding)));
+        }
+        let hidden = scorable_count(analysis).saturating_sub(scorable_bullets.len());
+        if hidden > 0 {
+            let _ = writeln!(
+                out,
+                "<li class=\"overflow\">…and {hidden} more finding{} below</li>",
+                if hidden == 1 { "" } else { "s" }
+            );
+        }
+        out.push_str("</ul>\n");
+    }
+    out.push_str("</section>\n\n");
+}
+
+/// Emits coverage caveats and unresolved-path warnings.
+fn render_caveats(out: &mut String, analysis: &Analysis) {
+    if let Some(caveat) = analysis.coverage.caveat_line() {
+        let _ = writeln!(
+            out,
+            "<div class=\"callout caveat\">\n<p>{}</p>\n</div>\n",
+            escape(&caveat)
+        );
+    }
+
+    if analysis.unresolved_paths > 0 {
+        let _ =
+            writeln!(
+            out,
+            "<div class=\"callout caveat\">\n<p>{} path{} could not be resolved to an absolute \
+             location and {} not checked against the expected directories.</p>\n</div>\n",
+            analysis.unresolved_paths,
+            if analysis.unresolved_paths == 1 { "" } else { "s" },
+            if analysis.unresolved_paths == 1 { "was" } else { "were" },
+        );
+    }
+}
+
+/// Emits the full findings table.
+fn render_findings_table(out: &mut String, analysis: &Analysis) {
+    if analysis.findings.is_empty() {
+        return;
+    }
+    out.push_str("<section class=\"findings\">\n<h2>Findings</h2>\n");
+    out.push_str(
+        "<table>\n<thead><tr>\
+        <th>Severity</th><th>Rule</th><th>Subject</th><th>Description</th><th>Count</th>\
+        </tr></thead>\n<tbody>\n",
+    );
+    for finding in &analysis.findings {
+        let note_html = finding
+            .note
+            .as_deref()
+            .map(|n| format!("<br><small>{}</small>", escape(n)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "<tr class=\"severity-{sev}\">\
+            <td><span class=\"tag {sev}\">{sev_label}</span></td>\
+            <td><code>{rule}</code></td>\
+            <td>{subject}</td>\
+            <td>{title}{note}</td>\
+            <td>{count}</td>\
+            </tr>",
+            sev = severity_class(finding.severity),
+            sev_label = escape(&format!("{:?}", finding.severity)),
+            rule = escape(&finding.rule_id),
+            subject = escape(&finding.subject),
+            title = escape(&finding.title),
+            note = note_html,
+            count = finding.occurrences,
+        );
+    }
+    out.push_str("</tbody>\n</table>\n</section>\n\n");
+}
+
+/// Emits the collapsible skipped-rules section.
+fn render_skipped_rules(out: &mut String, analysis: &Analysis) {
+    if analysis.skipped_rules.is_empty() {
+        return;
+    }
+    out.push_str(
+        "<details class=\"skipped\">\n\
+        <summary>Checks that did not run on this backend</summary>\n<ul>\n",
+    );
+    for (rule_id, reason) in &analysis.skipped_rules {
+        let _ = writeln!(
+            out,
+            "<li><code>{}</code> — {}</li>",
+            escape(rule_id),
+            escape(reason)
+        );
+    }
+    out.push_str("</ul>\n</details>\n\n");
+}
+
+/// Emits the footer with backend and advisory notice.
+fn render_footer(out: &mut String, analysis: &Analysis) {
+    let _ = writeln!(
+        out,
+        "<footer>\n<p>Recorded with the {} backend. Advisory: this report records what the \
+         install did, and does not block the build.</p>\n</footer>",
+        escape(&format!("{}", analysis.coverage.backend)),
+    );
+}
+
+/// The full inline `<style>` block.
+///
+/// Self-contained: no `@import`, no external fonts, no CDN. The font stack uses system fonts so the
+/// file works on any machine without a network request.
+const INLINE_CSS: &str = r#"<style>
+:root {
+    --accent: #FF6A3D;
+    --bg: #0e1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --critical: #f85149;
+    --high: #f0883e;
+    --medium: #d29922;
+    --low: #8b949e;
+    --clean: #3fb950;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 860px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.6;
+}
+header { border-bottom: 2px solid var(--accent); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+h1 { color: var(--accent); margin: 0; font-size: 1.75rem; }
+h2 { color: var(--text); margin: 1.5rem 0 0.75rem; font-size: 1.25rem; }
+.subject { color: var(--text-muted); margin: 0.25rem 0; }
+.score { font-size: 2rem; font-weight: 700; margin: 0.5rem 0; }
+.score.clean { color: var(--clean); }
+.score.findings { color: var(--high); }
+.score.critical { color: var(--critical); }
+.score.partial { color: var(--text-muted); }
+.badge { font-size: 0.75rem; padding: 0.2rem 0.5rem; border-radius: 3px; font-weight: 600;
+         text-transform: uppercase; vertical-align: middle; }
+.badge.partial { background: var(--medium); color: var(--bg); }
+.callout { border-left: 3px solid var(--medium); padding: 0.75rem 1rem; margin: 1rem 0;
+           background: var(--surface); border-radius: 0 4px 4px 0; }
+.callout.warning { border-color: var(--critical); }
+.callout.caveat { border-color: var(--medium); }
+.callout p { margin: 0; }
+.bullets { padding-left: 1.25rem; }
+.bullets li { margin: 0.35rem 0; }
+.overflow { color: var(--text-muted); font-style: italic; }
+.headline { font-size: 1.1rem; color: var(--clean); }
+table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.9rem; }
+th { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 2px solid var(--border);
+     color: var(--text-muted); font-weight: 600; }
+td { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+tr:hover { background: var(--surface); }
+code { font-size: 0.85em; background: var(--surface); padding: 0.15rem 0.35rem;
+       border-radius: 3px; }
+.tag { font-size: 0.75rem; padding: 0.15rem 0.4rem; border-radius: 3px; font-weight: 600;
+       text-transform: uppercase; }
+.tag.critical { background: var(--critical); color: var(--bg); }
+.tag.high { background: var(--high); color: var(--bg); }
+.tag.medium { background: var(--medium); color: var(--bg); }
+.tag.low { background: var(--border); color: var(--text-muted); }
+.severity-critical td { border-left: 3px solid var(--critical); }
+.severity-high td:first-child { border-left: 3px solid var(--high); }
+details { margin: 1rem 0; }
+summary { cursor: pointer; color: var(--text-muted); }
+summary:hover { color: var(--text); }
+.skipped ul { color: var(--text-muted); }
+footer { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border);
+         color: var(--text-muted); font-size: 0.85rem; }
+</style>"#;
+
+/// CSS class for the score element.
+fn score_class(analysis: &Analysis) -> &'static str {
+    let verdict = Verdict::of(analysis);
+    match verdict {
+        Verdict::Partial => "partial",
+        Verdict::Clean | Verdict::CleanWithCaveat => "clean",
+        Verdict::Findings => {
+            if analysis.score.value >= 80 {
+                "critical"
+            } else {
+                "findings"
+            }
+        }
+    }
+}
+
+/// CSS class for a severity.
+fn severity_class(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+    }
+}
+
+/// How many findings count toward the score.
+fn scorable_count(analysis: &Analysis) -> usize {
+    analysis
+        .findings
+        .iter()
+        .filter(|finding| finding.severity.contributes_to_score())
+        .count()
+}
+
+/// Uppercases the first character.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// HTML-escapes a string to prevent XSS.
+///
+/// Every user-supplied value (paths, rule text, command lines) passes through this before being
+/// placed in the document. A finding subject like `<script>alert(1)</script>` must render as text,
+/// not as executable markup.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::analyse_fixture;
+
+    fn context() -> ReportContext {
+        ReportContext {
+            package: Some("SYNTHETIC-fixture".to_string()),
+            version: Some("1.0.0".to_string()),
+            command: vec!["npm".to_string(), "install".to_string()],
+            evidence_link: Some("https://example.invalid/artifact".to_string()),
+            sarif_link: Some("https://example.invalid/sarif".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_clean_install_renders_a_valid_html_document() {
+        let rendered = render_html(&analyse_fixture("clean.jsonl"), &context());
+        assert!(rendered.starts_with("<!DOCTYPE html>"));
+        assert!(rendered.contains("</html>"));
+        assert!(rendered.contains("0 / 100"));
+        assert!(rendered.contains("Nothing outside expected behavior"));
+        assert!(
+            !rendered.contains("PARTIAL"),
+            "a complete recording must not show the badge"
+        );
+    }
+
+    #[test]
+    fn a_partial_recording_shows_the_badge_and_explains_itself() {
+        let rendered = render_html(&analyse_fixture("partial.jsonl"), &context());
+        assert!(rendered.contains("PARTIAL"), "{rendered}");
+        assert!(rendered.contains("incomplete"));
+        assert!(
+            rendered.contains("not evidence it did not happen"),
+            "the reader must be told what the incompleteness means"
+        );
+    }
+
+    #[test]
+    fn a_critical_install_shows_its_score_and_findings() {
+        let rendered = render_html(&analyse_fixture("critical.jsonl"), &context());
+        assert!(rendered.contains("100 / 100"));
+        assert!(rendered.contains("raw"), "the capped excess stays visible");
+        assert!(
+            rendered.contains("Critical"),
+            "critical findings must be labelled"
+        );
+    }
+
+    #[test]
+    fn an_aya_report_carries_its_coverage_caveat() {
+        let rendered = render_html(&analyse_fixture("aya-clean.jsonl"), &context());
+        assert!(rendered.contains("credential reads"), "{rendered}");
+        assert!(rendered.contains("not evidence"));
+        assert!(
+            rendered.contains("did not run"),
+            "the skipped checks must be listed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_strace_report_has_no_caveat() {
+        let rendered = render_html(&analyse_fixture("clean.jsonl"), &context());
+        assert!(!rendered.contains("Not checked by"));
+        assert!(!rendered.contains("did not run"));
+    }
+
+    #[test]
+    fn user_supplied_strings_are_html_escaped() {
+        // A path like <script> must not become executable markup.
+        assert_eq!(
+            escape("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+        assert_eq!(escape("a & b"), "a &amp; b");
+        assert_eq!(escape("\"quoted\""), "&quot;quoted&quot;");
+    }
+
+    #[test]
+    fn no_external_assets() {
+        // Rules.md §1: no CDN, no @import, no external fonts. The report must work offline.
+        for name in [
+            "clean.jsonl",
+            "critical.jsonl",
+            "partial.jsonl",
+            "aya-clean.jsonl",
+        ] {
+            let rendered = render_html(&analyse_fixture(name), &context());
+            assert!(!rendered.contains("@import"), "{name}: contains an @import");
+            assert!(
+                !rendered.contains("fonts.googleapis"),
+                "{name}: references external fonts"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_is_deterministic() {
+        for name in [
+            "clean.jsonl",
+            "high.jsonl",
+            "critical.jsonl",
+            "aya-clean.jsonl",
+        ] {
+            let analysis = analyse_fixture(name);
+            assert_eq!(
+                render_html(&analysis, &context()),
+                render_html(&analysis, &context()),
+                "{name} rendered differently on a second pass"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inline_css_uses_the_beacon_accent() {
+        assert!(
+            INLINE_CSS.contains("#FF6A3D"),
+            "the Beacon brand accent must be present in the CSS"
+        );
+    }
+
+    #[test]
+    fn the_report_says_it_is_advisory() {
+        let rendered = render_html(&analyse_fixture("high.jsonl"), &context());
+        assert!(rendered.contains("Advisory"));
+        assert!(rendered.contains("does not block the build"));
+    }
+}
