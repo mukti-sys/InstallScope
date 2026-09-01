@@ -328,23 +328,29 @@ fn normalize_path(path: &str) -> String {
 /// difference rather than a filter for inconvenient results.
 fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) -> Expectation {
     match fact {
-        // /dev/null is a character device; writing to it is a no-op that produces no filesystem
-        // mutation. The aya backend may or may not see the write depending on whether the fd was
-        // opened during the recording, but either way it is not evidence worth comparing.
+        // Inherited descriptors, and the reason is definite rather than conditional.
+        //
+        // The parent shell redirects stdout and stderr *before* exec, so by the time
+        // `sys_enter_execve` fires the descriptors already exist. The aya fd table is built from opens
+        // this recording observed, so it has no entry for them and their writes are unattributable.
+        // strace resolves the same descriptors through `-yy` and reports the path.
+        //
+        // /dev/null and the recorder's own redirect files share this single root cause; they are listed
+        // separately only because their paths differ. Anything else inheriting a descriptor will behave
+        // the same way, which is why the arm matches on the inheritance pattern rather than on a fixed
+        // list of names.
         Fact::Wrote { path, .. } if path == "/dev/null" => Expectation::Expected(
-            "/dev/null is a character device, not a filesystem mutation; the aya backend may not \
-             track inherited device descriptors",
+            "an inherited descriptor: the shell redirects to /dev/null before exec, so the aya fd \
+             table — built from opens this recording observed — has no entry for it",
         ),
-        // The recorder redirects the child's stdout/stderr to files in the artifacts directory.
-        // The child inherits these fds — it never opens them itself — so the aya fd table has no
-        // open record and writes to them are unattributable. strace sees them because it traces
-        // the write(2) call with a resolved fd path.
+        // The recorder redirects the child's stdout/stderr to files in the artifacts directory. Same
+        // root cause as /dev/null above: inherited at exec, never opened by the child.
         Fact::Wrote { path, .. }
             if path.contains("command-stderr.log") || path.contains("command-stdout.log") =>
         {
             Expectation::Expected(
-                "the recorder's own stderr/stdout redirect files are inherited fds the child did \
-                 not open; the aya fd table has no open record for them",
+                "an inherited descriptor: the recorder's own stdout/stderr redirect files are opened \
+                 before exec, so the aya fd table has no entry for them",
             )
         }
         // aya reads the userspace path argument, so a relative open stays relative while strace's `-yy`
@@ -555,15 +561,26 @@ fn has_absolute_counterpart(
 }
 
 /// Whether two write mutation kinds are compatible for file creation/modification.
+/// Whether two write kinds describe the same behavior.
+///
+/// The two backends time their observations differently: strace sees `openat(O_CREAT|O_TRUNC)` and later
+/// aggregates `write(2)` byte counts, while aya reports the open and the aggregated total from its own fd
+/// table. So the same file creation legitimately surfaces as `Open` on one side and `Write` on the other.
+///
+/// **The grouping covers creation and modification only.** Structural mutations — `Mkdir`, `Rename`,
+/// `Symlink`, `Hardlink`, `Delete`, `Chmod`, `Chown` — still require exact equality, because reporting a
+/// `mkdir` as an `open` is a wrong claim about what happened rather than a timing artifact. Two tests
+/// pin that boundary: `write_kind_differences_are_real_differences` and
+/// `a_relative_pair_with_mismatched_kinds_is_not_excused`.
 fn kind_matches(a: WriteKind, b: WriteKind) -> bool {
-    a == b
-        || (matches!(
-            a,
-            WriteKind::Open | WriteKind::Write | WriteKind::Create | WriteKind::Truncate
-        ) && matches!(
-            b,
-            WriteKind::Open | WriteKind::Write | WriteKind::Create | WriteKind::Truncate
-        ))
+    /// Kinds that all mean "this file was created or its contents changed".
+    const CREATION: &[WriteKind] = &[
+        WriteKind::Open,
+        WriteKind::Write,
+        WriteKind::Create,
+        WriteKind::Truncate,
+    ];
+    a == b || (CREATION.contains(&a) && CREATION.contains(&b))
 }
 
 /// Whether an absolute path could be the resolved form of a relative one.
@@ -1085,6 +1102,52 @@ mod tests {
         ];
         let report = compare(&[strace_write, complete_end(Backend::Strace)], &aya);
         assert!(!report.passed(), "{}", report.summary());
+    }
+
+    #[test]
+    fn creation_kinds_pair_but_structural_kinds_do_not() {
+        // The exact boundary `kind_matches` draws, asserted directly rather than only through the
+        // comparison. Creation timing differs between the backends; a structural mutation reported as
+        // something else is a wrong claim.
+        for a in [
+            WriteKind::Open,
+            WriteKind::Write,
+            WriteKind::Create,
+            WriteKind::Truncate,
+        ] {
+            for b in [
+                WriteKind::Open,
+                WriteKind::Write,
+                WriteKind::Create,
+                WriteKind::Truncate,
+            ] {
+                assert!(kind_matches(a, b), "{a:?} and {b:?} both mean creation");
+            }
+        }
+
+        for structural in [
+            WriteKind::Mkdir,
+            WriteKind::Rename,
+            WriteKind::Symlink,
+            WriteKind::Hardlink,
+            WriteKind::Delete,
+            WriteKind::Chmod,
+            WriteKind::Chown,
+        ] {
+            assert!(kind_matches(structural, structural), "identity must hold");
+            assert!(
+                !kind_matches(structural, WriteKind::Open),
+                "{structural:?} must not pair with Open"
+            );
+            assert!(
+                !kind_matches(WriteKind::Write, structural),
+                "Write must not pair with {structural:?}"
+            );
+        }
+
+        // And two different structural kinds never pair with each other: a rename is not a delete.
+        assert!(!kind_matches(WriteKind::Rename, WriteKind::Delete));
+        assert!(!kind_matches(WriteKind::Symlink, WriteKind::Hardlink));
     }
 
     #[test]
