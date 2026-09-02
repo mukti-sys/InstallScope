@@ -20,11 +20,4 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Internal dev-kit docs (local only)
-Architecture.md
-Design.md
-Memory.md
-PRD.md
-Phases.md
-Rules.md
-Scope.md
+
