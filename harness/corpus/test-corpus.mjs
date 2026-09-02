@@ -510,6 +510,75 @@ try {
       caveats: [],
     })
   );
+
+  // THE fixture the first real backfill produced, reduced to its shape: a dependency bump that added
+  // 1200 node_modules writes and nothing else. Ranking by `added.length` put this at the top of the
+  // queue, above a package that started phoning home, and a queue of 25 of these is a queue nobody
+  // finishes. It must now rank *below* the two-behavior network change above.
+  writeFileSync(
+    path.join(diffsDir, "churn.json"),
+    JSON.stringify({
+      package: "SYNTHETIC-churn",
+      before_version: "1",
+      after_version: "2",
+      comparable: true,
+      identical: false,
+      unchanged: 40,
+      added: Array.from({ length: 1200 }, (_, index) => ({
+        class: "filesystem",
+        summary: `wrote project/node_modules/vendored-${index}/index.js`,
+      })),
+      removed: [],
+      blockers: [],
+      caveats: [],
+    })
+  );
+
+  // A single write outside every declared zone — the critical class. One of these must outrank both of
+  // the above, because nothing an ordinary install does produces it.
+  writeFileSync(
+    path.join(diffsDir, "escape.json"),
+    JSON.stringify({
+      package: "SYNTHETIC-escape",
+      before_version: "1",
+      after_version: "2",
+      comparable: true,
+      identical: false,
+      unchanged: 5,
+      added: [
+        { class: "writes outside expected directories", summary: "wrote /etc/cron.d/SYNTHETIC" },
+      ],
+      removed: [],
+      blockers: [],
+      caveats: [],
+    })
+  );
+
+  // A candidate whose one interesting behavior is buried under churn. The *evidence* must lead with the
+  // credential read, not with ten node_modules lines — otherwise a reader sees churn and moves on, which
+  // is the same failure as ranking it low.
+  writeFileSync(
+    path.join(diffsDir, "buried.json"),
+    JSON.stringify({
+      package: "SYNTHETIC-buried",
+      before_version: "1",
+      after_version: "2",
+      comparable: true,
+      identical: false,
+      unchanged: 3,
+      added: [
+        ...Array.from({ length: 300 }, (_, index) => ({
+          class: "filesystem",
+          summary: `wrote project/node_modules/noise-${index}/index.js`,
+        })),
+        { class: "credential reads", summary: "read home/.ssh/id_rsa" },
+      ],
+      removed: [],
+      blockers: [],
+      caveats: [],
+    })
+  );
+
   // A blocked comparison must contribute nothing: a difference between recordings is not a difference
   // between versions.
   writeFileSync(
@@ -537,11 +606,80 @@ try {
   check("builds a review queue", selected.status === 0, selected.stderr);
 
   const queue = readJson(queueJson);
+  const rankOf = (pkg) => queue.queue.findIndex((c) => c.package === pkg);
+  const weightOf = (pkg) => queue.queue.find((c) => c.package === pkg)?.weight ?? -1;
+
   check(
     "ranks a version-to-version change above a metadata hint",
     queue.queue[0].kind === "behavior_changed_between_versions",
     queue.queue.map((c) => c.kind).join(", ")
   );
+
+  // ---- the ranking fix, asserted from four directions ----------------------------------------
+  //
+  // Asserted as *tiers*, not as an exact ordering. `SYNTHETIC-escape` (one outside-project write, 601)
+  // and `SYNTHETIC-a` (one network plus one process, 602) land one point apart, and which of those two
+  // a human should read first is not a question the weighting claims to answer — a package that started
+  // both phoning home and piping curl into a shell is not obviously less interesting than one that wrote
+  // a single stray file. Pinning that 1-point order would be pinning an accident, and it would flip on
+  // any future tweak for no reason a reader could defend.
+  //
+  // What the weighting *does* claim: notable classes outrank filesystem churn by an unbridgeable margin.
+  // That is what these check.
+  const NOTABLE = ["SYNTHETIC-escape", "SYNTHETIC-a", "SYNTHETIC-buried"];
+  check(
+    "every notable-class candidate outranks pure churn",
+    NOTABLE.every((pkg) => rankOf(pkg) < rankOf("SYNTHETIC-churn")) &&
+      NOTABLE.every((pkg) => weightOf(pkg) > weightOf("SYNTHETIC-churn")),
+    queue.queue.slice(0, 5).map((c) => `${c.package}(${c.weight})`).join(", ")
+  );
+  check(
+    "the top candidate is a notable class, never churn",
+    NOTABLE.includes(queue.queue[0].package),
+    `top is ${queue.queue[0].package}(${queue.queue[0].weight})`
+  );
+  check(
+    "1200 node_modules writes rank BELOW a two-behavior network change",
+    rankOf("SYNTHETIC-churn") > rankOf("SYNTHETIC-a") &&
+      weightOf("SYNTHETIC-churn") < weightOf("SYNTHETIC-a"),
+    `churn=${weightOf("SYNTHETIC-churn")} network=${weightOf("SYNTHETIC-a")}`
+  );
+  check(
+    "no quantity of filesystem churn can bridge a class tier",
+    // 1200 writes is the largest realistic churn; the log nudge must stay far below the tier gap. The
+    // margin is asserted rather than just the ordering, so a future weighting change that narrowed it to
+    // one point would fail here instead of silently becoming fragile.
+    weightOf("SYNTHETIC-buried") - weightOf("SYNTHETIC-churn") > 100,
+    `churn=${weightOf("SYNTHETIC-churn")} buried-credential-read=${weightOf("SYNTHETIC-buried")}`
+  );
+  check(
+    "a credential read buried under 300 writes still ranks by the credential read",
+    rankOf("SYNTHETIC-buried") < rankOf("SYNTHETIC-churn"),
+    `buried=${rankOf("SYNTHETIC-buried")} churn=${rankOf("SYNTHETIC-churn")}`
+  );
+  check(
+    "evidence leads with the interesting class, not with churn",
+    queue.queue
+      .find((c) => c.package === "SYNTHETIC-buried")
+      .evidence[0].startsWith("[credential reads]"),
+    queue.queue.find((c) => c.package === "SYNTHETIC-buried").evidence[0]
+  );
+  check(
+    "the summary names the classes rather than a bare count",
+    queue.queue.find((c) => c.package === "SYNTHETIC-buried").summary.includes("1 credential reads"),
+    queue.queue.find((c) => c.package === "SYNTHETIC-buried").summary
+  );
+  check(
+    "each candidate carries the class breakdown that drove its weight",
+    queue.queue.find((c) => c.package === "SYNTHETIC-churn").classes.filesystem === 1200,
+    JSON.stringify(queue.queue.find((c) => c.package === "SYNTHETIC-churn").classes)
+  );
+  check(
+    "the withheld evidence count is stated rather than silently truncated",
+    readFileSync(queueMd, "utf8").includes("more, in the recording artifact"),
+    "a reader must know whether they saw the interesting part or the first tenth"
+  );
+
   check(
     "excludes a blocked comparison entirely",
     !JSON.stringify(queue.queue).includes("should-not-appear"),

@@ -30,6 +30,16 @@
 // Only (1) and (2) can be computed here. (3) is the human's part, which is why the queue carries the
 // evidence rather than a verdict.
 //
+// AND WHY COUNT IS THE WRONG WAY TO RANK (1)
+//
+// The first real backfill ranked by `added.length` and put this at the top:
+//
+//     yargs@18.1.0 vs 17.7.3 — 1307 new behavior(s)
+//       [filesystem] wrote project/node_modules/cliui/build/tsconfig.tsbuildinfo
+//
+// A dependency bump, not a story. See CLASS_WEIGHT below: ranking is by what kind of behavior appeared,
+// and a single new network connection outranks a thousand new node_modules writes.
+//
 // Usage:
 //   node harness/corpus/select-receipts.mjs --merged merged.json [--plan corpus-plan.json]
 //     [--diffs diffs/] [--out-json receipts-queue.json] [--out-md RECEIPTS-QUEUE.md] [--top 20]
@@ -174,6 +184,98 @@ const excludedFailed = recordings.filter((r) => r.recorded !== true);
 
 const candidates = [];
 
+// ---------------------------------------------------------------------------------------------
+// Weighting behavior classes
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How much a newly-appeared behavior is worth to a human reviewer, by class.
+ *
+ * WHY THIS TABLE EXISTS, AND WHAT IT REPLACED
+ *
+ * The first version weighted a version-to-version change as `100 + added.length`. The first real
+ * backfill showed exactly why that is wrong. Its top candidate:
+ *
+ *     yargs@18.1.0 vs 17.7.3 — 1307 new behavior(s)
+ *       [filesystem] wrote project/node_modules/cliui/build/tsconfig.tsbuildinfo
+ *       [filesystem] created directory project/node_modules/cliui/node_modules
+ *       ...
+ *
+ * That is a dependency tree change, not surprising behavior: yargs bumped its deps, so 1300 new files
+ * appeared under `node_modules`. Ranking by count means the packages with the most vendoring churn
+ * dominate the queue, and they are the least interesting things in it. A queue of 25 candidates that
+ * all read like that is a queue nobody finishes.
+ *
+ * So the weight is driven by *what kind* of behavior appeared, not how many. One new
+ * `resolved telemetry.example` outranks 1300 new `node_modules` writes, because a maintainer's reaction
+ * to the first is "wait, what?" and to the second is "yes, that is what a dependency bump does".
+ *
+ * The numbers are ordinal, not measurements. Their only job is to sort a reading queue, and they are
+ * deliberately far apart so that no quantity of filesystem churn can outrank a single network
+ * connection. Kept here rather than read from the rule catalog: that catalog scores *severity* for a
+ * report, and this ranks *surprise* for a human — related, and not the same question.
+ */
+const CLASS_WEIGHT = {
+  // A write outside every declared zone is the critical class (Architecture.md section 4). Nothing in a
+  // normal install does this.
+  "writes outside expected directories": 500,
+  // Reading ~/.ssh or ~/.aws during an install has no legitimate explanation a reviewer would guess.
+  "credential reads": 400,
+  // A resolved hostname or a connect is the "phones home" story, and it is what a receipt usually is.
+  network: 300,
+  // Spawning curl, sh, or a downloaded binary. High, but a build tool spawning gcc is ordinary, so it
+  // ranks below network.
+  processes: 200,
+  // node_modules writes, cache writes, /proc reads. Every install does thousands of these.
+  filesystem: 1,
+};
+
+/** Weight for a class this script does not know about. */
+const UNKNOWN_CLASS_WEIGHT = 50;
+
+/**
+ * Scores a set of newly-appeared behaviors.
+ *
+ * Counts *distinct classes* rather than summing every behavior: 40 new network connections is one story
+ * about a package, not 40 stories, and summing would reintroduce the churn problem one level up. The
+ * count within a class contributes a small logarithmic nudge so that "resolved 12 new hosts" ranks above
+ * "resolved 1 new host" without ever overtaking a higher class.
+ */
+function scoreAdded(added) {
+  const byClass = new Map();
+  for (const behavior of added) {
+    const cls = typeof behavior === "object" && behavior !== null ? behavior.class : undefined;
+    const key = typeof cls === "string" ? cls : "unknown";
+    byClass.set(key, (byClass.get(key) ?? 0) + 1);
+  }
+
+  let score = 0;
+  for (const [cls, count] of byClass) {
+    const base = CLASS_WEIGHT[cls] ?? UNKNOWN_CLASS_WEIGHT;
+    // log2(count + 1) stays under 11 for a thousand behaviors, so the nudge can never bridge the gap
+    // between two class tiers.
+    score += base + Math.round(Math.log2(count + 1));
+  }
+  return { score, byClass };
+}
+
+/**
+ * Orders evidence so a reviewer reads the interesting lines first.
+ *
+ * Without this, a candidate whose one new network connection is buried under 1300 `node_modules` writes
+ * shows ten filesystem lines and nothing else — the reader sees churn and moves on, which is the same
+ * failure as ranking it low.
+ */
+function orderEvidence(added) {
+  return [...added].sort((a, b) => {
+    const weightOf = (behavior) => {
+      const cls = typeof behavior === "object" && behavior !== null ? behavior.class : undefined;
+      return CLASS_WEIGHT[typeof cls === "string" ? cls : "unknown"] ?? UNKNOWN_CLASS_WEIGHT;
+    };
+    return weightOf(b) - weightOf(a);
+  });
+}
+
 // ---- signal 1: behavior changed between two versions of one package ---------------------------
 //
 // The strongest signal, and the one the corpus exists for. A diff that reports added behaviors is a
@@ -185,24 +287,36 @@ for (const diff of diffs.found) {
   const added = Array.isArray(diff.added) ? diff.added : [];
   if (added.length === 0) continue;
 
+  const { score, byClass } = scoreAdded(added);
+  // Classes named in the summary, most interesting first, so the queue is skimmable without opening a
+  // single candidate.
+  const classSummary = [...byClass.entries()]
+    .sort((a, b) => (CLASS_WEIGHT[b[0]] ?? UNKNOWN_CLASS_WEIGHT) - (CLASS_WEIGHT[a[0]] ?? UNKNOWN_CLASS_WEIGHT))
+    .map(([cls, count]) => `${count} ${cls}`)
+    .join(", ");
+
   candidates.push({
     kind: "behavior_changed_between_versions",
     package: diff.package,
     version: diff.after_version ?? null,
     compared_with: diff.before_version ?? null,
-    // Weighted highest because it is the only signal that carries its own baseline: the same package,
-    // one version earlier, not doing this.
-    weight: 100 + added.length,
+    // Driven by class, not by count. See CLASS_WEIGHT for why, and for what this replaced.
+    weight: 100 + score,
+    // Recorded so a reader can see what drove the ranking without reverse-engineering the number.
+    classes: Object.fromEntries(byClass),
     summary:
       `${diff.package} behaves differently in ${diff.after_version} than in ${diff.before_version}: ` +
-      `${added.length} new behavior(s)`,
-    // Rendered as readable lines rather than raw objects. This file is a reading task for a human, and
-    // a wall of JSON is exactly the friction that makes a review get skipped.
-    evidence: added.slice(0, 10).map((behavior) =>
-      typeof behavior === "string"
-        ? behavior
-        : `[${behavior.class ?? "?"}] ${behavior.summary ?? JSON.stringify(behavior)}`
-    ),
+      `${classSummary}`,
+    // Rendered as readable lines rather than raw objects, most interesting class first. This file is a
+    // reading task for a human, and a wall of JSON — or ten lines of node_modules churn — is exactly the
+    // friction that makes a review get skipped.
+    evidence: orderEvidence(added)
+      .slice(0, 10)
+      .map((behavior) =>
+        typeof behavior === "string"
+          ? behavior
+          : `[${behavior.class ?? "?"}] ${behavior.summary ?? JSON.stringify(behavior)}`
+      ),
     confirmed: null,
     confirmation_note: null,
   });
@@ -227,8 +341,10 @@ for (const recording of usable) {
       version: recording.version,
       compared_with: null,
       // Low weight on purpose. npm's own activity dominates, so this is a hint for review rather than a
-      // claim, and it must not outrank a real version-to-version change.
+      // claim, and it must not outrank a real version-to-version change — even one whose only new
+      // behavior is filesystem churn, which scores 100 + 1 + a small nudge.
       weight: 10,
+      classes: {},
       summary:
         `${key} declares no install script in its registry metadata, and its recording contains ` +
         `${recording.events} events`,
@@ -247,6 +363,7 @@ for (const recording of usable) {
       version: recording.version,
       compared_with: null,
       weight: 20,
+      classes: {},
       summary: `${key} declares ${declared.join(", ")} and was recorded running it`,
       evidence: [
         `declared install hooks: ${declared.join(", ")}`,
@@ -370,6 +487,11 @@ if (queue.length === 0) {
   L.push("Read top to bottom. Mark each `confirmed` in the JSON, or reject it — a rejection is as");
   L.push("informative as a confirmation and belongs in Memory.md either way.");
   L.push("");
+  L.push("Ranking is by **what kind** of behavior appeared, not how many. A single new network");
+  L.push("connection outranks a thousand new `node_modules` writes, because a dependency bump produces");
+  L.push("the second and nothing ordinary produces the first. Evidence within a candidate is ordered the");
+  L.push("same way, so the interesting lines are the ones you see.");
+  L.push("");
   queue.forEach((candidate, index) => {
     L.push(`### ${index + 1}. \`${candidate.package}@${candidate.version ?? "?"}\``);
     L.push("");
@@ -382,6 +504,13 @@ if (queue.length === 0) {
       L.push("");
       for (const item of candidate.evidence) {
         L.push(`- \`${typeof item === "string" ? item : JSON.stringify(item)}\``);
+      }
+      const shown = candidate.evidence.length;
+      const total = Object.values(candidate.classes ?? {}).reduce((sum, n) => sum + n, 0);
+      if (total > shown) {
+        // The count, not silence. A reader deciding whether to open the artifact needs to know whether
+        // they have seen the interesting part or the first tenth of it.
+        L.push(`- …and ${total - shown} more, in the recording artifact`);
       }
       L.push("");
     }
