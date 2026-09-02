@@ -111,6 +111,8 @@ enum SnapshotCommand {
     List(SnapshotListArgs),
     /// Re-verify every stored snapshot against its content address.
     Verify(SnapshotVerifyArgs),
+    /// Report what the corpus actually contains, computed from the stored recordings.
+    Summarize(SnapshotSummarizeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -176,6 +178,21 @@ struct SnapshotVerifyArgs {
 }
 
 #[derive(Args, Debug)]
+struct SnapshotSummarizeArgs {
+    /// Registry root.
+    #[arg(long, default_value = ".installscope/registry")]
+    registry: PathBuf,
+
+    /// Emit JSON rather than a table.
+    #[arg(long)]
+    json: bool,
+
+    /// Write the summary to this file as well as to stdout.
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 struct DiffArgs {
     /// Package name.
     package: String,
@@ -193,6 +210,14 @@ struct DiffArgs {
     /// Write the Markdown and HTML diff reports into this directory.
     #[arg(short, long)]
     out: Option<PathBuf>,
+
+    /// Emit the comparison as JSON on stdout instead of Markdown.
+    ///
+    /// For the corpus harness: `select-receipts.mjs` needs the added and removed behaviors as data, and
+    /// parsing the Markdown surface would couple a review script to a presentation format that exists to
+    /// be read by people.
+    #[arg(long)]
+    json: bool,
 
     /// Exit non-zero when behavior changed.
     ///
@@ -374,6 +399,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Snapshot(SnapshotCommand::Push(args)) => run_snapshot_push(args),
         Command::Snapshot(SnapshotCommand::List(args)) => run_snapshot_list(args),
         Command::Snapshot(SnapshotCommand::Verify(args)) => run_snapshot_verify(args),
+        Command::Snapshot(SnapshotCommand::Summarize(args)) => run_snapshot_summarize(args),
         Command::Diff(args) => run_diff(args),
         Command::Parity(args) => run_parity(args),
     }
@@ -632,6 +658,96 @@ fn run_snapshot_verify(args: &SnapshotVerifyArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Reports what the corpus actually contains.
+///
+/// The Phase 5 counterpart to `verify`: that one asks whether the store is intact, this one asks what
+/// is in it. Both read every blob, and this one is where a publishable number comes from — Phases.md:39
+/// wants to say "~50k version-behaviors", and 200 packages × 5 versions is 1000 *recordings*. Only a
+/// completed corpus can produce a behavior count, and `Rules.md` §5 applies to our own headline.
+fn run_snapshot_summarize(args: &SnapshotSummarizeArgs) -> Result<ExitCode> {
+    let registry = installscope_registry::Registry::open(&args.registry)
+        .with_context(|| format!("opening the registry at {}", args.registry.display()))?;
+
+    let summary = registry.summarize();
+
+    let payload = serde_json::json!({
+        "registry": args.registry.display().to_string(),
+        "snapshots": summary.snapshots,
+        "snapshots_readable": summary.snapshots_readable,
+        "packages": summary.packages,
+        "packages_with_multiple_versions": summary.packages_with_multiple_versions,
+        "diffable_pairs": summary.diffable_pairs,
+        "behavior_observations": summary.behavior_observations,
+        "distinct_behaviors": summary.distinct_behaviors,
+        "observations_by_class": summary.observations_by_class,
+        "unresolved_paths": summary.unresolved_paths,
+        "intact": summary.is_intact(),
+        "unreadable_snapshots": summary.unreadable_snapshots.iter()
+            .map(|(label, reason)| serde_json::json!({ "snapshot": label, "reason": reason }))
+            .collect::<Vec<_>>(),
+        "incomplete_snapshots": summary.incomplete_snapshots,
+        "claim_you_may_make": summary.claim(),
+        "claim_you_may_NOT_make":
+            "a behavior count taken from the plan rather than from this summary, or \
+             \"the top N npm packages\" (no ranking is established anywhere in this pipeline)",
+    });
+
+    let rendered =
+        serde_json::to_string_pretty(&payload).context("rendering the corpus summary as JSON")?;
+
+    if args.json {
+        println!("{rendered}");
+    } else {
+        println!("corpus at {}", args.registry.display());
+        println!("snapshots:            {}", summary.snapshots);
+        println!("  readable:           {}", summary.snapshots_readable);
+        println!("packages:             {}", summary.packages);
+        println!(
+            "  with 2+ versions:   {}",
+            summary.packages_with_multiple_versions
+        );
+        println!("diffable pairs:       {}", summary.diffable_pairs);
+        println!("behavior observations:{:>7}", summary.behavior_observations);
+        println!("distinct behaviors:   {}", summary.distinct_behaviors);
+        if !summary.observations_by_class.is_empty() {
+            println!("by class:");
+            for (class, count) in &summary.observations_by_class {
+                println!("  {count:>7}  {class}");
+            }
+        }
+        if summary.unresolved_paths > 0 {
+            println!("unresolved paths:     {}", summary.unresolved_paths);
+        }
+        for (label, reason) in &summary.unreadable_snapshots {
+            println!("UNREADABLE  {label}: {reason}");
+        }
+        for label in &summary.incomplete_snapshots {
+            println!("INCOMPLETE  {label} (the store should have refused this)");
+        }
+        println!();
+        println!("claim you may make: {}", summary.claim());
+    }
+
+    if let Some(out) = &args.out {
+        std::fs::write(out, format!("{rendered}\n"))
+            .with_context(|| format!("writing {}", out.display()))?;
+        eprintln!("wrote {}", out.display());
+    }
+
+    // A corpus with unreadable or incomplete snapshots is a hard failure, for the same reason `verify`
+    // fails: every receipt drawn from it rests on evidence that cannot be produced.
+    if !summary.is_intact() {
+        eprintln!(
+            "installscope: error: the corpus is not intact ({} unreadable, {} incomplete); it must \
+             not be published in this state",
+            summary.unreadable_snapshots.len(),
+            summary.incomplete_snapshots.len()
+        );
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Compares two recorded versions of a package.
 fn run_diff(args: &DiffArgs) -> Result<ExitCode> {
     let registry = installscope_registry::Registry::open(&args.registry)
@@ -646,7 +762,45 @@ fn run_diff(args: &DiffArgs) -> Result<ExitCode> {
             )
         })?;
 
-    print!("{}", installscope_report::render_diff_markdown(&comparison));
+    if args.json {
+        // Behaviors as their rendered summary lines, which is the same identity the diff engine
+        // compares on. Emitting the enum's structure instead would expose an internal shape that a
+        // review script would then depend on.
+        let payload = serde_json::json!({
+            "package": comparison.package,
+            "before_version": comparison.before_version,
+            "after_version": comparison.after_version,
+            "comparable": comparison.comparable(),
+            "identical": comparison.is_identical(),
+            "headline": comparison.headline(),
+            "unchanged": comparison.unchanged,
+            "added": comparison.added.iter()
+                .map(|behavior| serde_json::json!({
+                    "class": behavior.class().as_str(),
+                    "summary": behavior.summary(),
+                }))
+                .collect::<Vec<_>>(),
+            "removed": comparison.removed.iter()
+                .map(|behavior| serde_json::json!({
+                    "class": behavior.class().as_str(),
+                    "summary": behavior.summary(),
+                }))
+                .collect::<Vec<_>>(),
+            // Carried so a consumer cannot mistake a blocked comparison for a quiet one.
+            "blockers": comparison.blockers.iter()
+                .map(installscope_registry::Blocker::explanation)
+                .collect::<Vec<_>>(),
+            "caveats": comparison.caveats.iter()
+                .map(installscope_registry::Caveat::explanation)
+                .collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("rendering the comparison as JSON")?
+        );
+    } else {
+        print!("{}", installscope_report::render_diff_markdown(&comparison));
+    }
 
     if let Some(out) = &args.out {
         std::fs::create_dir_all(out)

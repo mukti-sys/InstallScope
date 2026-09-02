@@ -169,6 +169,146 @@ impl Registry {
         Ok(compare(package, &before, &after))
     }
 
+    /// Summarises the whole corpus: what it holds, and what the behaviors across it actually are.
+    ///
+    /// Exists because of a specific claim. Phases.md:39 wants to publish "we already recorded ~50k
+    /// version-behaviors", and 200 packages × 5 versions is 1000 *recordings*, not 50k behaviors. Those
+    /// are different quantities and only a completed corpus can produce the second one. So this counts
+    /// it, and whatever it reports is the number that may be published — `Rules.md` §5 applies to our own
+    /// headline as much as to the neighbour table.
+    ///
+    /// Reads every blob, which means it also verifies every blob on the way past. A survey of a corpus
+    /// that skipped verification would be a statement about an index rather than about evidence.
+    ///
+    /// # Errors
+    /// Never as a whole. A snapshot that cannot be read is counted in
+    /// [`CorpusSummary::unreadable_snapshots`] and named, because a corpus that quietly omits its broken
+    /// entries reports itself as cleaner than it is.
+    #[must_use]
+    pub fn summarize(&self) -> CorpusSummary {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut summary = CorpusSummary::default();
+        let mut per_package: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // Behavior identity is the rendered summary line: two recordings that produce the same line
+        // describe the same behavior, and that is exactly the equality the diff engine uses.
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+
+        for entry in self.index.entries() {
+            summary.snapshots += 1;
+            let profile = match self.recording_of(entry) {
+                Ok(recording) => recording.profile,
+                Err(error) => {
+                    summary
+                        .unreadable_snapshots
+                        .push((entry.label(), error.to_string()));
+                    continue;
+                }
+            };
+
+            summary.snapshots_readable += 1;
+            per_package
+                .entry(entry.package.clone())
+                .or_default()
+                .insert(entry.version.clone());
+
+            // Counted twice on purpose: `behavior_observations` is the total across the corpus, which is
+            // the number a "we recorded N behaviors" claim needs, while `distinct` is how many *different*
+            // behaviors exist, which is the more interesting one and always smaller.
+            summary.behavior_observations += profile.len();
+            for behavior in &profile.behaviors {
+                distinct.insert(behavior.summary());
+                *summary
+                    .observations_by_class
+                    .entry(behavior.class().as_str().to_string())
+                    .or_insert(0) += 1;
+            }
+            summary.unresolved_paths += u64::from(profile.unresolved_paths);
+            if !profile.complete {
+                // Should be impossible: `push` refuses an incomplete recording. Counted rather than
+                // asserted, because a store can also be populated by hand, and a silent contradiction
+                // between the store's rule and its contents is worth surfacing.
+                summary.incomplete_snapshots.push(entry.label());
+            }
+        }
+
+        summary.distinct_behaviors = distinct.len();
+        summary.packages = per_package.len();
+        summary.packages_with_multiple_versions = per_package
+            .values()
+            .filter(|versions| versions.len() > 1)
+            .count();
+        summary.diffable_pairs = per_package
+            .values()
+            .map(|versions| versions.len().saturating_sub(1))
+            .sum();
+        summary
+    }
+}
+
+/// What a corpus actually contains, computed rather than intended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CorpusSummary {
+    /// Index entries seen.
+    pub snapshots: usize,
+    /// Entries whose blob verified and parsed.
+    pub snapshots_readable: usize,
+    /// Distinct packages with at least one readable snapshot.
+    pub packages: usize,
+    /// Packages with two or more versions — the only ones a version-diff can be drawn for.
+    pub packages_with_multiple_versions: usize,
+    /// Consecutive version pairs available to diff, summed over packages.
+    ///
+    /// The moat's actual size: a package with five recorded versions yields four comparisons.
+    pub diffable_pairs: usize,
+    /// Total behaviors observed across every snapshot, counting repeats across snapshots.
+    pub behavior_observations: usize,
+    /// How many *different* behaviors the corpus contains.
+    ///
+    /// Always smaller than [`Self::behavior_observations`], usually by a lot: every install writes to
+    /// `node_modules`. Reported separately because "we recorded N behaviors" is ambiguous between the two
+    /// and the smaller number is the honest one for a novelty claim.
+    pub distinct_behaviors: usize,
+    /// Observations per behavior class, keyed by the class's display name.
+    pub observations_by_class: std::collections::BTreeMap<String, usize>,
+    /// Paths no backend could resolve, summed. Bounds how much filesystem analysis actually happened.
+    pub unresolved_paths: u64,
+    /// Snapshots whose blob could not be read, with the reason.
+    pub unreadable_snapshots: Vec<(String, String)>,
+    /// Snapshots that parsed but are marked incomplete, which `push` should have refused.
+    pub incomplete_snapshots: Vec<String>,
+}
+
+impl CorpusSummary {
+    /// True when every indexed snapshot could be read and is complete.
+    #[must_use]
+    pub fn is_intact(&self) -> bool {
+        self.unreadable_snapshots.is_empty() && self.incomplete_snapshots.is_empty()
+    }
+
+    /// The sentence a launch post may use, built from what was counted.
+    ///
+    /// Phrased with both behavior numbers, because publishing only the larger one would be technically
+    /// true and misleading — most of the observations are the same handful of behaviors repeated across
+    /// packages.
+    #[must_use]
+    pub fn claim(&self) -> String {
+        if self.snapshots_readable == 0 {
+            return "no readable recordings — make no claim about this corpus".to_string();
+        }
+        format!(
+            "{} recordings of {} packages, {} version pairs comparable, {} behavior observations of \
+             {} distinct behaviors",
+            self.snapshots_readable,
+            self.packages,
+            self.diffable_pairs,
+            self.behavior_observations,
+            self.distinct_behaviors
+        )
+    }
+}
+
+impl Registry {
     /// Verifies every indexed snapshot against its content address.
     ///
     /// Exists because content addressing only pays off if someone checks. A corpus is the durable record
@@ -747,6 +887,158 @@ mod tests {
         let scratch = Scratch::new("verify-empty");
         let registry = Registry::open(scratch.path()).expect("open");
         assert!(registry.verify_all().is_empty());
+    }
+
+    #[test]
+    fn summarize_counts_observations_and_distinct_behaviors_separately() {
+        // The number Phases.md:39 wants to publish. "N behaviors" is ambiguous between the total across
+        // the corpus and how many *different* behaviors it contains, and the second is much smaller
+        // because every install writes to node_modules. Publishing only the larger would be technically
+        // true and misleading, so both are counted.
+        let scratch = Scratch::new("summarize");
+        let mut registry = Registry::open(scratch.path()).expect("open");
+
+        // Two versions of one package with identical behavior, plus one that does something extra.
+        registry
+            .push("pkg", "1.0.0", &recording_jsonl("/work", None, true))
+            .expect("push");
+        registry
+            .push("pkg", "1.0.1", &recording_jsonl("/elsewhere", None, true))
+            .expect("push");
+        registry
+            .push(
+                "pkg",
+                "1.0.2",
+                &recording_jsonl("/work", Some("/etc/cron.d/x"), true),
+            )
+            .expect("push");
+
+        let summary = registry.summarize();
+        assert_eq!(summary.snapshots, 3);
+        assert_eq!(summary.snapshots_readable, 3);
+        assert_eq!(summary.packages, 1);
+        assert_eq!(summary.packages_with_multiple_versions, 1);
+        // Three versions yield two consecutive comparisons, which is the moat's real size.
+        assert_eq!(summary.diffable_pairs, 2);
+
+        // 1 + 1 + 2 observations; the shared project write is one distinct behavior across all three.
+        assert_eq!(summary.behavior_observations, 4);
+        assert_eq!(
+            summary.distinct_behaviors, 2,
+            "the project write plus the /etc write: {summary:?}"
+        );
+        assert!(
+            summary.distinct_behaviors < summary.behavior_observations,
+            "distinct must be the smaller, more honest number"
+        );
+        assert!(summary.is_intact());
+    }
+
+    #[test]
+    fn summarize_reports_a_claim_built_from_what_it_counted() {
+        let scratch = Scratch::new("summarize-claim");
+        let mut registry = Registry::open(scratch.path()).expect("open");
+        registry
+            .push("pkg", "1.0.0", &recording_jsonl("/work", None, true))
+            .expect("push");
+
+        let claim = registry.summarize().claim();
+        assert!(claim.contains("1 recordings"), "{claim}");
+        assert!(claim.contains("1 packages"), "{claim}");
+        assert!(claim.contains("distinct behaviors"), "{claim}");
+
+        // An empty corpus refuses to produce a claim rather than producing a claim about zero.
+        let empty = Scratch::new("summarize-empty");
+        let none = Registry::open(empty.path()).expect("open");
+        assert!(none.summarize().claim().contains("make no claim"));
+    }
+
+    #[test]
+    fn summarize_names_a_snapshot_it_could_not_read() {
+        // A corpus that quietly omits its broken entries reports itself as cleaner than it is, and the
+        // published dataset would then overstate its own size.
+        //
+        // The two fixtures differ, which matters more than it looks: byte-identical recordings share one
+        // blob by construction, so corrupting "one of them" would corrupt both and the test would prove
+        // something else. That sharing is a real property of the corpus — two versions whose installs are
+        // byte-identical are one stored blob with two index entries.
+        let scratch = Scratch::new("summarize-broken");
+        let mut registry = Registry::open(scratch.path()).expect("open");
+        let entry = registry
+            .push("pkg", "1.0.0", &recording_jsonl("/work-a", None, true))
+            .expect("push");
+        registry
+            .push("pkg", "1.0.1", &recording_jsonl("/work-b", None, true))
+            .expect("push");
+
+        let digest = entry.digest().expect("digest");
+        let path = registry.store().path_of(&digest);
+        let mut bytes = std::fs::read(&path).expect("read blob");
+        bytes[0] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("tamper");
+
+        let summary = registry.summarize();
+        assert_eq!(summary.snapshots, 2);
+        assert_eq!(summary.snapshots_readable, 1, "one blob is unreadable");
+        assert_eq!(summary.unreadable_snapshots.len(), 1);
+        assert_eq!(summary.unreadable_snapshots[0].0, "pkg@1.0.0");
+        assert!(!summary.is_intact());
+        // And the unreadable one must not be counted toward the diffable pairs it cannot support.
+        assert_eq!(
+            summary.diffable_pairs, 0,
+            "one readable version diffs against nothing"
+        );
+    }
+
+    #[test]
+    fn identical_recordings_of_two_versions_share_one_blob() {
+        // Worth pinning, because it surprises: content addressing means two versions whose event streams
+        // are byte-identical occupy one blob and two index entries. Good for a corpus of ~1000 recordings,
+        // and it means a single corrupted blob can invalidate more than one index entry.
+        let scratch = Scratch::new("shared-blob");
+        let mut registry = Registry::open(scratch.path()).expect("open");
+        let first = registry
+            .push("pkg", "1.0.0", &recording_jsonl("/work", None, true))
+            .expect("push");
+        let second = registry
+            .push("pkg", "1.0.1", &recording_jsonl("/work", None, true))
+            .expect("push");
+
+        assert_eq!(first.digest, second.digest, "identical streams, one blob");
+        let summary = registry.summarize();
+        assert_eq!(summary.snapshots, 2, "two index entries all the same");
+        assert_eq!(summary.snapshots_readable, 2);
+        assert_eq!(summary.diffable_pairs, 1);
+    }
+
+    #[test]
+    fn summarize_groups_observations_by_class() {
+        let scratch = Scratch::new("summarize-classes");
+        let mut registry = Registry::open(scratch.path()).expect("open");
+        registry
+            .push(
+                "pkg",
+                "1.0.0",
+                &recording_jsonl("/work", Some("/etc/cron.d/x"), true),
+            )
+            .expect("push");
+
+        let summary = registry.summarize();
+        assert_eq!(
+            summary.observations_by_class.get("filesystem").copied(),
+            Some(1),
+            "the node_modules write: {:?}",
+            summary.observations_by_class
+        );
+        assert_eq!(
+            summary
+                .observations_by_class
+                .get("writes outside expected directories")
+                .copied(),
+            Some(1),
+            "{:?}",
+            summary.observations_by_class
+        );
     }
 
     #[test]
