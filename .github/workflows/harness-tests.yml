@@ -11,15 +11,23 @@ on:
     paths:
       - "harness/g2/**"
       - "core/**"
+      - "lockfile/**"
       - "recorder/**"
+      - "registry/**"
+      - "report/**"
       - "cli/**"
+      - "action/**"
       - ".github/workflows/harness-tests.yml"
   pull_request:
     paths:
       - "harness/g2/**"
       - "core/**"
+      - "lockfile/**"
       - "recorder/**"
+      - "registry/**"
+      - "report/**"
       - "cli/**"
+      - "action/**"
       - ".github/workflows/harness-tests.yml"
   workflow_dispatch:
 
@@ -51,13 +59,18 @@ jobs:
         # Covers product code as well as the harness: the framing matters most in the crate docs a
         # reader actually sees. Whole words only; lines that discuss the ban itself are excluded, as
         # is this workflow.
+        #
+        # `safe` is deliberately absent from the pattern. It has a legitimate technical meaning this
+        # codebase uses constantly — "safe Rust", "JSON's safe integer range", "safe by construction" —
+        # and banning the word rather than the framing would produce a check people route around. The
+        # framing it appears in is what matters, and that is a review judgement.
         run: |
           set -uo pipefail
           hits="$(
             grep -rniE '\b(sandbox|sandboxed|sandboxing|protection|protects?|guaranteed|security blanket)\b' \
               --include='*.md' --include='*.mjs' --include='*.sh' --include='*.rs' --include='*.yml' \
               --include='*.toml' --exclude='harness-tests.yml' \
-              harness .github core recorder cli 2>/dev/null \
+              harness .github core lockfile recorder registry report cli action 2>/dev/null \
               | grep -viE 'banned|Rules\.md|never .?(protection|sandbox)|not (a )?(sandbox|protection)|opt-in enforcement' \
               || true
           )"

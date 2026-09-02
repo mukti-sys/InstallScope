@@ -9,6 +9,11 @@ node_modules/
 harness/g2/out/
 harness/g2/work/
 
+# The default snapshot registry location. A registry is content-addressed evidence, and which
+# recordings belong in the repository is a deliberate choice per corpus (Phases.md:38) rather than
+# whatever a local run happened to produce. CI uploads it as an artifact.
+.installscope/
+
 # OS / editor
 .DS_Store
 Thumbs.db

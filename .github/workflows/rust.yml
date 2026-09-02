@@ -13,7 +13,9 @@ on:
     paths:
       - "abi/**"
       - "core/**"
+      - "lockfile/**"
       - "recorder/**"
+      - "registry/**"
       - "report/**"
       - "cli/**"
       - "rules/**"
@@ -25,7 +27,9 @@ on:
     paths:
       - "abi/**"
       - "core/**"
+      - "lockfile/**"
       - "recorder/**"
+      - "registry/**"
       - "report/**"
       - "cli/**"
       - "rules/**"
@@ -95,7 +99,7 @@ jobs:
         run: |
           set -uo pipefail
           hits="$(grep -rn 'allow(clippy::unwrap_used\|allow(clippy::expect_used' \
-            abi/src core/src recorder/src cli/src 2>/dev/null || true)"
+            abi/src core/src lockfile/src recorder/src registry/src report/src cli/src 2>/dev/null || true)"
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error title=Rules.md §2::unwrap/expect lints must not be allowed in product code"
@@ -110,7 +114,8 @@ jobs:
         # exactly the drift this catches.
         run: |
           set -uo pipefail
-          hits="$(grep -rln 'allow(unsafe_code)' abi/src core/src recorder/src cli/src 2>/dev/null || true)"
+          hits="$(grep -rln 'allow(unsafe_code)' \
+            abi/src core/src lockfile/src recorder/src registry/src report/src cli/src 2>/dev/null || true)"
           expected="recorder/src/aya.rs"
           if [ "$hits" != "$expected" ] && [ -n "$hits" ]; then
             printf 'files opting into unsafe:\n%s\n' "$hits"
@@ -118,6 +123,32 @@ jobs:
             exit 1
           fi
           echo "unsafe is confined to ${hits:-nothing}"
+
+      - name: Confirm the C dependency stays confined to the registry crate
+        # Rules.md §1 asks to avoid C-dependent stacks unless documented. `zstd` is a binding to the
+        # reference C implementation and is documented in registry/Cargo.toml — Architecture.md:40 fixes
+        # zstd for snapshot blobs, and the pure-Rust encoder panics above its lowest compression level
+        # (verified locally against ruzstd 0.9.0).
+        #
+        # Checked mechanically because the boundary is what makes the exception acceptable: the recorder
+        # and the rules engine must keep building on a machine with no C toolchain.
+        run: |
+          set -uo pipefail
+          for crate in installscope-abi installscope-core installscope-lockfile installscope-recorder; do
+            if cargo tree -p "$crate" --edges normal --prefix none --format '{p}' \
+                 | grep -qi '^zstd-sys'; then
+              echo "::error title=C dependency escaped::$crate now depends on zstd-sys; Rules.md §1 confines it to installscope-registry"
+              cargo tree -p "$crate" --edges normal --invert zstd-sys || true
+              exit 1
+            fi
+          done
+          # And it must genuinely be present where it is documented, or the documentation is stale.
+          if ! cargo tree -p installscope-registry --edges normal --prefix none --format '{p}' \
+               | grep -qi '^zstd'; then
+            echo "::error title=Stale documentation::installscope-registry no longer depends on zstd; update its Cargo.toml comment"
+            exit 1
+          fi
+          echo "zstd-sys is confined to installscope-registry, as documented"
 
       - name: Confirm the dependency tree has no LLM, cloud, or telemetry crates
         # Rules.md §1 bans these outright: "this product's entire moral claim is 'we watch packages,
@@ -198,4 +229,167 @@ jobs:
           ./target/release/installscope report corpus/demo/partial.jsonl --out /tmp/sarif-partial
           ./target/release/installscope report corpus/demo/aya-clean.jsonl --out /tmp/sarif-aya-clean
           npx --yes @microsoft/sarif-multitool validate /tmp/sarif-*/installscope.sarif.json
+
+      - name: Exercise the Phase 4 pipeline end to end on the demo corpus
+        # The registry and the diff renderers have unit and golden coverage, but the *wiring* between the
+        # CLI subcommands does not: an argument renamed on one side of `snapshot push` → `diff` would pass
+        # every test and break the Action. This runs the real binary over the committed fixtures.
+        run: |
+          set -euo pipefail
+          registry=/tmp/phase4-registry
+
+          ./target/release/installscope snapshot push corpus/demo/diff-before.jsonl \
+            --registry "$registry" --package SYNTHETIC-drifting-pkg --version 1.4.2
+          ./target/release/installscope snapshot push corpus/demo/diff-after.jsonl \
+            --registry "$registry" --package SYNTHETIC-drifting-pkg --version 1.4.3
+          ./target/release/installscope snapshot list --registry "$registry"
+
+          ./target/release/installscope diff SYNTHETIC-drifting-pkg 1.4.2 1.4.3 \
+            --registry "$registry" --out /tmp/phase4-diff | tee /tmp/phase4-diff.txt
+
+          grep -q "behavior changed" /tmp/phase4-diff.txt
+          grep -q "/etc/cron.d/SYNTHETIC-vendor-sync" /tmp/phase4-diff.txt
+          test -s /tmp/phase4-diff/installscope-diff.html
+
+          # Content addressing only pays off if something checks. A store that verified on write and never
+          # again would let a corrupted corpus back every later receipt.
+          ./target/release/installscope snapshot verify --registry "$registry"
+
+          # And the check must actually fail on a corrupted blob, or it is decoration.
+          #
+          # Corrupted by appending and by truncating rather than with `dd conv=notrunc`: dd is a silent
+          # no-op under Git-for-Windows' bash, so a dd-based check passes for the wrong reason on a dev
+          # machine and only ever exercises the real path in CI. `cmp` asserts the file actually changed
+          # before drawing any conclusion from the result — a tamper test that does not verify it tampered
+          # is the same class of false confidence this whole product is about.
+          blob="$(find "$registry/blobs" -type f | head -n 1)"
+          cp "$blob" /tmp/blob.bak
+
+          for method in append truncate; do
+            cp /tmp/blob.bak "$blob"
+            case "$method" in
+              append)   printf 'X' >> "$blob" ;;
+              truncate) truncate -s -1 "$blob" ;;
+            esac
+            if cmp -s /tmp/blob.bak "$blob"; then
+              echo "::error title=Tamper test did not tamper::the $method method left the blob unchanged, so it proves nothing"
+              cp /tmp/blob.bak "$blob"
+              exit 1
+            fi
+            if ./target/release/installscope snapshot verify --registry "$registry" > /tmp/verify-tampered.txt 2>&1; then
+              cat /tmp/verify-tampered.txt
+              echo "::error title=Verification is decoration::a $method-corrupted blob must fail snapshot verify"
+              cp /tmp/blob.bak "$blob"
+              exit 1
+            fi
+            grep -q "must not be used as evidence" /tmp/verify-tampered.txt
+            echo "$method corruption detected"
+          done
+
+          cp /tmp/blob.bak "$blob"
+          ./target/release/installscope snapshot verify --registry "$registry"
+          echo "corruption is detected, and the store verifies again once restored"
+
+          # A PARTIAL recording must be refused by the store, not silently accepted. The registry is the
+          # input to every later diff, so this refusal is the difference between a trustworthy corpus and
+          # one that attributes recorder failures to packages.
+          if ./target/release/installscope snapshot push corpus/demo/partial.jsonl \
+               --registry "$registry" --package SYNTHETIC-partial --version 0.0.1 2>/tmp/partial-err.txt; then
+            echo "::error title=PARTIAL accepted::the registry must refuse an incomplete recording"
+            exit 1
+          fi
+          cat /tmp/partial-err.txt
+          grep -q "attribute the recorder's failure to the package" /tmp/partial-err.txt
+          echo "the registry refuses PARTIAL recordings, as designed"
+
+      - name: Exercise the lockfile-diff trigger on the committed fixtures
+        # The trigger decides whether a runner gets spent at all, so its exit codes are a contract with the
+        # Action's shell. Checked against real package-manager output rather than a constructed case.
+        #
+        # The fixtures are staged into real lockfile names first, because that is how a caller actually
+        # holds them: the `--after` side is the file in the working tree under its own name. The `--before`
+        # side deliberately is *not* renamed — a workflow gets it from `git show` into a scratch filename,
+        # and this step is where that shape stays exercised.
+        run: |
+          set -euo pipefail
+          work=/tmp/trigger
+          rm -rf "$work"
+          mkdir -p "$work/before" "$work/after"
+          cp lockfile/tests/fixtures/npm/v1-nested-duplicate.json "$work/base-package-lock.json"
+          cp lockfile/tests/fixtures/npm/v3-alias-scoped-nested.json "$work/after/package-lock.json"
+
+          # A dependency addition must be recordable (exit 0).
+          ./target/release/installscope lockfile-diff \
+            --before "$work/base-package-lock.json" \
+            --after "$work/after/package-lock.json" \
+            --json > /tmp/trigger-add.json
+          cat /tmp/trigger-add.json
+          grep -q '"should_record": true' /tmp/trigger-add.json
+
+          # An unchanged lockfile must exit 4, which is how the Action skips a run without failing.
+          cp lockfile/tests/fixtures/npm/v3-alias-scoped-nested.json "$work/same-package-lock.json"
+          set +e
+          ./target/release/installscope lockfile-diff \
+            --before "$work/same-package-lock.json" \
+            --after "$work/after/package-lock.json" > /dev/null
+          status=$?
+          set -e
+          if [ "$status" -ne 4 ]; then
+            echo "::error title=Trigger contract broken::an unchanged lockfile must exit 4, got $status"
+            exit 1
+          fi
+
+          # A first dependency PR has no previous lockfile at all. `git show` of a path that did not exist
+          # produces an empty file, and that must read as "everything is new" rather than as a parse error.
+          : > "$work/absent-package-lock.json"
+          ./target/release/installscope lockfile-diff \
+            --before "$work/absent-package-lock.json" \
+            --after "$work/after/package-lock.json" \
+            --json > /tmp/trigger-first.json
+          grep -q '"should_record": true' /tmp/trigger-first.json
+
+          # An out-of-scope lockfile must be refused by name (Scope.md:41).
+          printf '# yarn lockfile v1\n' > /tmp/yarn.lock
+          set +e
+          ./target/release/installscope lockfile-diff --before /tmp/yarn.lock --after /tmp/yarn.lock \
+            2>/tmp/yarn-err.txt
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error title=Out-of-scope lockfile accepted::yarn.lock must be refused"
+            exit 1
+          fi
+          grep -q "not an in-scope lockfile" /tmp/yarn-err.txt
+          echo "the trigger contract holds"
+
+      - name: Lint the Action definitions
+        # The composite actions are the only part of the product that is not Rust, so they get the checks
+        # a compiler would otherwise provide: valid YAML, and the two trigger guards that make the
+        # read-only/write-token split real rather than documented.
+        run: |
+          set -euo pipefail
+          for action in action/record/action.yml action/comment/action.yml; do
+            node -e "
+              const fs = require('fs');
+              const text = fs.readFileSync('$action', 'utf8');
+              if (!text.includes('using: \"composite\"')) {
+                console.error('$action is not a composite action');
+                process.exit(1);
+              }
+            "
+          done
+
+          # The recording action executes untrusted install scripts, so it must refuse the triggers that
+          # would hand it a write-capable token.
+          grep -q 'pull_request_target|issue_comment|workflow_run' action/record/action.yml
+          # And it must not request a write scope anywhere.
+          if grep -nE 'pull-requests:[[:space:]]*write|contents:[[:space:]]*write' action/record/action.yml; then
+            echo "::error title=Write scope in the recording action::it runs untrusted code and must stay read-only"
+            exit 1
+          fi
+          # The comment action holds the write token, so it must refuse to run anywhere but workflow_run.
+          grep -q 'GITHUB_EVENT_NAME}" != "workflow_run"' action/comment/action.yml
+          # And it must validate the PR number it reads out of an artifact written by that untrusted job.
+          grep -q "grep -Eq '\^\[1-9\]\[0-9\]{0,9}\$'" action/comment/action.yml
+          echo "both Action guards are present"
 

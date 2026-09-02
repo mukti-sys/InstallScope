@@ -52,11 +52,18 @@ const WRITE = !process.argv.includes("--stdout");
 /**
  * Feature sets that must both be verified. The aya backend is optional, so both configurations ship.
  *
- * `linuxHostOnly` marks a set whose *tests* cannot execute on a non-Linux host: `aya` depends on
- * `aya-obj`, which uses `std::os::fd`, so native compilation fails on Windows before any test runs.
- * Clippy still covers it because clippy runs against `--target x86_64-unknown-linux-gnu`. That
- * distinction matters — reporting "cannot run here" as "failed" would make this file the kind of
- * misleading signal it exists to prevent.
+ * `linuxHostOnly` marks a set that cannot be verified at all on a non-Linux host, and since Phase 4 that
+ * covers its lint as well as its tests. Two separate reasons, both real:
+ *
+ * - **Tests:** `aya` depends on `aya-obj`, which uses `std::os::fd`, so native compilation fails on
+ *   Windows before any test runs.
+ * - **Clippy:** linting it needs `--target x86_64-unknown-linux-gnu`, and the workspace now contains a C
+ *   dependency (`zstd-sys`, via `installscope-registry`) that a Windows host cannot cross-compile without
+ *   a Linux C toolchain. `cc` invokes the host compiler with a Linux target triple and it refuses.
+ *
+ * Reported as skipped rather than failed, for the reason this whole file exists: "cannot be checked here"
+ * and "checked and broken" are different claims, and conflating them makes the artifact the kind of
+ * misleading signal it is meant to prevent. CI runs on Linux natively and checks both.
  */
 const FEATURE_SETS = [
   { label: "default", args: [], linuxHostOnly: false },
@@ -250,6 +257,23 @@ const fmt = cargo(["fmt", "--all", "--", "--check"], { allowFailure: true });
 const results = [];
 
 for (const set of FEATURE_SETS) {
+  // A set that cannot be verified on this host is recorded as skipped, not as zero-passed or failed.
+  // Either of those would be a false claim: zero reads as "nothing to test", and failed reads as
+  // "checked and broken". See the FEATURE_SETS docs for why the aya set cannot be checked on Windows.
+  if (set.linuxHostOnly && !HOST_IS_LINUX) {
+    console.error(`test-log: ${set.label} skipped entirely — needs a Linux host`);
+    results.push({
+      label: set.label,
+      clippy: null,
+      tests: null,
+      skipped:
+        `not verifiable on ${process.platform}: aya-obj requires std::os::fd for the tests, and ` +
+        "cross-linting needs a Linux C toolchain for zstd-sys",
+      areas: [],
+    });
+    continue;
+  }
+
   console.error(`test-log: clippy (${set.label})`);
   const clippy = cargo(
     [
@@ -264,21 +288,6 @@ for (const set of FEATURE_SETS) {
     ],
     { allowFailure: true }
   );
-
-  // A set whose tests cannot run on this host is recorded as skipped, not as zero-passed. Zero would
-  // read as "nothing to test", which is false and is precisely the wrong impression for a transparency
-  // artifact to leave.
-  if (set.linuxHostOnly && !HOST_IS_LINUX) {
-    console.error(`test-log: test (${set.label}) skipped — needs a Linux host`);
-    results.push({
-      label: set.label,
-      clippy: clippy.ok,
-      tests: null,
-      skipped: `not runnable on ${process.platform}: aya-obj requires std::os::fd`,
-      areas: [],
-    });
-    continue;
-  }
 
   console.error(`test-log: test (${set.label})`);
   const tests = runTests(set.args);
@@ -300,7 +309,13 @@ const primary = results.find((r) => r.label === "default") ?? results[0];
 const everythingPassed =
   fmt.ok &&
   harness.ok &&
-  results.every((r) => r.clippy && (r.tests === null || (r.tests.ok && r.tests.failed === 0)));
+  // A skipped set carries `clippy: null` and `tests: null`. It must not count as a failure — that would
+  // mark every Windows run as broken — and it must not count as a pass either, which is why the file
+  // states the skip prominently rather than quietly folding it into a green total.
+  results.every(
+    (r) =>
+      (r.clippy === null || r.clippy) && (r.tests === null || (r.tests.ok && r.tests.failed === 0))
+  );
 
 // ---------------------------------------------------------------------------------------------
 
@@ -323,8 +338,8 @@ lines.push(
 lines.push("");
 lines.push(
   "**Counts are host-dependent.** `recorder/src/strace.rs` tests are `cfg(target_os = \"linux\")`, the " +
-    "E2E suite is Linux-only, and the aya-backend tests cannot link on Windows at all. A Linux run of " +
-    "this commit therefore reports more tests than a Windows run — more of the suite exists there. The " +
+    "E2E suite is Linux-only, and the aya-backend set cannot be verified on Windows at all. A Linux run " +
+    "of this commit therefore reports more tests than a Windows run — more of the suite exists there. The " +
     "committed copy of this file is generated on Linux, which is the platform the product runs on."
 );
 lines.push("");
@@ -359,6 +374,12 @@ lines.push(
 );
 lines.push("");
 
+/** Renders a clippy cell: clean, failed, or not attempted at all. */
+function clippyCell(clippy) {
+  if (clippy === null) return "_skipped_";
+  return clippy ? "clean" : "**FAILED**";
+}
+
 lines.push("## Rust tests");
 lines.push("");
 lines.push("| Feature set | Passed | Failed | Ignored | clippy `-D warnings` |");
@@ -366,12 +387,12 @@ lines.push("|---|---|---|---|---|");
 for (const r of results) {
   if (r.tests === null) {
     lines.push(
-      `| \`${r.label}\` | _skipped_ | _skipped_ | _skipped_ | ${r.clippy ? "clean" : "**FAILED**"} |`
+      `| \`${r.label}\` | _skipped_ | _skipped_ | _skipped_ | ${clippyCell(r.clippy)} |`
     );
   } else {
     lines.push(
       `| \`${r.label}\` | ${r.tests.passed} | ${r.tests.failed} | ${r.tests.ignored} | ` +
-        `${r.clippy ? "clean" : "**FAILED**"} |`
+        `${clippyCell(r.clippy)} |`
     );
   }
 }
@@ -385,9 +406,9 @@ if (skipped.length > 0) {
   lines.push("");
   for (const r of skipped) {
     lines.push(
-      `Tests for \`${r.label}\` were **skipped on this host** (${r.skipped}). Clippy still covers the ` +
-        "code because it runs against the Linux target; the tests themselves need a Linux host, and CI " +
-        "provides one."
+      `\`${r.label}\` was **skipped entirely on this host** — ${r.skipped}. Reported as skipped rather ` +
+        "than as a pass or a failure, because neither would be true. CI runs on Linux natively and " +
+        "checks it there."
     );
   }
 }
@@ -426,14 +447,19 @@ lines.push("");
 lines.push("## Reproducing");
 lines.push("");
 lines.push("```sh");
-lines.push("# CI (Linux, native):");
+lines.push("# CI (Linux, native). Checks both feature sets.");
 lines.push("node scripts/test-log.mjs");
 lines.push("");
-lines.push("# Windows dev machine (msvc has no linker here; clippy runs against the Linux target):");
+lines.push("# Windows dev machine. msvc has no linker here, so the gnu toolchain is used; the");
+lines.push("# aya-backend set is skipped entirely (see the note above).");
 lines.push("INSTALLSCOPE_CARGO_TOOLCHAIN=stable-x86_64-pc-windows-gnu \\");
-lines.push("INSTALLSCOPE_CARGO_TARGET=x86_64-unknown-linux-gnu \\");
 lines.push("  node scripts/test-log.mjs");
 lines.push("```");
+lines.push("");
+lines.push(
+  "`INSTALLSCOPE_CARGO_TARGET` may be set to lint against another target, but note that since the " +
+    "registry crate acquired a C dependency, cross-linting from Windows also needs a Linux C toolchain."
+);
 lines.push("");
 lines.push(
   "Workflow runs that verified behaviour on a real kernel are recorded in `Memory.md`; this file " +

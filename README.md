@@ -1,11 +1,14 @@
 # InstallScope
-[![G2 — strace receipts harness](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml/badge.svg)](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml)   
+[![rust](https://github.com/mukti-sys/InstallScope/actions/workflows/rust.yml/badge.svg)](https://github.com/mukti-sys/InstallScope/actions/workflows/rust.yml)
+[![G2 — strace receipts harness](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml/badge.svg)](https://github.com/mukti-sys/InstallScope/actions/workflows/g2-strace-harness.yml)
 [![Phase 2 — aya backend parity](https://github.com/mukti-sys/InstallScope/actions/workflows/phase2-aya.yml/badge.svg)](https://github.com/mukti-sys/InstallScope/actions/workflows/phase2-aya.yml)
 > Attestations verify *who signed* it. InstallScope records *what it did*.
 
 The flight recorder for package installs.
 
-> 🚧 **Status:** Early development (Phase 0/1). Core architecture is being validated — README and full documentation will follow once the recorder pipeline is stable.
+> 🚧 **Status:** Phase 4 in progress — recorder, rules engine, reports, snapshot registry and the
+> GitHub Action are implemented; the README below is developer-facing until Phase 6 writes the public
+> one.
 
 ---
 
@@ -25,14 +28,49 @@ When a PR adds or updates a dependency, InstallScope records the **syscall-level
 
 ---
 
+## The CLI
+
+```
+installscope record -- npm install        # record an install into a JSONL event stream
+installscope verify events.jsonl          # is the recording complete, or PARTIAL?
+installscope report events.jsonl          # evaluate against the rule catalog → SARIF + HTML + comment
+installscope lockfile-diff --before a --after b   # did this PR introduce code that will run?
+installscope snapshot push events.jsonl --package p --version v
+installscope snapshot verify              # re-check every stored snapshot against its content address
+installscope diff <pkg> <v1> <v2>         # what changed behaviorally between two versions
+installscope parity --strace a --aya b    # do the two backends agree about what happened?
+```
+
+Recording needs Linux. Everything else runs anywhere, so a recording made on a runner can be
+evaluated, diffed and re-rendered on any machine.
+
+## Repository layout
+
+| Crate | What it holds |
+|---|---|
+| `core/` | schema v1 event model, zones, rule catalog, scoring, coverage |
+| `recorder/` | the strace backend (v1.0) and the aya eBPF backend (v1.1), plus parity |
+| `lockfile/` | npm and pnpm lockfile parsing and diffing — the trigger |
+| `registry/` | content-addressed snapshot store and the behavioral version-diff engine |
+| `report/` | SARIF 2.1.0, PR-comment Markdown, self-contained HTML, and the diff surfaces |
+| `cli/` | the `installscope` binary |
+| `action/` | two composite GitHub Actions: `record` (read-only) and `comment` (write) |
+| `rules/` | the public YAML rule catalog |
+| `corpus/demo/` | synthetic fixtures, labelled as such |
+
+`action/README.md` explains why recording and commenting are two separate workflows: the recording job
+executes untrusted install scripts, so it must never hold a token that can write to the repository.
+
+---
+
 ## Phase 0: Kill Gates
 
-Phase 0 validates the core technical assumptions before product code:
+Phase 0 validated the core technical assumptions before product code:
 
-1. **Gate G1 — eBPF Runner Probe**: Validates that an `aya` tracepoint eBPF probe loads, attaches, and captures events on standard `ubuntu-latest` GitHub runners.
-2. **Gate G2 — `strace` Receipts Harness**: Runs candidate npm package installs inside clean ephemeral matrix environments under `strace -f -ff` and extracts structured syscall telemetry.
+1. **Gate G1 — eBPF Runner Probe**: an `aya` tracepoint probe loads, attaches, and captures events on standard `ubuntu-latest` GitHub runners.
+2. **Gate G2 — `strace` Receipts Harness**: candidate npm package installs run inside clean ephemeral matrix environments under `strace -f -ff`, and structured syscall telemetry is extracted.
 
-See `.github/workflows/` and `harness/` for test harness workflows.
+Both passed. See `.github/workflows/` and `harness/`.
 
 ---
 
