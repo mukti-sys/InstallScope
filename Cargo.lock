@@ -269,7 +269,9 @@ dependencies = [
  "anyhow",
  "clap",
  "installscope-core",
+ "installscope-lockfile",
  "installscope-recorder",
+ "installscope-registry",
  "installscope-report",
  "serde_json",
  "tracing",
@@ -332,6 +334,7 @@ name = "installscope-report"
 version = "0.1.0"
 dependencies = [
  "installscope-core",
+ "installscope-registry",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

@@ -7,6 +7,9 @@
 //! - `record -- <command>` — record an install and write a schema v1 JSONL stream;
 //! - `verify <events.jsonl>` — re-read a stream and say whether it is trustworthy;
 //! - `report <events.jsonl>` — evaluate a recording against the rule catalog and emit reports;
+//! - `lockfile-diff --before <a> --after <b>` — decide whether a lockfile change is worth recording;
+//! - `snapshot push|list` — store a recording in the content-addressed registry;
+//! - `diff <pkg> <v1> <v2>` — compare two recorded versions behaviorally;
 //! - `parity --strace <a> --aya <b>` — compare two recordings of the same workload (Phase 2).
 //!
 //! `verify` exists because of `Rules.md` §2: the failure mode that matters is a recorder that dies
@@ -16,6 +19,14 @@
 //! `report` evaluates a recording against the embedded YAML rule catalog and writes SARIF, Markdown,
 //! and/or HTML to the output directory. It is the pipeline entry point: `record` produces evidence,
 //! `report` produces findings.
+//!
+//! `lockfile-diff` is the Phase 4 trigger (PRD.md:30). It exists as a subcommand rather than as shell in
+//! the Action for the same reason `parity` does: the decision about what counts as a dependency change is
+//! unit-tested Rust, and a shell reimplementation would drift from it.
+//!
+//! `snapshot` and `diff` are the registry (Architecture.md §6). `diff` is the moat — "this package's
+//! behavior changed between 1.2.3 and 1.2.4" — and it refuses to make that claim when the two recordings
+//! cannot support it.
 //!
 //! `parity` exists for the same reason at one level up: it decides whether two backends agree about
 //! what happened, and it lives here rather than as a CI script so the comparison logic is unit-tested
@@ -81,8 +92,114 @@ enum Command {
     Verify(VerifyArgs),
     /// Evaluate a recording against the rule catalog and emit reports.
     Report(ReportArgs),
+    /// Decide whether a lockfile change introduces code worth recording.
+    LockfileDiff(LockfileDiffArgs),
+    /// Store and list recordings in the content-addressed snapshot registry.
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+    /// Compare two recorded versions of a package behaviorally.
+    Diff(DiffArgs),
     /// Compare two recordings of the same workload, made by different backends.
     Parity(ParityArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCommand {
+    /// Store a recording under its content address and index it.
+    Push(SnapshotPushArgs),
+    /// List indexed recordings.
+    List(SnapshotListArgs),
+    /// Re-verify every stored snapshot against its content address.
+    Verify(SnapshotVerifyArgs),
+}
+
+#[derive(Args, Debug)]
+struct LockfileDiffArgs {
+    /// The lockfile as it was before the change.
+    #[arg(long)]
+    before: PathBuf,
+
+    /// The lockfile as it is after the change.
+    #[arg(long)]
+    after: PathBuf,
+
+    /// Emit the decision as JSON, for a workflow step to consume.
+    #[arg(long)]
+    json: bool,
+
+    /// Exit 0 even when nothing needs recording.
+    ///
+    /// Off by default: the exit code is how a workflow step decides whether to spend a runner on a
+    /// recording, and a step that always succeeds cannot express "nothing to do here".
+    #[arg(long)]
+    always_succeed: bool,
+}
+
+#[derive(Args, Debug)]
+struct SnapshotPushArgs {
+    /// Path to an events.jsonl produced by `installscope record`.
+    events: PathBuf,
+
+    /// Registry root. Created if absent.
+    #[arg(long, default_value = ".installscope/registry")]
+    registry: PathBuf,
+
+    /// Package this recording is of.
+    #[arg(long)]
+    package: String,
+
+    /// Version this recording is of.
+    #[arg(long)]
+    version: String,
+}
+
+#[derive(Args, Debug)]
+struct SnapshotListArgs {
+    /// Registry root.
+    #[arg(long, default_value = ".installscope/registry")]
+    registry: PathBuf,
+
+    /// Only list recordings of this package.
+    #[arg(long)]
+    package: Option<String>,
+
+    /// Emit JSONL rather than a table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct SnapshotVerifyArgs {
+    /// Registry root.
+    #[arg(long, default_value = ".installscope/registry")]
+    registry: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct DiffArgs {
+    /// Package name.
+    package: String,
+
+    /// The earlier version.
+    before: String,
+
+    /// The later version.
+    after: String,
+
+    /// Registry root.
+    #[arg(long, default_value = ".installscope/registry")]
+    registry: PathBuf,
+
+    /// Write the Markdown and HTML diff reports into this directory.
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+
+    /// Exit non-zero when behavior changed.
+    ///
+    /// Off by default, because a behavioral change is information rather than a verdict — the same
+    /// advisory-first discipline as the finding report (PRD.md:43).
+    #[arg(long)]
+    fail_on_change: bool,
 }
 
 #[derive(Args, Debug)]
@@ -253,8 +370,315 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Record(args) => run_record(args),
         Command::Verify(args) => run_verify(args),
         Command::Report(args) => run_report(args),
+        Command::LockfileDiff(args) => run_lockfile_diff(args),
+        Command::Snapshot(SnapshotCommand::Push(args)) => run_snapshot_push(args),
+        Command::Snapshot(SnapshotCommand::List(args)) => run_snapshot_list(args),
+        Command::Snapshot(SnapshotCommand::Verify(args)) => run_snapshot_verify(args),
+        Command::Diff(args) => run_diff(args),
         Command::Parity(args) => run_parity(args),
     }
+}
+
+/// Exit code meaning "the lockfile changed, but nothing new will run".
+///
+/// Distinct from success so a workflow step can branch on it without parsing stdout. Not an error: a PR
+/// that only removes a dependency is a perfectly good PR, it just has nothing to record.
+const EXIT_NOTHING_TO_RECORD: u8 = 4;
+
+/// Decides whether a lockfile change is worth recording.
+///
+/// Lives here rather than in the Action's shell for the reason `Rules.md` §6 gives about parity: the
+/// decision is unit-tested Rust, and a shell reimplementation would drift from the tests that pin it.
+fn run_lockfile_diff(args: &LockfileDiffArgs) -> Result<ExitCode> {
+    // The "after" side is parsed first because it is the authoritative one: it is the lockfile as it
+    // exists in the working tree, under its real name. The "before" side is a copy pulled out of git and
+    // named whatever the caller found convenient, so it borrows this ecosystem when its own name says
+    // nothing. See `load_lockfile_side`.
+    let after = installscope_lockfile::load(&args.after)
+        .with_context(|| format!("reading {}", args.after.display()))?;
+    let before = load_lockfile_side(&args.before, after.ecosystem)?;
+
+    // A missing "before" is a lockfile that did not exist yet, which is the first-commit case. Treated as
+    // empty rather than as an error: every dependency in the new file is genuinely new.
+    let before = before.unwrap_or_else(|| installscope_lockfile::Lockfile {
+        ecosystem: after.ecosystem,
+        declared_version: after.declared_version.clone(),
+        packages: Vec::new(),
+    });
+
+    let diff = installscope_lockfile::diff(&before, &after);
+    let recordable = diff.recordable();
+
+    if args.json {
+        let payload = serde_json::json!({
+            "ecosystem": after.ecosystem.to_string(),
+            "lockfile": after.ecosystem.lockfile_name(),
+            "ecosystem_changed": diff.ecosystem_changed,
+            "should_record": diff.should_record(),
+            "changes": diff.changes.iter().map(|change| serde_json::json!({
+                "name": change.name(),
+                "summary": change.summary(),
+                "introduces_code": change.introduces_code(),
+            })).collect::<Vec<_>>(),
+            "record": recordable.iter().map(|identity| serde_json::json!({
+                "name": identity.name,
+                "version": identity.version,
+                "label": identity.to_string(),
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("rendering the decision as JSON")?
+        );
+    } else {
+        println!(
+            "{}",
+            if diff.should_record() {
+                "record"
+            } else {
+                "nothing-to-record"
+            }
+        );
+        println!("ecosystem: {}", after.ecosystem);
+        if diff.ecosystem_changed {
+            // Named loudly: every dependency is being reinstalled by a different tool, and a reader who
+            // misses that would read a hundred changes as if one PR added them.
+            println!("note:      the package manager itself changed between these two lockfiles");
+        }
+        println!("changes:   {}", diff.changes.len());
+        for change in &diff.changes {
+            println!(
+                "  {} {}",
+                if change.introduces_code() { "+" } else { " " },
+                change.summary()
+            );
+        }
+        if !recordable.is_empty() {
+            println!("record:");
+            for identity in &recordable {
+                println!("  {identity}");
+            }
+        }
+    }
+
+    if diff.should_record() || args.always_succeed {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(EXIT_NOTHING_TO_RECORD))
+    }
+}
+
+/// Loads the "before" lockfile, treating absence as "it did not exist yet".
+///
+/// # Why this side is parsed by ecosystem rather than by filename
+///
+/// The before-copy never has a lockfile's real name. A workflow obtains it with
+/// `git show origin/main:package-lock.json > base-package-lock.json`, because writing it to the real
+/// filename would clobber the working tree's copy — the very file being compared against. Requiring the
+/// sanctioned name here rejected every caller that did the obvious thing, including this project's own
+/// Action and its own CI step. Found by running the extracted workflow scripts locally, not by reading
+/// them.
+///
+/// So the ecosystem comes from the *after* side, which is the file under its real name, and the
+/// before-copy is parsed as that same ecosystem. Comparing an npm lockfile against a pnpm one is not a
+/// meaningful question anyway: `LockfileDiff::ecosystem_changed` exists for a migration, and a migration
+/// changes the file that is actually in the tree.
+///
+/// A filename that *does* identify an ecosystem still wins, so passing two real lockfile paths keeps
+/// working and a genuine mismatch between them stays visible rather than being silently coerced.
+fn load_lockfile_side(
+    path: &std::path::Path,
+    fallback: installscope_lockfile::Ecosystem,
+) -> Result<Option<installscope_lockfile::Lockfile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    // An empty file is what `git show` produces for a path that did not exist at that revision, which is
+    // the shape a workflow step will actually hand over. Same reading as an absent file.
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let name = path.to_str().unwrap_or_default();
+    let parsed = if installscope_lockfile::Ecosystem::from_path(name).is_some() {
+        installscope_lockfile::parse(name, &text)
+    } else {
+        installscope_lockfile::parse(fallback.lockfile_name(), &text)
+    };
+    parsed
+        .map(Some)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// Stores a recording in the registry.
+fn run_snapshot_push(args: &SnapshotPushArgs) -> Result<ExitCode> {
+    let events = std::fs::read_to_string(&args.events)
+        .with_context(|| format!("reading {}", args.events.display()))?;
+
+    let mut registry = installscope_registry::Registry::open(&args.registry)
+        .with_context(|| format!("opening the registry at {}", args.registry.display()))?;
+
+    let entry = registry
+        .push(&args.package, &args.version, &events)
+        .with_context(|| format!("storing the recording of {}@{}", args.package, args.version))?;
+
+    let digest = entry.digest().context("the stored digest is malformed")?;
+    let compressed = registry.store().compressed_size(&digest).unwrap_or(0);
+
+    println!("stored {}", entry.label());
+    println!("digest:      {}", entry.digest);
+    println!("recorded_at: {}", entry.recorded_at);
+    println!("backend:     {}", entry.backend);
+    println!("events:      {}", entry.events);
+    println!(
+        "size:        {} bytes compressed from {}",
+        compressed, entry.uncompressed_bytes
+    );
+    println!("registry:    {}", args.registry.display());
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Lists what the registry holds.
+fn run_snapshot_list(args: &SnapshotListArgs) -> Result<ExitCode> {
+    let registry = installscope_registry::Registry::open(&args.registry)
+        .with_context(|| format!("opening the registry at {}", args.registry.display()))?;
+    let index = registry.index();
+
+    let entries: Vec<&installscope_registry::Entry> = index
+        .entries()
+        .iter()
+        .filter(|entry| match args.package.as_deref() {
+            Some(package) => entry.package == package,
+            None => true,
+        })
+        .collect();
+
+    if args.json {
+        for entry in &entries {
+            println!(
+                "{}",
+                serde_json::to_string(entry).context("rendering an index entry")?
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if entries.is_empty() {
+        println!("no recordings in {}", args.registry.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "{} recording(s) in {}",
+        entries.len(),
+        args.registry.display()
+    );
+    for entry in &entries {
+        // The digest is truncated for reading; `--json` gives the full value. A short digest is never
+        // used to look anything up.
+        let short = entry.digest.get(..12).unwrap_or(&entry.digest);
+        println!(
+            "  {:<40} {:<8} {:>6} events  {}  {}",
+            entry.label(),
+            entry.backend,
+            entry.events,
+            entry.recorded_at,
+            short
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Re-verifies every stored snapshot.
+///
+/// Separate from `list` because they answer different questions: `list` says what the index claims, and
+/// `verify` says whether the store can still produce it. Content addressing is only worth having if
+/// something checks, and a corpus that backs published receipts is exactly where "it was right when we
+/// wrote it" stops being good enough.
+fn run_snapshot_verify(args: &SnapshotVerifyArgs) -> Result<ExitCode> {
+    let registry = installscope_registry::Registry::open(&args.registry)
+        .with_context(|| format!("opening the registry at {}", args.registry.display()))?;
+
+    let results = registry.verify_all();
+    if results.is_empty() {
+        println!("no recordings in {}", args.registry.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut failures = 0;
+    for result in &results {
+        match &result.outcome {
+            Ok(events) => println!("ok      {:<40} {events} events", result.label()),
+            Err(reason) => {
+                failures += 1;
+                println!("FAILED  {:<40} {reason}", result.label());
+            }
+        }
+    }
+
+    println!("\n{} verified, {failures} failed", results.len() - failures);
+
+    if failures > 0 {
+        // A corrupted corpus is a hard failure, not a warning. Every receipt drawn from it, and every
+        // version-diff computed against it, rests on bytes that no longer match their address.
+        eprintln!(
+            "installscope: error: {failures} snapshot(s) do not match their content address; the \
+             affected recordings must not be cited as evidence"
+        );
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Compares two recorded versions of a package.
+fn run_diff(args: &DiffArgs) -> Result<ExitCode> {
+    let registry = installscope_registry::Registry::open(&args.registry)
+        .with_context(|| format!("opening the registry at {}", args.registry.display()))?;
+
+    let comparison = registry
+        .diff_versions(&args.package, &args.before, &args.after)
+        .with_context(|| {
+            format!(
+                "comparing {}@{} with {}@{}",
+                args.package, args.before, args.package, args.after
+            )
+        })?;
+
+    print!("{}", installscope_report::render_diff_markdown(&comparison));
+
+    if let Some(out) = &args.out {
+        std::fs::create_dir_all(out)
+            .with_context(|| format!("creating output directory {}", out.display()))?;
+
+        let markdown_path = out.join("installscope-diff.md");
+        std::fs::write(
+            &markdown_path,
+            installscope_report::render_diff_markdown(&comparison),
+        )
+        .with_context(|| format!("writing {}", markdown_path.display()))?;
+        eprintln!("wrote {}", markdown_path.display());
+
+        let html_path = out.join("installscope-diff.html");
+        std::fs::write(
+            &html_path,
+            installscope_report::render_diff_html(&comparison),
+        )
+        .with_context(|| format!("writing {}", html_path.display()))?;
+        eprintln!("wrote {}", html_path.display());
+    }
+
+    // A blocked comparison exits non-zero regardless of --fail-on-change: the caller asked a question
+    // that could not be answered, and reporting success would let a workflow treat "cannot compare" as
+    // "nothing changed" — which is the silent-absence failure this project keeps refusing.
+    if !comparison.comparable() {
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    }
+    if args.fail_on_change && !comparison.is_identical() {
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Compares two recordings of the same workload.
@@ -859,5 +1283,133 @@ mod tests {
         // A caller must be able to distinguish "recorded but incomplete" from "failed to record".
         assert_ne!(EXIT_PARTIAL, EXIT_FAILURE);
         assert_ne!(EXIT_PARTIAL, 0);
+    }
+
+    #[test]
+    fn nothing_to_record_has_its_own_exit_code() {
+        // A workflow step branches on this to decide whether to spend a runner. Collapsing it into
+        // failure would make a dependency-removal PR look like a broken build; collapsing it into success
+        // would record nothing and say nothing.
+        assert_ne!(EXIT_NOTHING_TO_RECORD, EXIT_FAILURE);
+        assert_ne!(EXIT_NOTHING_TO_RECORD, EXIT_PARTIAL);
+        assert_ne!(EXIT_NOTHING_TO_RECORD, 0);
+    }
+
+    #[test]
+    fn lockfile_diff_requires_both_sides() {
+        // A one-sided diff is not a diff. Requiring both makes that a usage error rather than a run that
+        // trivially reports "everything is new".
+        assert!(
+            Cli::try_parse_from(["installscope", "lockfile-diff", "--before", "a.json"]).is_err(),
+            "both lockfiles are required"
+        );
+
+        let cli = Cli::try_parse_from([
+            "installscope",
+            "lockfile-diff",
+            "--before",
+            "old/package-lock.json",
+            "--after",
+            "new/package-lock.json",
+            "--json",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::LockfileDiff(args) => {
+                assert_eq!(args.before, PathBuf::from("old/package-lock.json"));
+                assert_eq!(args.after, PathBuf::from("new/package-lock.json"));
+                assert!(args.json);
+                assert!(!args.always_succeed);
+            }
+            other => panic!("expected lockfile-diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_push_requires_the_package_and_version() {
+        // A snapshot with no identity cannot be diffed against anything, so it is refused at parse time
+        // rather than stored as an orphan.
+        assert!(
+            Cli::try_parse_from(["installscope", "snapshot", "push", "events.jsonl"]).is_err(),
+            "--package and --version are required"
+        );
+
+        let cli = Cli::try_parse_from([
+            "installscope",
+            "snapshot",
+            "push",
+            "events.jsonl",
+            "--package",
+            "lodash",
+            "--version",
+            "4.17.21",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Snapshot(SnapshotCommand::Push(args)) => {
+                assert_eq!(args.events, PathBuf::from("events.jsonl"));
+                assert_eq!(args.package, "lodash");
+                assert_eq!(args.version, "4.17.21");
+                assert_eq!(args.registry, PathBuf::from(".installscope/registry"));
+            }
+            other => panic!("expected snapshot push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_takes_a_package_and_two_versions_positionally() {
+        // Architecture.md:90 spells it `installscope diff <pkg> 1.2.3 1.2.4`. Matching the documented
+        // shape matters: that string is in the README and in the launch post.
+        let cli = Cli::try_parse_from(["installscope", "diff", "lodash", "4.17.20", "4.17.21"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Diff(args) => {
+                assert_eq!(args.package, "lodash");
+                assert_eq!(args.before, "4.17.20");
+                assert_eq!(args.after, "4.17.21");
+                assert!(!args.fail_on_change, "advisory by default (PRD.md:43)");
+            }
+            other => panic!("expected diff, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["installscope", "diff", "lodash", "4.17.20"]).is_err(),
+            "a comparison needs two versions"
+        );
+    }
+
+    #[test]
+    fn snapshot_list_accepts_a_package_filter() {
+        let cli = Cli::try_parse_from([
+            "installscope",
+            "snapshot",
+            "list",
+            "--package",
+            "lodash",
+            "--json",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Snapshot(SnapshotCommand::List(args)) => {
+                assert_eq!(args.package.as_deref(), Some("lodash"));
+                assert!(args.json);
+            }
+            other => panic!("expected snapshot list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_verify_needs_only_a_registry() {
+        // Deliberately unfiltered: a partial verification of a corpus is not a verification. Adding a
+        // `--package` filter here would invite checking the one snapshot someone was already suspicious
+        // of and calling the store sound.
+        let cli = Cli::try_parse_from(["installscope", "snapshot", "verify"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Snapshot(SnapshotCommand::Verify(args)) => {
+                assert_eq!(args.registry, PathBuf::from(".installscope/registry"));
+            }
+            other => panic!("expected snapshot verify, got {other:?}"),
+        }
     }
 }
