@@ -1,0 +1,658 @@
+name: Phase 5 â€” corpus backfill
+
+# Phases.md:38: "Top ~200 npm packages x last ~5 versions, clean-VM-per-package harness (no cache
+# contamination)". This workflow is that harness.
+#
+# WHY workflow_dispatch ONLY, AND WHY THE DEFAULTS ARE SMALL
+#
+# Every job here installs arbitrary third-party packages and lets their install scripts run on the
+# runner. That is the point â€” audit mode, everything allowed, everything logged â€” but it must never fire
+# on a push. The defaults (10 packages x 3 versions) exist so the pipeline can be proven for a few
+# runner-minutes; the full run is an explicit choice a human makes by passing 200 and 5.
+#
+# WHAT ONE JOB IS, AND WHY
+#
+# One shard = several packages, all versions of each. Not one job per recording, for two reasons:
+# GitHub's matrix caps at 256, and versions of one package can share a VM safely while versions of
+# *different* packages cannot. record-corpus.sh gives every recording a fresh cache, home, project and
+# tmp, so what a shared VM leaks between versions is only state outside those zones. Sharing that risk
+# within one package is acceptable; sharing it across packages would let one package's postinstall show
+# up as another's behavior.
+#
+# WHY EACH SHARD BUILDS THE RECORDER ITSELF
+#
+# Building once and passing the binary through an artifact would be faster. It would also mean the thing
+# that produces the evidence crossed a job boundary as an opaque blob. For a tool whose entire claim is
+# "we recorded what actually happened", each shard compiling from the checkout it is running is worth the
+# ~40s. cargo caching makes it cheaper than it sounds.
+#
+# WHAT THIS WORKFLOW DOES NOT DECIDE
+#
+# Not the gate. G3 is fired by a human who reads the receipt queue and confirms candidates
+# (Rules.md rule 7, Phases.md:40). Nothing here prints PASS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many packages to record (10 proves the pipeline; 200 is the full backfill)"
+        required: false
+        default: "10"
+      versions:
+        description: "Versions per package, newest stable first (3 to prove it; 5 for the full run)"
+        required: false
+        default: "3"
+      shards:
+        description: "Matrix width. More shards finish sooner and use more runners at once."
+        required: false
+        default: "5"
+      timeout_seconds:
+        description: "Per-install recording timeout"
+        required: false
+        default: "600"
+      resume_from_run:
+        description: "Optional run ID to resume from: recordings already complete there are skipped"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  # Deliberately not cancel-in-progress: a half-cancelled backfill leaves a partially populated
+  # registry, and re-running it is cheaper than reasoning about what survived.
+  group: phase5-corpus-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Verify the harness before spending 200 runners on it. Pure Node, no Linux needed.
+  # ---------------------------------------------------------------------------------------------
+  verify-harness:
+    name: verify harness (golden tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Golden tests over the synthetic fixtures
+        run: node harness/corpus/test-corpus.mjs
+
+  # ---------------------------------------------------------------------------------------------
+  # Resolve versions and shard the work. One job, because it hits the registry and caches packuments.
+  # ---------------------------------------------------------------------------------------------
+  plan:
+    name: resolve versions and plan shards
+    needs: verify-harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.shard.outputs.matrix }}
+      shard_count: ${{ steps.shard.outputs.shard_count }}
+      recordings: ${{ steps.shard.outputs.recordings }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate the inputs
+        env:
+          LIMIT: ${{ inputs.limit }}
+          VERSIONS: ${{ inputs.versions }}
+          SHARDS: ${{ inputs.shards }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          set -euo pipefail
+          # Bounded rather than trusted. These reach a shell and a matrix, and an unbounded value here
+          # means either a nonsense plan or a few hundred wasted runner-hours.
+          check() {
+            local name="$1" value="$2" min="$3" max="$4"
+            case "$value" in
+              ''|*[!0-9]*) echo "::error title=Bad input::$name must be a positive integer, got: $value"; exit 1 ;;
+            esac
+            if [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+              echo "::error title=Bad input::$name must be between $min and $max, got: $value"
+              exit 1
+            fi
+          }
+          check limit "$LIMIT" 1 500
+          check versions "$VERSIONS" 1 20
+          check shards "$SHARDS" 1 256
+          check timeout_seconds "$TIMEOUT" 30 3600
+          echo "limit=$LIMIT versions=$VERSIONS shards=$SHARDS timeout=${TIMEOUT}s"
+
+      - name: Download the previous run's results
+        id: previous
+        if: inputs.resume_from_run != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corpus-shard-*
+          path: previous
+          run-id: ${{ inputs.resume_from_run }}
+          github-token: ${{ github.token }}
+
+      - name: Resolve versions from the registry
+        env:
+          LIMIT: ${{ inputs.limit }}
+          VERSIONS: ${{ inputs.versions }}
+        run: |
+          set -euo pipefail
+          node harness/corpus/resolve-versions.mjs \
+            --packages harness/g2/packages.txt \
+            --versions "$VERSIONS" \
+            --limit "$LIMIT" \
+            --cache .cache/packuments \
+            --out corpus-plan.json
+
+          # A plan that resolved nothing is a hard stop: the rest of the workflow would run 0 jobs and
+          # report success, which is the silent-nothing outcome this project keeps refusing.
+          node -e '
+            const plan = require("./corpus-plan.json");
+            if ((plan.totals?.recordings_planned ?? 0) === 0) {
+              console.log("::error title=Empty plan::no versions resolved; nothing to record");
+              process.exit(1);
+            }
+            console.log(`::notice title=Plan::${plan.totals.recordings_planned} recordings across ${plan.totals.packages_resolved} packages`);
+            if (plan.totals.packages_unresolved > 0) {
+              console.log(`::warning title=Unresolved packages::${plan.totals.packages_unresolved} package(s) could not be resolved and are excluded`);
+            }
+          '
+
+      - name: Plan the shards
+        id: shard
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          completed_args=()
+          if [ -d previous ]; then
+            completed_args=(--completed previous)
+            echo "resuming: previous results present"
+          fi
+
+          shard_count="$(node harness/corpus/shard.mjs plan \
+            --plan corpus-plan.json \
+            --shards "$SHARDS" \
+            --out shards.json \
+            "${completed_args[@]}")"
+
+          if [ "$shard_count" = "0" ]; then
+            echo "::notice title=Nothing to do::every planned recording is already complete"
+          fi
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+
+          # The matrix carries only ids; each shard reads its own work out of shards.json, which travels
+          # as an artifact. Putting package lists in the matrix would blow past GitHub's size limits on a
+          # 200-package run.
+          node -e '
+            const fs = require("node:fs");
+            const shards = require("./shards.json");
+            const include = shards.shards.map((s) => ({ id: s.id, recordings: s.recordings }));
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `recordings=${shards.totals.recordings}\n`);
+          '
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-plan
+          path: |
+            corpus-plan.json
+            shards.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Phase 5 plan"
+            echo ""
+            echo "\`${{ steps.shard.outputs.recordings }}\` recordings across \`${{ steps.shard.outputs.shard_count }}\` shard(s)."
+            echo ""
+            echo "Selection rule: most recent \`${{ inputs.versions }}\` stable versions by publish time, prereleases excluded."
+            echo ""
+            echo "Every recording gets a cold npm cache. Two recordings of one package against a shared"
+            echo "cache would differ enormously for a reason that has nothing to do with the package."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  # One shard per job. Each records every version of each of its packages, cold cache per recording.
+  # ---------------------------------------------------------------------------------------------
+  record:
+    name: "shard ${{ matrix.id }} (${{ matrix.recordings }} recordings)"
+    needs: plan
+    if: needs.plan.outputs.shard_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # A package whose install explodes is still evidence. One bad package must never abort the backfill.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared across shards: the build is identical, and 200 jobs each populating their own cache
+          # entry would be slower than one shared read.
+          shared-key: phase5-corpus
+
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends strace
+          strace -V | head -n 1
+
+      - name: Record the runner environment
+        # Captured before anything installs, so a runner fact is never mistaken for package behavior when
+        # a receipt is disputed. record-corpus.sh stamps the same values into every recording.json; this
+        # is the per-shard copy a human reads first.
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            echo "kernel: $(uname -r)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "arch: $(uname -m)"
+            echo "node: $(node --version)"
+            echo "npm: $(npm --version)"
+            echo "strace: $(strace -V | head -n 1)"
+            echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unavailable)"
+            echo "runner_image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } | tee out/runner-env.txt
+
+      - name: Build the recorder from this checkout
+        # Built here rather than passed in as an artifact. The binary is what produces the evidence; a
+        # tool whose entire claim is "we recorded what actually happened" should not receive it as an
+        # opaque blob from another job.
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p installscope
+          ./target/release/installscope --version
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+      - name: Download the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: corpus-plan
+          path: .
+
+      - name: Record this shard
+        id: record
+        env:
+          SHARD_ID: ${{ matrix.id }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          set -euo pipefail
+          chmod +x harness/corpus/record-corpus.sh
+
+          # The shard's work comes from shards.json rather than from the matrix, so a 200-package run does
+          # not put package lists into workflow metadata. Emitted as TSV and read with `read`, so a name
+          # is never interpolated into a command line.
+          node -e '
+            const shards = require("./shards.json");
+            const shard = shards.shards.find((s) => String(s.id) === process.env.SHARD_ID);
+            if (!shard) {
+              console.error(`no shard ${process.env.SHARD_ID} in shards.json`);
+              process.exit(1);
+            }
+            const lines = [];
+            for (const entry of shard.packages) {
+              for (const version of entry.versions) lines.push(`${entry.package}\t${version}`);
+            }
+            require("node:fs").writeFileSync("shard-work.tsv", lines.join("\n") + "\n");
+            console.error(`shard ${shard.id}: ${lines.length} recordings`);
+          '
+
+          total=0
+          complete=0
+          partial=0
+          failed=0
+
+          while IFS=$'\t' read -r pkg version; do
+            [ -n "$pkg" ] || continue
+            total=$((total + 1))
+            slug="$(printf '%s' "${pkg}_${version}" | tr -c 'A-Za-z0-9._-' '_')"
+            echo "::group::${pkg}@${version}"
+
+            set +e
+            harness/corpus/record-corpus.sh \
+              --package "$pkg" \
+              --version "$version" \
+              --outdir "out/${slug}" \
+              --registry registry \
+              --timeout "$TIMEOUT"
+            status=$?
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              # complete vs PARTIAL is recording.json's own reading, not this loop's guess.
+              if node -e 'process.exit(require("./out/'"$slug"'/recording.json").complete ? 0 : 1)' 2>/dev/null; then
+                complete=$((complete + 1))
+              else
+                partial=$((partial + 1))
+                echo "::warning title=PARTIAL::${pkg}@${version} recorded incompletely and was not stored"
+              fi
+            else
+              failed=$((failed + 1))
+              echo "::warning title=Not recorded::${pkg}@${version} could not be recorded (exit $status)"
+            fi
+            echo "::endgroup::"
+          done < shard-work.tsv
+
+          echo "shard ${SHARD_ID}: ${total} attempted, ${complete} complete, ${partial} PARTIAL, ${failed} failed"
+          {
+            echo "total=$total"
+            echo "complete=$complete"
+            echo "partial=$partial"
+            echo "failed=$failed"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify this shard's registry
+        # The store verifies on read, and this is where that gets exercised on a real backfill rather than
+        # only in unit tests. A shard whose blobs do not match their addresses has produced evidence
+        # nobody can stand behind, and it must say so before the merge treats it as data.
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d registry ]; then
+            echo "no registry produced by this shard (every recording failed or was PARTIAL)"
+            exit 0
+          fi
+          if ! installscope snapshot verify --registry registry > out/verify-registry.log 2>&1; then
+            cat out/verify-registry.log
+            echo "::error title=Shard registry corrupt::snapshots in shard ${{ matrix.id }} do not match their content address"
+            exit 1
+          fi
+          cat out/verify-registry.log
+
+      - name: Shard summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### shard ${{ matrix.id }}"
+            echo ""
+            echo "attempted \`${{ steps.record.outputs.total }}\` · complete \`${{ steps.record.outputs.complete }}\` · PARTIAL \`${{ steps.record.outputs.partial }}\` · failed \`${{ steps.record.outputs.failed }}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload this shard's recordings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-shard-${{ matrix.id }}
+          path: |
+            out
+            registry
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------------------------
+  # Merge, diff, summarize, and build the review queue. Reports; decides nothing.
+  # ---------------------------------------------------------------------------------------------
+  aggregate:
+    name: merge, diff, and build the receipt queue
+    needs: [plan, record]
+    if: always() && needs.plan.outputs.shard_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: phase5-corpus
+
+      - name: Build the recorder
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p installscope
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+      - name: Download the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: corpus-plan
+          path: .
+
+      - name: Download every shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corpus-shard-*
+          path: shards
+
+      - name: Merge the shard results
+        run: |
+          set -euo pipefail
+          node harness/corpus/shard.mjs merge --indir shards --out merged.json
+
+      - name: Combine the shard registries into one corpus
+        # Each shard wrote its own registry, because 200 jobs appending to one index concurrently is a
+        # corruption waiting to happen. Combining is sequential and done once, here.
+        #
+        # Blobs are content-addressed, so copying them together cannot collide: two shards that produced
+        # byte-identical recordings produced the same digest, and the file is the same file. The index is
+        # append-only JSONL, so concatenating the shards' indexes is the whole merge.
+        run: |
+          set -euo pipefail
+          mkdir -p corpus/blobs
+
+          shard_registries=0
+          for registry in shards/*/registry; do
+            [ -d "$registry" ] || continue
+            shard_registries=$((shard_registries + 1))
+            if [ -d "$registry/blobs" ]; then
+              cp -rn "$registry/blobs/." corpus/blobs/ 2>/dev/null || true
+            fi
+            if [ -f "$registry/index.jsonl" ]; then
+              cat "$registry/index.jsonl" >> corpus/index.jsonl
+            fi
+          done
+
+          if [ "$shard_registries" -eq 0 ]; then
+            echo "::warning title=No registries::no shard produced a registry; every recording failed or was PARTIAL"
+            : > corpus/index.jsonl
+          fi
+          echo "combined $shard_registries shard registr(ies)"
+          wc -l < corpus/index.jsonl | sed 's/^/index entries: /'
+
+      - name: Verify the combined corpus
+        # The check that decides whether anything may be published. A corpus whose blobs do not match
+        # their addresses backs no receipt, and `snapshot verify` exits non-zero on the first mismatch it
+        # finds — which is what makes this a gate rather than a log line.
+        id: verify
+        run: |
+          set -euo pipefail
+          if ! installscope snapshot verify --registry corpus > verify.log 2>&1; then
+            cat verify.log
+            echo "::error title=Corpus not intact::stored snapshots do not match their content address; nothing may be published from this corpus"
+            echo "intact=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          cat verify.log
+          echo "intact=true" >> "$GITHUB_OUTPUT"
+
+      - name: Diff every consecutive version pair
+        # The moat, computed. A package with N recorded versions yields N-1 comparisons, and each is a
+        # story with a before and an after — which is what makes a receipt readable.
+        #
+        # A blocked comparison is written out too: `select-receipts.mjs` counts them so their absence from
+        # the queue is explained rather than looking like an empty result.
+        run: |
+          set -euo pipefail
+          mkdir -p diffs
+
+          # Pairs come from the plan, which knows publish order. The index does not: `versions_of` returns
+          # first-seen order deliberately (semver ordering is not the registry's job), so pairing from it
+          # could compare the wrong direction.
+          node -e '
+            const fs = require("node:fs");
+            const plan = require("./corpus-plan.json");
+            const pairs = [];
+            for (const entry of plan.packages) {
+              // Plan versions are newest-first, so consecutive pairs read (older, newer) reversed.
+              const versions = entry.versions.map((v) => v.version).reverse();
+              for (let i = 1; i < versions.length; i += 1) {
+                pairs.push([entry.package, versions[i - 1], versions[i]]);
+              }
+            }
+            fs.writeFileSync("pairs.tsv", pairs.map((p) => p.join("\t")).join("\n") + "\n");
+            console.error(`${pairs.length} consecutive version pair(s) to compare`);
+          '
+
+          compared=0
+          blocked=0
+          missing=0
+          while IFS=$'\t' read -r pkg before after; do
+            [ -n "$pkg" ] || continue
+            slug="$(printf '%s' "${pkg}_${before}_${after}" | tr -c 'A-Za-z0-9._-' '_')"
+            set +e
+            installscope diff "$pkg" "$before" "$after" --registry corpus --json \
+              > "diffs/${slug}.json" 2> "diffs/${slug}.err"
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              compared=$((compared + 1))
+            elif [ -s "diffs/${slug}.json" ]; then
+              # Non-zero with output means the comparison ran and was blocked — real information, kept.
+              blocked=$((blocked + 1))
+            else
+              # No output means a version is not in the corpus, which the recording log already explains.
+              missing=$((missing + 1))
+              rm -f "diffs/${slug}.json"
+            fi
+            rm -f "diffs/${slug}.err"
+          done < pairs.tsv
+
+          echo "diffs: ${compared} compared, ${blocked} blocked, ${missing} unavailable"
+
+      - name: Describe the dataset
+        # Where a publishable number comes from. Phases.md:39 wants "~50k version-behaviors"; 200x5 is
+        # 1000 *recordings*, and only the store can count behaviors. This is the join between what the run
+        # log says happened and what the evidence actually contains.
+        run: |
+          set -euo pipefail
+          installscope snapshot summarize --registry corpus --json --out corpus-summary.json
+          installscope snapshot summarize --registry corpus
+
+          set +e
+          node harness/corpus/summarize-corpus.mjs \
+            --merged merged.json \
+            --corpus corpus-summary.json \
+            --plan corpus-plan.json \
+            --out-json dataset.json \
+            --out-md DATASET.md
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Dataset not publishable::the corpus is not intact; see DATASET.md"
+            exit 1
+          fi
+
+      - name: Build the receipt review queue
+        run: |
+          set -euo pipefail
+          node harness/corpus/select-receipts.mjs \
+            --merged merged.json \
+            --plan corpus-plan.json \
+            --diffs diffs \
+            --top 25 \
+            --out-json receipts-queue.json \
+            --out-md RECEIPTS-QUEUE.md
+
+      - name: Write the step summary
+        run: |
+          set -euo pipefail
+          cat DATASET.md >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat RECEIPTS-QUEUE.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Flag incomplete recordings loudly
+        # Rules.md rule 2: a green run over silently-dead recorders is the worst outcome this project can
+        # produce. Annotated, not failed — a PARTIAL recording is data about the backfill, and the
+        # dataset report already excludes it from every count.
+        run: |
+          set -euo pipefail
+          node -e '
+            const merged = require("./merged.json");
+            const t = merged.totals ?? {};
+            if ((t.partial ?? 0) > 0) {
+              const names = (merged.partial_recordings ?? []).map((r) => r.spec).slice(0, 20).join(", ");
+              console.log(`::warning title=PARTIAL recordings::${t.partial} recording(s) were incomplete and are excluded from the corpus: ${names}`);
+            }
+            if ((t.failed ?? 0) > 0) {
+              const names = (merged.failed_recordings ?? []).map((r) => r.spec).slice(0, 20).join(", ");
+              console.log(`::warning title=Failed recordings::${t.failed} recording(s) could not be recorded: ${names}`);
+            }
+            if ((t.version_mismatches ?? 0) > 0) {
+              console.log(`::error title=Version mismatch::${t.version_mismatches} recording(s) installed a version other than the one requested; those recordings are mislabeled and must not be cited`);
+            }
+            const rate = t.recordings > 0 ? (t.complete / t.recordings) : 0;
+            if (t.recordings > 0 && rate < 0.9) {
+              console.log(`::warning title=Low completion rate::${(rate * 100).toFixed(1)}% of recordings completed. Failures skew toward packages with elaborate install scripts, so the corpus is biased against the behaviors it exists to document.`);
+            }
+          '
+
+      - name: Upload the corpus and the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus
+          path: |
+            corpus
+            corpus-plan.json
+            shards.json
+            merged.json
+            corpus-summary.json
+            dataset.json
+            DATASET.md
+            receipts-queue.json
+            RECEIPTS-QUEUE.md
+            diffs
+            verify.log
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Restate what this workflow did not decide
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "### This job does not fire G3"
+            echo ""
+            echo "\`RECEIPTS-QUEUE.md\` ranks **candidates**. A candidate becomes a **receipt** only when a"
+            echo "human reads the evidence and confirms the behavior is genuinely surprising: a rule firing"
+            echo "means \"this matched a pattern\", a receipt means \"a maintainer would be surprised\", and"
+            echo "only the second is a judgement about people (Rules.md rule 7)."
+            echo ""
+            echo "Record the confirmed count and the verdict in \`Memory.md\`. If the corpus produces nothing"
+            echo "surprising, Phases.md:41's stop rule applies and a human chooses between repositioning and"
+            echo "launching as a content piece. Widening the rules to manufacture candidates is a process"
+            echo "failure, not a fix."
+            echo ""
+            echo "Nothing in \`corpus/demo/\` may be cited as a receipt either — those fixtures are synthetic"
+            echo "and labelled as such in their own contents."
+          } >> "$GITHUB_STEP_SUMMARY"
