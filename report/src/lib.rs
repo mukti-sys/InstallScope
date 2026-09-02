@@ -7,6 +7,7 @@
 //! - [`markdown`] — the PR comment. One score, at most three bullets, a link. PRD.md:57.
 //! - [`sarif`] — SARIF 2.1.0 for GitHub code scanning.
 //! - [`html`] — a self-contained artifact, no external assets (Rules.md §1).
+//! - [`diff`] — the version-to-version behavioral diff (Design.md:51), in Markdown and HTML.
 //!
 //! # What every renderer must show
 //!
@@ -20,18 +21,23 @@
 //!
 //! Neither is a formatting preference. A renderer that omits either is making a false claim about
 //! evidence, which is the one thing this product cannot do.
+//!
+//! The diff renderers carry the same obligation in a different shape: a comparison that cannot support a
+//! behavioral claim must not be rendered as one. See [`diff`].
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![warn(clippy::pedantic, missing_docs, rust_2018_idioms)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod diff;
 pub mod html;
 pub mod markdown;
 pub mod sarif;
 
 use installscope_core::{Analysis, Score, Severity};
 
+pub use diff::{render_diff_html, render_diff_markdown};
 pub use html::render_html;
 pub use markdown::render_markdown;
 pub use sarif::render_sarif;

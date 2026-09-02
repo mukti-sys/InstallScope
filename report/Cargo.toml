@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 installscope-core = { workspace = true }
+# For the version-diff renderer. Brings zstd transitively, which is documented in registry/Cargo.toml;
+# the alternative was a second rendering home for the diff surfaces, and Architecture.md §5 puts all
+# rendering here.
+installscope-registry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

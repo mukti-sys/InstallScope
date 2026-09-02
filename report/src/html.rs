@@ -13,16 +13,29 @@
 //! 2. Top findings (bullets)
 //! 3. Coverage caveat (when the backend has blind spots)
 //! 4. Full findings table
-//! 5. Evidence detail (expandable per finding)
+//! 5. Per-class coverage table
+//! 6. Evidence detail (expandable per finding)
 //!
 //! # What this renderer refuses to do
 //!
 //! Same contract as the other two: it does not soften a PARTIAL recording, and it does not present
 //! a limited backend's clean result as an unqualified pass. Tests assert both.
+//!
+//! # Why the per-class coverage table lives here and not in the comment
+//!
+//! `Memory.md`:194 records it as a Phase 3 obligation: the parity harness keeps the strace/aya
+//! asymmetry visible as per-class counts, and the report has to do the same. The one-line caveat in
+//! [`installscope_core::Coverage::caveat_line`] names only the classes a backend cannot see *at all* —
+//! it says nothing about the ones it sees with a caveat, and "byte counts are the requested count, not
+//! the number actually written" is exactly the sort of qualification that changes how a reader weighs a
+//! finding.
+//!
+//! So the full table belongs in the artifact, which is the surface with room for it. The PR comment
+//! keeps the one-liner, because PRD.md:57 caps that surface at a score, three bullets, and a link.
 
 use std::fmt::Write as _;
 
-use installscope_core::{select_bullets, Analysis, Severity};
+use installscope_core::{select_bullets, Analysis, Observability, Severity};
 
 use crate::{format_bullet, format_score, ReportContext, Verdict};
 
@@ -41,6 +54,7 @@ pub fn render_html(analysis: &Analysis, context: &ReportContext) -> String {
     render_summary(&mut out, analysis, verdict);
     render_caveats(&mut out, analysis);
     render_findings_table(&mut out, analysis);
+    render_coverage_table(&mut out, analysis);
     render_skipped_rules(&mut out, analysis);
     render_footer(&mut out, analysis);
 
@@ -203,6 +217,53 @@ fn render_findings_table(out: &mut String, analysis: &Analysis) {
     out.push_str("</tbody>\n</table>\n</section>\n\n");
 }
 
+/// Emits the per-class coverage table.
+///
+/// Always rendered, including for a full-coverage backend. That is deliberate: a table that appears only
+/// when something is wrong teaches a reader to equate its absence with completeness, and they would then
+/// have no way to tell a full-coverage recording from a report that simply forgot to say. The strace
+/// version of this table is also not uniformly green — reads are filtered to a path list, and connects
+/// carry no hostname — so there is real information in it either way.
+///
+/// The wording of every row comes from [`installscope_core::observability`] rather than from this module.
+/// A renderer that phrased its own caveats could drift from what the engine actually did.
+fn render_coverage_table(out: &mut String, analysis: &Analysis) {
+    out.push_str("<section class=\"coverage\">\n<h2>What this recording could observe</h2>\n");
+    let _ = writeln!(
+        out,
+        "<p class=\"coverage-intro\">Recorded with the <code>{}</code> backend. A class marked \
+         <em>not observed</em> means the absence of a finding in that class says nothing about the \
+         install.</p>",
+        escape(&format!("{}", analysis.coverage.backend))
+    );
+    out.push_str(
+        "<table>\n<thead><tr>\
+        <th>Behavior</th><th>Observed</th><th>Qualification</th>\
+        </tr></thead>\n<tbody>\n",
+    );
+    for (class, observability) in &analysis.coverage.classes {
+        let (state_class, state_label) = match observability {
+            Observability::Observed => ("observed", "yes"),
+            Observability::Partial(_) => ("qualified", "with caveat"),
+            Observability::Unobserved(_) => ("unobserved", "no"),
+        };
+        let _ = writeln!(
+            out,
+            "<tr class=\"coverage-{state_class}\">\
+            <td>{class}</td>\
+            <td><span class=\"tag {state_class}\">{state_label}</span></td>\
+            <td>{note}</td>\
+            </tr>",
+            class = escape(class.as_str()),
+            note = observability.note().map_or_else(
+                || "&mdash;".to_string(),
+                |note| capitalise_sentence(&escape(note))
+            ),
+        );
+    }
+    out.push_str("</tbody>\n</table>\n</section>\n\n");
+}
+
 /// Emits the collapsible skipped-rules section.
 fn render_skipped_rules(out: &mut String, analysis: &Analysis) {
     if analysis.skipped_rules.is_empty() {
@@ -295,6 +356,12 @@ code { font-size: 0.85em; background: var(--surface); padding: 0.15rem 0.35rem;
 .tag.high { background: var(--high); color: var(--bg); }
 .tag.medium { background: var(--medium); color: var(--bg); }
 .tag.low { background: var(--border); color: var(--text-muted); }
+.tag.observed { background: var(--clean); color: var(--bg); }
+.tag.qualified { background: var(--medium); color: var(--bg); }
+.tag.unobserved { background: var(--critical); color: var(--bg); }
+.coverage-intro { color: var(--text-muted); font-size: 0.9rem; margin: 0 0 0.5rem; }
+.coverage table { font-size: 0.85rem; }
+.coverage-unobserved td { border-left: 3px solid var(--critical); }
 .severity-critical td { border-left: 3px solid var(--critical); }
 .severity-high td:first-child { border-left: 3px solid var(--high); }
 details { margin: 1rem 0; }
@@ -347,6 +414,19 @@ fn capitalise(text: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// Capitalises a note and gives it a full stop.
+///
+/// The coverage notes are written as sentence fragments so they read correctly inside
+/// [`installscope_core::Coverage::caveat_line`]. In a table cell they stand alone, so they get the
+/// punctuation a standalone sentence needs. Applied *after* escaping, so it cannot alter an entity.
+fn capitalise_sentence(text: &str) -> String {
+    let mut sentence = capitalise(text);
+    if !sentence.is_empty() && !sentence.ends_with('.') {
+        sentence.push('.');
+    }
+    sentence
 }
 
 /// HTML-escapes a string to prevent XSS.
@@ -427,6 +507,113 @@ mod tests {
         let rendered = render_html(&analyse_fixture("clean.jsonl"), &context());
         assert!(!rendered.contains("Not checked by"));
         assert!(!rendered.contains("did not run"));
+    }
+
+    #[test]
+    fn every_report_carries_the_full_per_class_coverage_table() {
+        // Memory.md:194 makes this a Phase 3 obligation: the parity harness keeps the strace/aya
+        // asymmetry visible in per-class counts, and the report must too. Rendered unconditionally,
+        // because a table that appears only on the weaker backend would teach a reader to read its
+        // absence as completeness.
+        for name in [
+            "clean.jsonl",
+            "high.jsonl",
+            "critical.jsonl",
+            "partial.jsonl",
+            "aya-clean.jsonl",
+        ] {
+            let analysis = analyse_fixture(name);
+            let rendered = render_html(&analysis, &context());
+            assert!(
+                rendered.contains("What this recording could observe"),
+                "{name}: the coverage table is missing"
+            );
+            for (class, _) in &analysis.coverage.classes {
+                assert!(
+                    rendered.contains(class.as_str()),
+                    "{name}: the coverage table omits {class}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_coverage_table_distinguishes_unobserved_from_qualified() {
+        // The distinction the table exists for. "Byte counts are approximate" and "credential reads are
+        // not recorded at all" must not render identically — the first qualifies a finding, the second
+        // means silence proves nothing.
+        let aya = render_html(&analyse_fixture("aya-clean.jsonl"), &context());
+        assert!(
+            aya.contains("tag unobserved"),
+            "aya has blind spots and must show them as such: {aya}"
+        );
+        assert!(
+            aya.contains("tag qualified"),
+            "aya's caveated classes must be marked distinctly: {aya}"
+        );
+
+        // strace has no blind spots, so nothing may be marked unobserved for it. This is the assertion
+        // that stops the table degrading into decoration that always looks the same.
+        let strace = render_html(&analyse_fixture("clean.jsonl"), &context());
+        assert!(
+            !strace.contains("tag unobserved"),
+            "strace sees every class; marking one unobserved would be a false claim: {strace}"
+        );
+        assert!(
+            strace.contains("tag observed"),
+            "strace's fully-observed classes must be visible as such"
+        );
+    }
+
+    #[test]
+    fn the_coverage_table_states_the_reason_for_every_qualification() {
+        // A "with caveat" cell and no reason is a shrug. Each note comes from
+        // installscope_core::observability, so the report cannot phrase its own caveat and drift from
+        // what the engine actually did.
+        for name in ["clean.jsonl", "aya-clean.jsonl"] {
+            let analysis = analyse_fixture(name);
+            let rendered = render_html(&analysis, &context());
+            for (class, observability) in &analysis.coverage.classes {
+                if let Some(note) = observability.note() {
+                    // The note is escaped and sentence-cased before rendering, so a distinctive
+                    // fragment is compared rather than the whole string.
+                    let fragment: String = note
+                        .split_whitespace()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let escaped = escape(&fragment);
+                    let expected = capitalise(&escaped);
+                    assert!(
+                        rendered.contains(&escaped) || rendered.contains(&expected),
+                        "{name}: {class} is qualified but its reason is absent: {note}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_coverage_table_names_the_backend_that_produced_the_recording() {
+        // The table is a claim about a recorder, not about an install. Which recorder must be on the
+        // same screen as the claim.
+        let aya = render_html(&analyse_fixture("aya-clean.jsonl"), &context());
+        assert!(aya.contains("<code>aya</code>"), "{aya}");
+        let strace = render_html(&analyse_fixture("clean.jsonl"), &context());
+        assert!(strace.contains("<code>strace</code>"), "{strace}");
+    }
+
+    #[test]
+    fn coverage_notes_are_escaped_like_every_other_string() {
+        // The notes are static today, so this guards the mechanism rather than current data: a future
+        // note containing a `<` must render as text.
+        assert_eq!(
+            capitalise_sentence(&escape("<b>reads</b> are filtered")),
+            "&lt;b&gt;reads&lt;/b&gt; are filtered."
+        );
+        // An existing full stop is not doubled.
+        assert_eq!(capitalise_sentence("already done."), "Already done.");
+        assert_eq!(capitalise_sentence(""), "");
     }
 
     #[test]
