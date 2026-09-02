@@ -288,6 +288,45 @@ jobs:
           ./target/release/installscope --version
           echo "$(pwd)/target/release" >> "$GITHUB_PATH"
 
+      - name: Smoke-test the recorder before recording anything real
+        # One trivial recording before the shard's real work, because the failure this catches is not
+        # visible any other way.
+        #
+        # The first backfill lost 30 recordings out of 30 to a single mistake: record-corpus.sh invokes the
+        # recorder through `env -i`, which wipes PATH, so a binary placed on PATH via GITHUB_PATH could not
+        # be found. Its own `command -v` check passed, because that runs with the caller's PATH. `bash -n`
+        # passed too, because the script parses fine.
+        #
+        # Only running it finds that class of bug, so it is run once here â€” on `ms`, which is 6 KB and has
+        # no install scripts â€” and a failure costs one job instead of the whole matrix. Deliberately not
+        # `continue-on-error`: if the recorder cannot record, this shard has nothing to contribute.
+        run: |
+          set -euo pipefail
+          chmod +x harness/corpus/record-corpus.sh
+          harness/corpus/record-corpus.sh \
+            --package ms \
+            --version 2.1.3 \
+            --outdir smoke \
+            --timeout 120
+
+          # `record-corpus.sh` exits 0 for a PARTIAL recording, because an incomplete recording is still a
+          # result worth keeping. For a smoke test it is not: a recorder that cannot produce a complete
+          # recording of a 6 KB dependency-free package is broken, whatever the reason.
+          node -e '
+            const recording = require("./smoke/recording.json");
+            if (!recording.recorded || !recording.complete) {
+              console.log(`::error title=Recorder smoke test failed::${recording.incomplete_reason ?? "unknown"} (exit ${recording.recorder_exit_code})`);
+              process.exit(1);
+            }
+            if (recording.events < 5) {
+              console.log(`::error title=Implausibly quiet smoke recording::a real npm install produces more than 5 events; got ${recording.events}`);
+              process.exit(1);
+            }
+            console.log(`recorder smoke test: ${recording.events} events, complete`);
+          '
+          rm -rf smoke
+
+
       - name: Download the plan
         uses: actions/download-artifact@v4
         with:
@@ -337,7 +376,7 @@ jobs:
               --package "$pkg" \
               --version "$version" \
               --outdir "out/${slug}" \
-              --registry registry \
+              --registry shard-registry \
               --timeout "$TIMEOUT"
             status=$?
             set -e
@@ -369,14 +408,19 @@ jobs:
         # The store verifies on read, and this is where that gets exercised on a real backfill rather than
         # only in unit tests. A shard whose blobs do not match their addresses has produced evidence
         # nobody can stand behind, and it must say so before the merge treats it as data.
+        #
+        # The directory is `shard-registry`, not `registry`: this workflow runs from the repository root,
+        # where `registry/` is the crate. The first backfill used the latter and uploaded 6 Rust source
+        # files as its "corpus" artifact â€” harmless because nothing was stored anyway, and a real
+        # collision waiting to happen once something is.
         if: always()
         run: |
           set -euo pipefail
-          if [ ! -d registry ]; then
+          if [ ! -d shard-registry ]; then
             echo "no registry produced by this shard (every recording failed or was PARTIAL)"
             exit 0
           fi
-          if ! installscope snapshot verify --registry registry > out/verify-registry.log 2>&1; then
+          if ! installscope snapshot verify --registry shard-registry > out/verify-registry.log 2>&1; then
             cat out/verify-registry.log
             echo "::error title=Shard registry corrupt::snapshots in shard ${{ matrix.id }} do not match their content address"
             exit 1
@@ -390,7 +434,7 @@ jobs:
           {
             echo "### shard ${{ matrix.id }}"
             echo ""
-            echo "attempted \`${{ steps.record.outputs.total }}\` · complete \`${{ steps.record.outputs.complete }}\` · PARTIAL \`${{ steps.record.outputs.partial }}\` · failed \`${{ steps.record.outputs.failed }}\`"
+            echo "attempted \`${{ steps.record.outputs.total }}\` ï¿½ complete \`${{ steps.record.outputs.complete }}\` ï¿½ PARTIAL \`${{ steps.record.outputs.partial }}\` ï¿½ failed \`${{ steps.record.outputs.failed }}\`"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -401,7 +445,7 @@ jobs:
           name: corpus-shard-${{ matrix.id }}
           path: |
             out
-            registry
+            shard-registry
           retention-days: 90
           if-no-files-found: warn
 
@@ -459,7 +503,7 @@ jobs:
           mkdir -p corpus/blobs
 
           shard_registries=0
-          for registry in shards/*/registry; do
+          for registry in shards/*/shard-registry; do
             [ -d "$registry" ] || continue
             shard_registries=$((shard_registries + 1))
             if [ -d "$registry/blobs" ]; then
@@ -470,17 +514,26 @@ jobs:
             fi
           done
 
-          if [ "$shard_registries" -eq 0 ]; then
-            echo "::warning title=No registries::no shard produced a registry; every recording failed or was PARTIAL"
+          # An index is only created by a push, so its absence means no shard stored anything. That is a
+          # real outcome â€” every recording failed or was PARTIAL â€” and it has to be reported as that
+          # rather than as an arithmetic error on a missing file.
+          #
+          # The first backfill failed exactly here: `wc -l` on an absent index, which said nothing about
+          # the 30 recordings that had actually failed upstream. A gate whose error message points at the
+          # wrong thing costs a debugging round trip, which is the cheap version of this mistake.
+          if [ ! -f corpus/index.jsonl ]; then
             : > corpus/index.jsonl
+            echo "::error title=Nothing was recorded::${shard_registries} shard registr(ies) were present but none contained an index, so no recording was stored. Check the shard logs: this is an upstream failure, not a merge failure."
+            exit 1
           fi
+
           echo "combined $shard_registries shard registr(ies)"
-          wc -l < corpus/index.jsonl | sed 's/^/index entries: /'
+          echo "index entries: $(wc -l < corpus/index.jsonl)"
 
       - name: Verify the combined corpus
         # The check that decides whether anything may be published. A corpus whose blobs do not match
         # their addresses backs no receipt, and `snapshot verify` exits non-zero on the first mismatch it
-        # finds — which is what makes this a gate rather than a log line.
+        # finds ï¿½ which is what makes this a gate rather than a log line.
         id: verify
         run: |
           set -euo pipefail
@@ -495,7 +548,7 @@ jobs:
 
       - name: Diff every consecutive version pair
         # The moat, computed. A package with N recorded versions yields N-1 comparisons, and each is a
-        # story with a before and an after — which is what makes a receipt readable.
+        # story with a before and an after ï¿½ which is what makes a receipt readable.
         #
         # A blocked comparison is written out too: `select-receipts.mjs` counts them so their absence from
         # the queue is explained rather than looking like an empty result.
@@ -535,7 +588,7 @@ jobs:
             if [ "$status" -eq 0 ]; then
               compared=$((compared + 1))
             elif [ -s "diffs/${slug}.json" ]; then
-              # Non-zero with output means the comparison ran and was blocked — real information, kept.
+              # Non-zero with output means the comparison ran and was blocked ï¿½ real information, kept.
               blocked=$((blocked + 1))
             else
               # No output means a version is not in the corpus, which the recording log already explains.
@@ -590,7 +643,7 @@ jobs:
 
       - name: Flag incomplete recordings loudly
         # Rules.md rule 2: a green run over silently-dead recorders is the worst outcome this project can
-        # produce. Annotated, not failed — a PARTIAL recording is data about the backfill, and the
+        # produce. Annotated, not failed ï¿½ a PARTIAL recording is data about the backfill, and the
         # dataset report already excludes it from every count.
         run: |
           set -euo pipefail
@@ -653,6 +706,6 @@ jobs:
             echo "launching as a content piece. Widening the rules to manufacture candidates is a process"
             echo "failure, not a fix."
             echo ""
-            echo "Nothing in \`corpus/demo/\` may be cited as a receipt either — those fixtures are synthetic"
+            echo "Nothing in \`corpus/demo/\` may be cited as a receipt either ï¿½ those fixtures are synthetic"
             echo "and labelled as such in their own contents."
           } >> "$GITHUB_STEP_SUMMARY"

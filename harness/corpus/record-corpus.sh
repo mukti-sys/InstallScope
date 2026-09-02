@@ -103,10 +103,38 @@ command -v strace >/dev/null 2>&1 || die "strace not found; the recorder's v1.0 
 command -v node   >/dev/null 2>&1 || die "node not found"
 command -v npm    >/dev/null 2>&1 || die "npm not found"
 command -v timeout >/dev/null 2>&1 || die "timeout (coreutils) not found"
-command -v "$INSTALLSCOPE" >/dev/null 2>&1 || die "installscope not found at: $INSTALLSCOPE"
+
+# Resolved to an absolute path HERE, before `env -i` below wipes PATH.
+#
+# This is the bug that made the first real backfill fail 30 recordings out of 30 with
+# `env: 'installscope': No such file or directory`, and it is worth stating plainly because
+# `command -v` passing above is exactly what makes it invisible: this check runs with the caller's PATH,
+# and the recorder runs without it. A workflow that puts the binary on PATH via GITHUB_PATH satisfies
+# the check and then fails the invocation.
+#
+# `bash -n` cannot catch it either — the script parses fine. Only running it does.
+INSTALLSCOPE_BIN="$(command -v "$INSTALLSCOPE" 2>/dev/null)" \
+  || die "installscope not found at: $INSTALLSCOPE"
+case "$INSTALLSCOPE_BIN" in
+  /*) ;;
+  # command -v returns a bare name for a shell builtin or a relative path for `./installscope`. Neither
+  # survives `env -i`, so both are resolved rather than accepted.
+  *) INSTALLSCOPE_BIN="$(cd "$(dirname "$INSTALLSCOPE_BIN")" && pwd)/$(basename "$INSTALLSCOPE_BIN")" ;;
+esac
+[ -x "$INSTALLSCOPE_BIN" ] || die "installscope is not executable: $INSTALLSCOPE_BIN"
 
 mkdir -p "$OUTDIR" || die "cannot create outdir: $OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)" || die "cannot resolve outdir"
+
+# The registry path is made absolute for the same reason the recorder's own `--out` is (Memory.md,
+# Phase 1: a relative `-o` produced a silently empty recording because strace resolved it against the
+# *install's* directory). A relative --registry here would be resolved against whatever directory the
+# push happens to run in, and in the first backfill it meant the workflow uploaded the repository's own
+# `registry/` crate as the artifact instead of a store.
+if [ -n "$REGISTRY_DIR" ]; then
+  mkdir -p "$REGISTRY_DIR" || die "cannot create registry dir: $REGISTRY_DIR"
+  REGISTRY_DIR="$(cd "$REGISTRY_DIR" && pwd)" || die "cannot resolve registry dir"
+fi
 
 WORK="$OUTDIR/work"
 FAKE_HOME="$WORK/home"
@@ -127,7 +155,7 @@ printf '%s\n' '{"name":"installscope-corpus-scratch","version":"0.0.0","private"
 node_version="$(node --version 2>/dev/null || echo unknown)"
 npm_version="$(npm --version 2>/dev/null || echo unknown)"
 strace_version="$(strace -V 2>/dev/null | head -n 1 || echo unknown)"
-recorder_version="$("$INSTALLSCOPE" --version 2>/dev/null || echo unknown)"
+recorder_version="$("$INSTALLSCOPE_BIN" --version 2>/dev/null || echo unknown)"
 kernel_release="$(uname -r 2>/dev/null || echo unknown)"
 
 SPEC="${PACKAGE}@${VERSION}"
@@ -139,6 +167,10 @@ start_epoch="$(date +%s)"
 # `env -i` so the recording sees a known environment rather than whatever the runner exported. The
 # npm_config_* vars point every cache npm has at the private directory: npm_config_cache alone leaves
 # _cacache elsewhere on some versions.
+#
+# The recorder is invoked by absolute path ($INSTALLSCOPE_BIN, resolved above) because `env -i` wipes
+# PATH and the fixed PATH below deliberately does not include wherever the binary was built. The PATH
+# that *is* set is for the traced command — npm needs node, and node needs the system directories.
 #
 # --project/--cache/--expect declare the recorder's zones. Without them every write looks like it
 # landed somewhere unexpected and an ordinary install scores as critical (core/src/zones.rs).
@@ -152,7 +184,7 @@ env -i \
   npm_config_audit=false \
   CI=true \
   INSTALLSCOPE_CORPUS=1 \
-  "$INSTALLSCOPE" record \
+  "$INSTALLSCOPE_BIN" record \
     --out "$RECORDING_DIR" \
     --cwd "$PROJECT_DIR" \
     --project "$PROJECT_DIR" \
@@ -196,7 +228,7 @@ fi
 verify_status="skipped"
 events_count=0
 if [ -s "$EVENTS" ]; then
-  "$INSTALLSCOPE" verify "$EVENTS" > "$OUTDIR/verify.log" 2>&1
+  "$INSTALLSCOPE_BIN" verify "$EVENTS" > "$OUTDIR/verify.log" 2>&1
   case "$?" in
     0) verify_status="complete" ;;
     3) verify_status="partial"; complete=false
@@ -251,7 +283,7 @@ push_error=""
 digest=""
 if [ -n "$REGISTRY_DIR" ]; then
   if [ "$complete" = true ]; then
-    if "$INSTALLSCOPE" snapshot push "$EVENTS" \
+    if "$INSTALLSCOPE_BIN" snapshot push "$EVENTS" \
          --registry "$REGISTRY_DIR" \
          --package "$PACKAGE" \
          --version "$VERSION" > "$OUTDIR/push.log" 2>&1; then
