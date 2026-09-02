@@ -214,6 +214,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "installscope-lockfile"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "installscope-recorder"
 version = "0.1.0"
 dependencies = [

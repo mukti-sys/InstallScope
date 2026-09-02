@@ -1,0 +1,29 @@
+lockfileVersion: 5.4
+
+specifiers:
+  local-dir: file:./local-dir
+  ms: github:vercel/ms#2.1.3
+  tarball: https://registry.npmjs.org/ms/-/ms-2.1.2.tgz
+
+dependencies:
+  local-dir: file:local-dir
+  ms: github.com/vercel/ms/1c6264b795492e8fdecbc82cb8802fcfbfc08d26
+  tarball: /ms/2.1.2
+
+packages:
+
+  /ms/2.1.2:
+    resolution: {integrity: sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==}
+    dev: false
+
+  file:local-dir:
+    resolution: {directory: local-dir, type: directory}
+    name: local-dir
+    version: 0.0.1
+    dev: false
+
+  github.com/vercel/ms/1c6264b795492e8fdecbc82cb8802fcfbfc08d26:
+    resolution: {tarball: https://codeload.github.com/vercel/ms/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26}
+    name: ms
+    version: 2.1.3
+    dev: false

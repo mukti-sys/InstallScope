@@ -1,0 +1,22 @@
+{
+  "name": "lp10",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "lp10",
+      "version": "1.0.0",
+      "dependencies": {
+        "thing": "file:./vendor/thing"
+      }
+    },
+    "node_modules/thing": {
+      "resolved": "vendor/thing",
+      "link": true
+    },
+    "vendor/thing": {
+      "version": "0.0.1"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["abi", "core", "recorder", "report", "cli"]
+members = ["abi", "core", "lockfile", "recorder", "report", "cli"]
 
 # harness/ is Phase 0 gate tooling with its own toolchain requirements (nightly + build-std for the
 # eBPF crate) and is deliberately not part of the product workspace.
@@ -20,6 +20,7 @@ repository = "https://github.com/mukti-sys/InstallScope"
 [workspace.dependencies]
 installscope-abi = { path = "abi" }
 installscope-core = { path = "core" }
+installscope-lockfile = { path = "lockfile" }
 installscope-recorder = { path = "recorder" }
 installscope-report = { path = "report" }
 
