@@ -1,0 +1,35 @@
+[package]
+name = "installscope-registry"
+description = "Content-addressed snapshot store and behavioral version-diff engine for InstallScope."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+installscope-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Architecture.md:89 fixes the snapshot address as sha256(zstd(events)), so both algorithms are load
+# bearing rather than interchangeable.
+#
+# `sha2` is pure Rust (RustCrypto). `zstd` is a binding to the reference C implementation, which
+# Rules.md §1 asks to avoid unless documented — so it is documented here, in the one crate that needs
+# it. core/, recorder/ and report/ stay free of C dependencies.
+#
+# Why not the pure-Rust `ruzstd`: verified locally against ruzstd 0.9.0, its *encoder* is unfinished —
+# every compression level above `Fastest` panics with `not implemented` inside
+# `encoding/frame_compressor.rs`. A panic reachable from a compression level is not a dependency this
+# crate can carry, and pinning the one working level would mean shipping the weakest ratio (2.0% vs
+# 0.66% of the raw stream, measured on a 40k-event synthetic recording) while still carrying a decoder
+# whose encoder half is a trap for the next person who touches it.
+sha2 = "0.10.9"
+zstd = "0.13.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }

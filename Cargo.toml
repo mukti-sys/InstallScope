@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["abi", "core", "lockfile", "recorder", "report", "cli"]
+members = ["abi", "core", "lockfile", "recorder", "registry", "report", "cli"]
 
 # harness/ is Phase 0 gate tooling with its own toolchain requirements (nightly + build-std for the
 # eBPF crate) and is deliberately not part of the product workspace.
@@ -22,6 +22,7 @@ installscope-abi = { path = "abi" }
 installscope-core = { path = "core" }
 installscope-lockfile = { path = "lockfile" }
 installscope-recorder = { path = "recorder" }
+installscope-registry = { path = "registry" }
 installscope-report = { path = "report" }
 
 # clap without default features: `color` pulls in anstream/anstyle-query, which drag in windows-sys
