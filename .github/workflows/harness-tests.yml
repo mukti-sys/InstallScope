@@ -10,6 +10,7 @@ on:
   push:
     paths:
       - "harness/g2/**"
+      - "harness/corpus/**"
       - "core/**"
       - "lockfile/**"
       - "recorder/**"
@@ -21,6 +22,7 @@ on:
   pull_request:
     paths:
       - "harness/g2/**"
+      - "harness/corpus/**"
       - "core/**"
       - "lockfile/**"
       - "recorder/**"
@@ -36,7 +38,7 @@ permissions:
 
 jobs:
   golden:
-    name: G2 golden tests
+    name: harness golden tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -46,11 +48,22 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Parser + classifier + aggregator golden tests
+      - name: G2 parser + classifier + aggregator golden tests
         run: node harness/g2/test-parse.mjs
 
+      - name: Phase 5 corpus harness golden tests
+        # The corpus scripts decide which package@version pairs get recorded and which candidates a
+        # human reads. Their failure mode is not a crash — it is producing a plausible number, which no
+        # amount of CI green would catch. So these tests mostly assert what the scripts refuse to say.
+        #
+        # Pure Node, no network, no Linux dependency, which is what lets them run on every push.
+        run: node harness/corpus/test-corpus.mjs
+
       - name: Shell syntax check
-        run: bash -n harness/g2/record-package.sh
+        run: |
+          set -euo pipefail
+          bash -n harness/g2/record-package.sh
+          bash -n harness/corpus/record-corpus.sh
 
       - name: Banned-language check
         # Rules.md §4: "protection", "sandbox", "safe", "guaranteed" etc. must not appear as product

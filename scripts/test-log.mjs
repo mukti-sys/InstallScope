@@ -217,19 +217,40 @@ function groupByArea(perCrate) {
   }
   return [...areas.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
-/** Runs the Node harness suite, which is separate from cargo and easy to forget. */
+/**
+ * Runs the Node harness suites, which are separate from cargo and easy to forget.
+ *
+ * Both are counted, not just G2's: the Phase 5 corpus scripts decide which `package@version` pairs get
+ * recorded and which candidates a human reads, and their failure mode is producing a plausible number
+ * rather than crashing. A test log that omitted them would understate what is actually verified.
+ */
 function runHarnessTests() {
-  const result = spawnSync(process.execPath, ["harness/g2/test-parse.mjs"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    shell: false,
+  const suites = [
+    { label: "harness/g2/test-parse.mjs", script: "harness/g2/test-parse.mjs" },
+    { label: "harness/corpus/test-corpus.mjs", script: "harness/corpus/test-corpus.mjs" },
+  ];
+
+  const results = suites.map(({ label, script }) => {
+    const result = spawnSync(process.execPath, [script], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      shell: false,
+    });
+    const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    const match = /(\d+)\/(\d+) checks passed/.exec(combined);
+    return {
+      label,
+      ok: result.status === 0,
+      passed: match ? Number(match[1]) : 0,
+      total: match ? Number(match[2]) : 0,
+    };
   });
-  const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-  const match = /(\d+)\/(\d+) checks passed/.exec(combined);
+
   return {
-    ok: result.status === 0,
-    passed: match ? Number(match[1]) : 0,
-    total: match ? Number(match[2]) : 0,
+    suites: results,
+    ok: results.every((suite) => suite.ok),
+    passed: results.reduce((sum, suite) => sum + suite.passed, 0),
+    total: results.reduce((sum, suite) => sum + suite.total, 0),
   };
 }
 
@@ -434,11 +455,18 @@ lines.push("## Other suites");
 lines.push("");
 lines.push("| Suite | Result | Notes |");
 lines.push("|---|---|---|");
-lines.push(
-  `| \`harness/g2/test-parse.mjs\` | ${harness.passed}/${harness.total} ` +
-    `${harness.ok ? "passed" : "**FAILED**"} | Phase 0 gate tooling; golden tests over a labelled ` +
-    "synthetic strace fixture. Separate from cargo. |"
-);
+const harnessNotes = {
+  "harness/g2/test-parse.mjs":
+    "Phase 0 gate tooling; golden tests over a labelled synthetic strace fixture.",
+  "harness/corpus/test-corpus.mjs":
+    "Phase 5 corpus harness; asserts what the scripts refuse to say, not just that they run.",
+};
+for (const suite of harness.suites) {
+  lines.push(
+    `| \`${suite.label}\` | ${suite.passed}/${suite.total} ` +
+      `${suite.ok ? "passed" : "**FAILED**"} | ${harnessNotes[suite.label] ?? ""} Separate from cargo. |`
+  );
+}
 lines.push(
   `| \`cargo fmt --check\` | ${fmt.ok ? "clean" : "**FAILED**"} | Rules.md §6 requires this. |`
 );
