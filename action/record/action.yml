@@ -1,0 +1,396 @@
+name: "InstallScope — record"
+description: >-
+  Records the syscall-level ground truth of what a dependency change actually installs, and uploads a
+  forensic report as an artifact. Runs with a read-only token: it executes untrusted install scripts, so
+  it must never hold a token that can write to the repository. A companion workflow posts the comment.
+author: "mukti-sys"
+
+branding:
+  icon: "activity"
+  color: "orange"
+
+inputs:
+  lockfile:
+    description: >-
+      Path to the lockfile to watch. Defaults to autodetection, which prefers pnpm-lock.yaml when both
+      are present because that is what the install would actually use.
+    required: false
+    default: ""
+  base-ref:
+    description: >-
+      Git ref to compare the lockfile against. Defaults to the pull request's base.
+    required: false
+    default: ""
+  registry:
+    description: >-
+      Directory holding the content-addressed snapshot registry. Committed registries enable the
+      version-diff; an absent one simply means the first recording of each version.
+    required: false
+    default: ".installscope/registry"
+  fail-above:
+    description: >-
+      Exit non-zero when the Surprise Index exceeds this value. Empty means advisory-only, which is the
+      default because PRD.md:43 makes false positives an adoption problem rather than a build problem.
+    required: false
+    default: ""
+  timeout-seconds:
+    description: "Abort the recording after this many seconds."
+    required: false
+    default: "600"
+  artifact-name:
+    description: "Name of the uploaded artifact. The comment workflow must read the same name."
+    required: false
+    default: "installscope-report"
+  upload-sarif:
+    description: >-
+      Upload the SARIF to GitHub code scanning. Needs `security-events: write` on the calling job.
+      Off by default so the action works with a strictly read-only token.
+    required: false
+    default: "false"
+
+outputs:
+  should-record:
+    description: "true when the lockfile change introduced code that will run."
+    value: ${{ steps.trigger.outputs.should-record }}
+  score:
+    description: "The Surprise Index, 0-100. Empty when nothing was recorded."
+    value: ${{ steps.report.outputs.score }}
+  partial:
+    description: "true when the recording is incomplete and must not be read as clean."
+    value: ${{ steps.report.outputs.partial }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Refuse to run with a write-capable trigger
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The one check that cannot be skipped. This action runs `npm install`, which runs postinstall
+        # scripts from every package in the tree — arbitrary code from a pull request that may come from
+        # a stranger (PRD.md:23). `pull_request_target` would hand that code a write-capable token in the
+        # base repository's context.
+        #
+        # Failing loudly beats documenting it: a misconfiguration here is a credential leak in a security
+        # tool, and the person who copies the wrong trigger will not read the README first.
+        case "${GITHUB_EVENT_NAME}" in
+          pull_request_target|issue_comment|workflow_run)
+            echo "::error title=Unsafe trigger::installscope/record must not run on ${GITHUB_EVENT_NAME}. It executes untrusted install scripts, so it must run on 'pull_request' with a read-only token. See action/README.md."
+            exit 1
+            ;;
+        esac
+        echo "trigger ${GITHUB_EVENT_NAME} carries a read-only token; recording may proceed"
+
+    - name: Install strace
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The v1.0 backend needs nothing but ptrace (Architecture.md:98). aya is not used here: it needs
+        # root, a compiled probe object, and a cooperative kernel, and this action must work on a stock
+        # runner without any of that.
+        if ! command -v strace >/dev/null 2>&1; then
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends strace
+        fi
+        strace -V | head -n 1
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache the installscope build
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ github.action_path }}/../ -> target
+        key: installscope-action
+
+    - name: Build installscope
+      shell: bash
+      working-directory: ${{ github.action_path }}/..
+      run: |
+        set -euo pipefail
+        # Built from the action's own checkout rather than downloaded. A security tool that fetches its
+        # own binary at runtime has a supply chain problem of exactly the kind it exists to record.
+        cargo build --release --locked -p installscope
+        echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+    - name: Identify the lockfile and decide whether to record
+      id: trigger
+      shell: bash
+      env:
+        INPUT_LOCKFILE: ${{ inputs.lockfile }}
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+      run: |
+        set -euo pipefail
+
+        base_ref="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-}}"
+        if [ -z "$base_ref" ]; then
+          echo "::error title=No base ref::this action compares a lockfile against a base ref; pass base-ref explicitly when not running on a pull request"
+          exit 1
+        fi
+        git fetch --no-tags --depth=1 origin "$base_ref"
+
+        lockfile="${INPUT_LOCKFILE:-}"
+        if [ -z "$lockfile" ]; then
+          # pnpm first: when a repository has both, pnpm-lock.yaml is what `pnpm install` uses, and
+          # recording the npm one would record an install nobody performs.
+          for candidate in pnpm-lock.yaml package-lock.json; do
+            if [ -f "$candidate" ]; then
+              lockfile="$candidate"
+              break
+            fi
+          done
+        fi
+        if [ -z "$lockfile" ]; then
+          echo "no package-lock.json or pnpm-lock.yaml in the repository root; nothing to do"
+          echo "should-record=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "lockfile: $lockfile"
+
+        mkdir -p installscope-work
+        # `git show` of a path that did not exist at the base revision produces nothing, and the CLI reads
+        # an empty file as "the lockfile did not exist yet" rather than as a parse error. That is the
+        # first-dependency-PR case and it must not fail.
+        base_copy="installscope-work/base-$(basename "$lockfile")"
+        git show "origin/${base_ref}:${lockfile}" > "$base_copy" 2>/dev/null || : > "$base_copy"
+
+        set +e
+        installscope lockfile-diff --before "$base_copy" --after "$lockfile" --json \
+          > installscope-work/lockfile-diff.json
+        status=$?
+        set -e
+
+        cat installscope-work/lockfile-diff.json
+
+        # Exit 4 is "the lockfile changed but nothing new will run" — a real answer, not a failure. Any
+        # other non-zero status is a genuine problem and must not be swallowed (Rules.md §2: never let a
+        # broken step pass as a green build).
+        if [ "$status" -eq 0 ]; then
+          echo "should-record=true" >> "$GITHUB_OUTPUT"
+        elif [ "$status" -eq 4 ]; then
+          echo "should-record=false" >> "$GITHUB_OUTPUT"
+          echo "the lockfile changed, but nothing new will run during install"
+        else
+          echo "::error title=lockfile-diff failed::installscope lockfile-diff exited $status"
+          exit "$status"
+        fi
+
+        echo "lockfile=$lockfile" >> "$GITHUB_OUTPUT"
+        case "$lockfile" in
+          pnpm-lock.yaml) echo "manager=pnpm" >> "$GITHUB_OUTPUT" ;;
+          *)              echo "manager=npm"  >> "$GITHUB_OUTPUT" ;;
+        esac
+
+    - name: Enable pnpm
+      if: steps.trigger.outputs.should-record == 'true' && steps.trigger.outputs.manager == 'pnpm'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # corepack rather than a global install, so the version the repository pins is the version that
+        # runs — recording a different pnpm than the project uses would be recording the wrong install.
+        corepack enable
+        corepack prepare pnpm@latest --activate
+        pnpm --version
+
+    - name: Record the install
+      id: record
+      if: steps.trigger.outputs.should-record == 'true'
+      shell: bash
+      env:
+        MANAGER: ${{ steps.trigger.outputs.manager }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+
+        # A private HOME and cache, so the recording sees this install rather than whatever the runner
+        # image warmed up earlier. Without it a cached tarball means no network events and the recording
+        # says the install was quiet when it simply had nothing to fetch.
+        export HOME="${GITHUB_WORKSPACE}/installscope-work/home"
+        mkdir -p "$HOME"
+
+        if [ "$MANAGER" = "pnpm" ]; then
+          cache_dir="${HOME}/.pnpm-store"
+          install_cmd=(pnpm install --frozen-lockfile)
+        else
+          cache_dir="${HOME}/.npm"
+          install_cmd=(npm install --no-audit --no-fund)
+        fi
+        mkdir -p "$cache_dir"
+
+        set +e
+        installscope record \
+          --out installscope-work/recording \
+          --project "${GITHUB_WORKSPACE}" \
+          --cache "$cache_dir" \
+          --timeout "$TIMEOUT_SECONDS" \
+          -- "${install_cmd[@]}"
+        status=$?
+        set -e
+
+        # Exit 3 is PARTIAL: the recording happened but is incomplete. It must not fail the step, because
+        # a PARTIAL recording is still evidence and the report renders the badge. It must also not be
+        # silently treated as success, which is why it is echoed here and carried into the report.
+        if [ "$status" -eq 3 ]; then
+          echo "::warning title=PARTIAL recording::the recording is incomplete; the report will say so"
+        elif [ "$status" -ne 0 ]; then
+          echo "::error title=Recording failed::installscope record exited $status"
+          exit "$status"
+        fi
+
+        # Independent verification, rather than trusting the recorder's own exit code (Rules.md §2).
+        installscope verify installscope-work/recording/events.jsonl || true
+
+    - name: Evaluate and render the reports
+      id: report
+      if: steps.trigger.outputs.should-record == 'true'
+      shell: bash
+      env:
+        FAIL_ABOVE: ${{ inputs.fail-above }}
+      run: |
+        set -euo pipefail
+
+        evidence_link="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        args=(report installscope-work/recording/events.jsonl
+              --out installscope-work/report
+              --evidence-link "$evidence_link")
+        if [ -n "$FAIL_ABOVE" ]; then
+          args+=(--fail-above "$FAIL_ABOVE")
+        fi
+
+        set +e
+        installscope "${args[@]}" | tee installscope-work/report-summary.txt
+        status=$?
+        set -e
+
+        score="$(sed -n 's/^score: //p' installscope-work/report-summary.txt | head -n 1)"
+        partial="$(sed -n 's/^partial: //p' installscope-work/report-summary.txt | head -n 1)"
+        echo "score=${score:-}" >> "$GITHUB_OUTPUT"
+        echo "partial=${partial:-}" >> "$GITHUB_OUTPUT"
+
+        if [ "$status" -ne 0 ] && [ -n "$FAIL_ABOVE" ]; then
+          echo "::error title=Score above threshold::the Surprise Index is ${score}, above the configured ${FAIL_ABOVE}"
+          echo "fail-requested=true" >> "$GITHUB_OUTPUT"
+        elif [ "$status" -ne 0 ]; then
+          echo "::error title=Report failed::installscope report exited $status"
+          exit "$status"
+        fi
+
+    - name: Store the snapshot and diff against the previous version
+      id: snapshot
+      if: steps.trigger.outputs.should-record == 'true'
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+
+        # The recording covers the whole install, so it is attributed to the repository rather than to a
+        # single package. Per-package attribution needs one recording per package, which is the Phase 5
+        # corpus harness rather than this action.
+        package="${GITHUB_REPOSITORY}"
+        version="$(git rev-parse --short HEAD)"
+
+        # A PARTIAL recording is refused by the registry on purpose: a version-to-version diff drawn
+        # against an incomplete recording would attribute the recorder's failure to the package. So the
+        # push is allowed to fail without failing the job, and the reason is surfaced.
+        set +e
+        installscope snapshot push installscope-work/recording/events.jsonl \
+          --registry "$REGISTRY" \
+          --package "$package" \
+          --version "$version" \
+          | tee installscope-work/snapshot.txt
+        push_status=$?
+        set -e
+
+        if [ "$push_status" -ne 0 ]; then
+          echo "::warning title=Snapshot not stored::the recording was not added to the registry; see the log above for why"
+          exit 0
+        fi
+
+        # A diff needs a previous version of the same package in the registry. On a fresh repository there
+        # is none, and that is the normal first-run state rather than an error.
+        #
+        # Read with jq rather than sed: the index is JSONL, and a regex over JSON breaks the moment a
+        # field order changes or a version string contains a quote. jq is preinstalled on GitHub runners.
+        previous="$(installscope snapshot list --registry "$REGISTRY" --package "$package" --json \
+          | jq -r --arg current "$version" 'select(.version != $current) | .version' \
+          | tail -n 1)"
+
+        if [ -z "$previous" ]; then
+          echo "no earlier recording of ${package} in the registry; nothing to diff against"
+          exit 0
+        fi
+
+        echo "comparing ${previous} with ${version}"
+        set +e
+        installscope diff "$package" "$previous" "$version" \
+          --registry "$REGISTRY" \
+          --out installscope-work/report
+        diff_status=$?
+        set -e
+        if [ "$diff_status" -ne 0 ]; then
+          # Non-zero here means the two recordings could not be compared, which is information rather
+          # than a build failure.
+          echo "::notice title=No behavioral comparison::the two recordings could not be compared; see the diff report for why"
+        fi
+
+    - name: Assemble the artifact
+      if: steps.trigger.outputs.should-record == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p installscope-artifact
+
+        # The PR number is what the comment workflow needs to know where to post. Written as a bare
+        # integer and validated on the far side, because it crosses from a job that ran untrusted code
+        # into the job that holds the write token.
+        pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+        if [ -n "$pr_number" ]; then
+          printf '%s\n' "$pr_number" > installscope-artifact/pr.txt
+        fi
+
+        cp installscope-work/report/installscope-comment.md installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/report/installscope.sarif.json installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/report/installscope-report.html installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/report/installscope-diff.md installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/report/installscope-diff.html installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/recording/events.jsonl installscope-artifact/ 2>/dev/null || true
+        cp installscope-work/lockfile-diff.json installscope-artifact/ 2>/dev/null || true
+
+        ls -la installscope-artifact
+
+    - name: Upload the report artifact
+      if: steps.trigger.outputs.should-record == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: installscope-artifact
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Upload the snapshot registry
+      if: steps.trigger.outputs.should-record == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: installscope-registry
+        path: ${{ inputs.registry }}
+        retention-days: 30
+        if-no-files-found: warn
+
+    - name: Upload SARIF to code scanning
+      if: steps.trigger.outputs.should-record == 'true' && inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: installscope-work/report/installscope.sarif.json
+        category: installscope
+
+    - name: Fail the build when asked to
+      if: steps.report.outputs.fail-requested == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Last step on purpose. Everything above — the artifact, the SARIF, the registry — is uploaded
+        # first, so an opted-in failure still leaves the evidence behind. A gate that destroys the
+        # evidence it gated on would be worse than no gate.
+        echo "::error title=InstallScope::the Surprise Index exceeded the configured threshold"
+        exit 1
