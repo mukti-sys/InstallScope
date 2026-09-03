@@ -103,7 +103,7 @@ fn render_header(
     <span class="pkg-name">{pkg_name}</span>
   </div>
   <div class="header-right">
-    REGISTRY registry.npmjs.org<span class="sep">·</span>SANDBOX {backend}/linux-6.8.0-x86_64<span class="sep">·</span>SESSION FR-7Q2K-0194<span class="sep">·</span>CAPTURED 2026-09-03T18:41:07.412Z<span class="sep">·</span>WALL 4.118s
+    REGISTRY registry.npmjs.org<span class="sep">·</span>RECORDER {backend}/linux-6.8.0-x86_64<span class="sep">·</span>SESSION FR-7Q2K-0194<span class="sep">·</span>CAPTURED 2026-09-03T18:41:07.412Z<span class="sep">·</span>WALL 4.118s
   </div>
 </header>
 "#,
