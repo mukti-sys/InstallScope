@@ -293,6 +293,11 @@ fn render_priority_item(out: &mut String, finding: &installscope_core::Finding) 
         String::new()
     };
 
+    let prose = match &finding.note {
+        Some(note) => format!("{} — {}", escape(&finding.title), escape(note)),
+        None => escape(&format_bullet(finding)),
+    };
+
     let _ = write!(
         out,
         r#"        <article class="finding-item {sev_str}">
@@ -300,10 +305,9 @@ fn render_priority_item(out: &mut String, finding: &installscope_core::Finding) 
             <span class="sev-tag {sev_str}">{sev_label}</span>
             <span class="mitre-id">{mitre}{count_badge}</span>
           </div>
-          <p class="finding-prose">{bullet}</p>
+          <p class="finding-prose">{prose}</p>
         </article>
 "#,
-        bullet = escape(&format_bullet(finding)),
     );
 }
 
