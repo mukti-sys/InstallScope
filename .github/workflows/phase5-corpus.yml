@@ -315,6 +315,19 @@ jobs:
             --outdir smoke \
             --timeout 120
 
+          if [ -f smoke/install.log ]; then
+            echo "--- smoke/install.log ---"
+            cat smoke/install.log
+          fi
+          if [ -f smoke/verify.log ]; then
+            echo "--- smoke/verify.log ---"
+            cat smoke/verify.log
+          fi
+          if [ -f smoke/recording/session-summary.txt ]; then
+            echo "--- smoke/recording/session-summary.txt ---"
+            cat smoke/recording/session-summary.txt
+          fi
+
           # `record-corpus.sh` exits 0 for a PARTIAL recording, because an incomplete recording is still a
           # result worth keeping. For a smoke test it is not: a recorder that cannot produce a complete
           # recording of a 6 KB dependency-free package is broken, whatever the reason.

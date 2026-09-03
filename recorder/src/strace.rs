@@ -470,8 +470,8 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
     let mut reasons = Vec::new();
 
     for (pid, path) in &trace_files {
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
+        let contents = match fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(source) => {
                 // A single unreadable trace file is a partial recording, not a total failure: the
                 // other pids' evidence is still real. Recorded as a reason so the gap is visible.

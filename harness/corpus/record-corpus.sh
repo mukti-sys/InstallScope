@@ -218,8 +218,8 @@ if [ ! -s "$EVENTS" ]; then
   incomplete_reason="no events.jsonl was written"
 fi
 
-if [ "$recorded" = false ]; then
-  log "COULD NOT RECORD: $incomplete_reason"
+if [ "$complete" = false ]; then
+  log "RECORDING NOT COMPLETE: $incomplete_reason"
   log "--- install.log (tail) ---"
   tail -n 30 "$OUTDIR/install.log" >&2 2>/dev/null || true
 fi
