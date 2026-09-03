@@ -59,7 +59,7 @@ pub struct ParseStats {
     /// Diagnostics that specifically report strace losing data. Unlike ordinary chatter these do
     /// force PARTIAL, because the stream is then genuinely missing events.
     pub diagnostic_data_loss: u64,
-    /// Syscalls that indicate untraced execution channels or anti-debugging evasion (`io_uring`, `ptrace`).
+    /// Syscalls that indicate anti-debugging evasion or tracer manipulation (`ptrace`).
     pub evasion_attempts: u64,
     /// First evasion syscall signature encountered, for diagnostic reporting.
     pub first_evasion: Option<String>,
@@ -1049,13 +1049,7 @@ impl Parser {
                 }
             }
 
-            // ---- evasion & untraced channels ----------------------------------------------------
-            "io_uring_enter" => {
-                self.stats.evasion_attempts += 1;
-                if self.stats.first_evasion.is_none() {
-                    self.stats.first_evasion = Some(format!("io_uring_enter({args_text})"));
-                }
-            }
+            // ---- evasion & anti-debugging -------------------------------------------------------
             "ptrace" => {
                 // A successful ptrace(PTRACE_TRACEME) = 0 is the child handshake allowing strace to attach.
                 // An anti-debugging check calls PTRACE_TRACEME expecting -1 EPERM to detect analysis,

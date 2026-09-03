@@ -663,18 +663,20 @@ fn every_emitted_event_carries_full_provenance() {
 }
 
 #[test]
-fn evasion_syscalls_are_counted_as_evasion_attempts() {
+fn ptrace_anti_debugging_and_attach_are_counted_as_evasion() {
     let mut parser = Parser::new(FIXTURE_START_EPOCH);
-    parser.feed_line("1700000000.000100 io_uring_enter(3, 1, 0, 0) = 1", 1);
+    // Anti-debugging probe: fails with EPERM when strace is already attached
     parser.feed_line(
-        "1700000000.000300 ptrace(PTRACE_TRACEME, 0, 0, 0) = -1 EPERM",
+        "1700000000.000100 ptrace(PTRACE_TRACEME, 0, 0, 0) = -1 EPERM",
         1,
     );
+    // Process hijacking / tracing interference
+    parser.feed_line("1700000000.000200 ptrace(PTRACE_ATTACH, 1337, 0, 0) = 0", 1);
 
     assert_eq!(
         parser.stats().evasion_attempts,
         2,
-        "io_uring ring submission and ptrace anti-debugging must be counted to force PARTIAL"
+        "anti-debugging probe and attach attempts must be counted to force PARTIAL"
     );
 }
 
