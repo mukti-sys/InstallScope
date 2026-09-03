@@ -40,8 +40,9 @@ InstallScope provides runtime behavioral observation designed specifically for C
 Evaluate an included forensic trace fixture without any Linux or kernel prerequisites:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/mukti-sys/InstallScope.git && cd InstallScope
+# 1. Clone the repository and enter the directory
+git clone https://github.com/mukti-sys/InstallScope.git
+cd InstallScope
 
 # 2. Evaluate a sample recording against the deterministic rule catalog
 cargo run -p installscope -- report corpus/demo/high.jsonl
