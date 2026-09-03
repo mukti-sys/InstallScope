@@ -54,7 +54,7 @@ const TRACE_SET: &str = concat!(
     "chmod,fchmodat,chown,lchown,fchownat,link,linkat,symlink,symlinkat,",
     "socket,connect,sendto,sendmsg,send,sendmmsg,",
     "execve,execveat,clone,clone3,fork,vfork,",
-    "io_uring_enter,ptrace"
+    "ptrace"
 );
 
 /// Terminates a traced process and its entire process tree.
