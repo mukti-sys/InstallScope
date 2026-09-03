@@ -60,6 +60,12 @@ evaluated, diffed and re-rendered on any machine.
 `action/README.md` explains why recording and commenting are two separate workflows: the recording job
 executes untrusted install scripts, so it must never hold a token that can write to the repository.
 
+### Backend architecture & CI execution
+- **`strace` (v1.0)**: Primary engine for `installscope record` and GitHub Actions (`action/record`). Traces filesystem writes, credential reads, network connects, DNS queries, and spawned processes with zero root/eBPF privileges required.
+- **`aya` eBPF (v1.1)**: Optional in-kernel backend verified against `strace` via the parity suite (`installscope parity`). Standard PR workflows run `strace` because hosted runners do not grant eBPF root privileges by default.
+- **Process spawn parity**: `strace` and `aya` hook execution at slightly different boundaries (shebang script execution vs binary interpreter invocation), so cross-backend process spawn parity is classified as best-effort.
+- **Unresolved paths**: Relative paths without a determinable parent directory are counted and displayed in reports, but deliberately not scored as outside-zone to avoid manufacturing false criticals.
+
 ---
 
 ## Phase 0: Kill Gates

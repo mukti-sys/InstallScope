@@ -98,6 +98,9 @@ write token.
 
 - **No `fail-on` default.** PRD.md:43 makes the comment advisory; blocking is opt-in per repository via
   the `fail-above` input. `Scope.md`:38 refuses blocking-by-default outright.
+- **Strace backend in CI.** The `action/record` composite action runs the `strace` engine (v1.0). GitHub-hosted
+  runners do not grant root eBPF capabilities by default, so while the `aya` backend (v1.1) is verified
+  via local parity testing and dedicated CI workflows (`phase2-aya.yml`), PR workflows execute `strace`.
 - **No network egress.** The recorder uploads nothing. `installscope snapshot push` writes to a local
   directory that becomes an artifact; Architecture.md:103 forbids the product having network authority.
 - **No telemetry.** Rules.md §1: "we watch packages, not people."

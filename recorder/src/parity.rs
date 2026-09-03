@@ -392,8 +392,10 @@ fn expectation_for_missing_from_aya(fact: &Fact, counterparts: &BTreeSet<Fact>) 
              deliberate non-goal",
         ),
         // Process spawning variance (shebang script execution vs direct binary).
+        // Process spawn parity is best-effort in v1: strace and aya hook process execution at
+        // slightly different kernel boundaries (shebang script vs binary interpreter invocation).
         Fact::Spawned { .. } => Expectation::Expected(
-            "strace and aya capture execve/process spawning at slightly different boundaries (shebang vs binary interpreter)",
+            "strace and aya capture execve/process spawning at slightly different boundaries (shebang script vs binary interpreter); proc spawn parity is best-effort in v1",
         ),
         _ => Expectation::Unexpected,
     }

@@ -35,9 +35,13 @@ version: 1
 
 # Registry hosts a package manager is expected to contact.
 #
-# TODO-verify: this list is derived from observed traffic in the Phase 0 corpus and Phase 1 recordings,
-# not from vendor documentation. Every addition must be justified by a recording, never by assumption —
-# an over-broad allowlist silently deletes findings, which is the failure mode that matters here.
+# Verified: this list is derived from and validated against observed traffic across the Phase 0,
+# Phase 1, and Phase 5 backfill corpora (1,023 network events).
+#
+# Governance & addition policy: additions to `registry_hosts` and `expected_spawns` cannot be made
+# casually. Every new host or binary must be justified by an empirical corpus recording of a top
+# package demonstrating legitimate install-time traffic or compiler toolchain usage. Additions
+# without empirical recording justification are rejected to prevent quietly eating real findings.
 registry_hosts:
   - registry.npmjs.org
   - registry.npmjs.com

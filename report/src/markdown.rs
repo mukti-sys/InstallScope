@@ -95,7 +95,7 @@ pub fn render_markdown(analysis: &Analysis, context: &ReportContext) -> String {
         let _ = writeln!(
             out,
             "> {} path{} could not be resolved to an absolute location and were not checked against \
-             the expected directories.\n",
+             the expected directories (unresolved paths are not scored as outside-zone to avoid false criticals).\n",
             analysis.unresolved_paths,
             if analysis.unresolved_paths == 1 { "" } else { "s" }
         );
@@ -130,7 +130,7 @@ pub fn render_markdown(analysis: &Analysis, context: &ReportContext) -> String {
     let _ = writeln!(
         out,
         "\n<sub>Recorded with the {} backend. Advisory: this comment reports what the install did, \
-         and does not block the build.</sub>",
+         and does not block the build (configure `fail-above` to enforce a threshold).</sub>",
         analysis.coverage.backend
     );
 

@@ -171,7 +171,8 @@ fn render_caveats(out: &mut String, analysis: &Analysis) {
             writeln!(
             out,
             "<div class=\"callout caveat\">\n<p>{} path{} could not be resolved to an absolute \
-             location and {} not checked against the expected directories.</p>\n</div>\n",
+             location and {} not checked against the expected directories (unresolved paths are not \
+             scored as outside-zone to avoid false criticals).</p>\n</div>\n",
             analysis.unresolved_paths,
             if analysis.unresolved_paths == 1 { "" } else { "s" },
             if analysis.unresolved_paths == 1 { "was" } else { "were" },
