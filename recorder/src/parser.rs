@@ -61,6 +61,8 @@ pub struct ParseStats {
     pub diagnostic_data_loss: u64,
     /// Syscalls that indicate untraced execution channels or anti-debugging evasion (`io_uring`, `ptrace`).
     pub evasion_attempts: u64,
+    /// First evasion syscall signature encountered, for diagnostic reporting.
+    pub first_evasion: Option<String>,
     /// Events produced.
     pub events_emitted: u64,
 }
@@ -1050,17 +1052,25 @@ impl Parser {
             // ---- evasion & untraced channels ----------------------------------------------------
             "io_uring_enter" => {
                 self.stats.evasion_attempts += 1;
+                if self.stats.first_evasion.is_none() {
+                    self.stats.first_evasion = Some(format!("io_uring_enter({args_text})"));
+                }
             }
             "ptrace" => {
                 // A successful ptrace(PTRACE_TRACEME) = 0 is the child handshake allowing strace to attach.
                 // An anti-debugging check calls PTRACE_TRACEME expecting -1 EPERM to detect analysis,
                 // or calls PTRACE_ATTACH / PTRACE_SEIZE to interfere with tracing.
-                let is_benign_traceme = args
-                    .first()
-                    .is_some_and(|a| a.starts_with("PTRACE_TRACEME"))
+                let first_arg = args.first().map(String::as_str).unwrap_or_default();
+                let is_benign_traceme = (first_arg.contains("PTRACE_TRACEME")
+                    || first_arg == "0"
+                    || first_arg == "0x0")
                     && ret.ok == Some(true);
                 if !is_benign_traceme {
                     self.stats.evasion_attempts += 1;
+                    if self.stats.first_evasion.is_none() {
+                        self.stats.first_evasion =
+                            Some(format!("ptrace({args_text}) = {ret_text}"));
+                    }
                 }
             }
 

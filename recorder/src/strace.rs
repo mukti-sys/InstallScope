@@ -507,9 +507,14 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         });
     }
     if stats.evasion_attempts > 0 {
+        let first_evasion_suffix = stats
+            .first_evasion
+            .as_deref()
+            .map(|f| format!(", e.g. {f}"))
+            .unwrap_or_default();
         reasons.push(IncompleteReason::Other {
             detail: format!(
-                "process attempted untraced execution or anti-debugging ({} evasion syscall{})",
+                "process attempted untraced execution or anti-debugging ({} evasion syscall{}{first_evasion_suffix})",
                 stats.evasion_attempts,
                 if stats.evasion_attempts == 1 { "" } else { "s" },
             ),
