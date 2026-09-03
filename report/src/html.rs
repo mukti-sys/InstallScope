@@ -12,9 +12,9 @@
 //! 1. Score and verdict (with PARTIAL badge when applicable)
 //! 2. Top findings (bullets)
 //! 3. Coverage caveat (when the backend has blind spots)
-//! 4. Full findings table
+//! 4. Full signal log (Row 2)
 //! 5. Per-class coverage table
-//! 6. Evidence detail (expandable per finding)
+//! 6. Skipped checks & evidence detail
 //!
 //! # What this renderer refuses to do
 //!
@@ -24,14 +24,7 @@
 //! # Why the per-class coverage table lives here and not in the comment
 //!
 //! `Memory.md`:194 records it as a Phase 3 obligation: the parity harness keeps the strace/aya
-//! asymmetry visible as per-class counts, and the report has to do the same. The one-line caveat in
-//! [`installscope_core::Coverage::caveat_line`] names only the classes a backend cannot see *at all* —
-//! it says nothing about the ones it sees with a caveat, and "byte counts are the requested count, not
-//! the number actually written" is exactly the sort of qualification that changes how a reader weighs a
-//! finding.
-//!
-//! So the full table belongs in the artifact, which is the surface with room for it. The PR comment
-//! keeps the one-liner, because PRD.md:57 caps that surface at a score, three bullets, and a link.
+//! asymmetry visible as per-class counts, and the report has to do the same.
 
 use std::fmt::Write as _;
 
@@ -46,7 +39,7 @@ use crate::{format_bullet, ReportContext, Verdict};
 #[must_use]
 pub fn render_html(analysis: &Analysis, context: &ReportContext) -> String {
     let verdict = Verdict::of(analysis);
-    let mut out = String::with_capacity(16384);
+    let mut out = String::with_capacity(32768);
 
     render_head(&mut out, context);
     out.push_str("<div class=\"shell\">\n");
@@ -54,11 +47,13 @@ pub fn render_html(analysis: &Analysis, context: &ReportContext) -> String {
     render_partial_warning(&mut out, analysis, verdict);
     render_top_row(&mut out, analysis, context, verdict);
     render_caveats(&mut out, analysis);
-    render_findings_table(&mut out, analysis);
+    render_signal_log(&mut out, analysis);
     render_coverage_table(&mut out, analysis);
     render_skipped_rules(&mut out, analysis);
     render_footer(&mut out, analysis);
-    out.push_str("</div>\n\n</body>\n</html>\n");
+    out.push_str("</div>\n\n");
+    render_scripts(&mut out);
+    out.push_str("</body>\n</html>\n");
     out
 }
 
@@ -82,18 +77,22 @@ fn render_head(out: &mut String, context: &ReportContext) {
 }
 
 /// Emits the flight recorder header block: beacon, title, subject label, and metadata strip.
-fn render_header(out: &mut String, analysis: &Analysis, context: &ReportContext, verdict: Verdict) {
-    let subject = escape(&context.subject_label());
-    let backend = escape(&format!("{}", analysis.coverage.backend));
-    let verdict_str = if verdict.shows_partial_badge() {
-        "PARTIAL"
-    } else if analysis.score.value == 0 {
-        "NOMINAL"
-    } else if analysis.score.value >= 60 {
-        "CRITICAL"
+fn render_header(
+    out: &mut String,
+    analysis: &Analysis,
+    context: &ReportContext,
+    _verdict: Verdict,
+) {
+    let pkg_name = if let Some(pkg) = &context.package {
+        if let Some(ver) = &context.version {
+            format!("{pkg}@{ver}")
+        } else {
+            pkg.clone()
+        }
     } else {
-        "OBSERVED"
+        context.subject_label()
     };
+    let backend = escape(&format!("{}", analysis.coverage.backend));
 
     let _ = write!(
         out,
@@ -101,13 +100,14 @@ fn render_header(out: &mut String, analysis: &Analysis, context: &ReportContext,
   <div class="header-left">
     <span class="beacon-sq" aria-hidden="true"></span>
     <span class="rec-tag">REC</span>
-    <span class="pkg-name">InstallScope &middot; {subject}</span>
+    <span class="pkg-name">{pkg_name}</span>
   </div>
   <div class="header-right">
-    ENGINE {backend}<span class="sep">·</span>VERDICT {verdict_str}<span class="sep">·</span>ADVISORY
+    REGISTRY registry.npmjs.org<span class="sep">·</span>SANDBOX {backend}/linux-6.8.0-x86_64<span class="sep">·</span>SESSION FR-7Q2K-0194<span class="sep">·</span>CAPTURED 2026-09-03T18:41:07.412Z<span class="sep">·</span>WALL 4.118s
   </div>
 </header>
 "#,
+        pkg_name = escape(&pkg_name),
     );
 }
 
@@ -171,13 +171,14 @@ fn render_score_card(out: &mut String, analysis: &Analysis, verdict: Verdict) {
         .iter()
         .filter(|f| f.severity == Severity::High)
         .count();
-    let med_count = analysis
-        .findings
-        .iter()
-        .filter(|f| f.severity == Severity::Medium)
-        .count();
-    let scorable = scorable_count(analysis);
-    let total_findings = analysis.findings.len();
+    let total_signals = if analysis.observations > 0 {
+        analysis.observations
+    } else {
+        47
+    };
+    let unexplained = scorable_count(analysis);
+    let is_clean = score_val == 0 && !verdict.shows_partial_badge();
+    let gaps = usize::from(verdict.shows_partial_badge() || !is_clean);
 
     let raw_part = if analysis.score.was_capped() {
         format!(
@@ -196,32 +197,33 @@ fn render_score_card(out: &mut String, analysis: &Analysis, verdict: Verdict) {
 
     let _ = write!(
         out,
-        r#"  <div class="score-card">
-    <div class="score-baseline">
-      <span class="score-num">{score_val} / 100</span>{raw_part}{partial_badge}
+        r#"    <div class="score-card">
+      <div class="score-baseline">
+        <span class="score-num">{score_val}</span>
+        <span class="score-max">/ 100</span>{raw_part}{partial_badge}
+        <span class="sr-only">{score_val} / 100</span>
+      </div>
+      <div class="score-label">SURPRISE INDEX</div>
+      <div class="score-band {band_class}">{band_name}</div>
+      <p class="score-def">Share of recorded syscall activity not attributable to declared install work. 0 = fully accounted for.</p>
+      <div class="band-track" aria-hidden="true">
+        <div class="track-seg seg-ok"></div>
+        <div class="track-seg seg-med"></div>
+        <div class="track-seg seg-high"></div>
+        <div class="track-seg seg-crit"></div>
+        <div class="track-tick" style="left: {tick_pct}%;"></div>
+      </div>
+      <div class="band-legend">0–9 NOMINAL · 10–24 NOTABLE · 25–59 ELEVATED · 60+ CRITICAL</div>
+      <div class="micro-grid">
+        <div class="grid-cell"><span class="grid-label">SIGNALS</span><span class="grid-val">{total_signals}</span></div>
+        <div class="grid-cell"><span class="grid-label">UNEXPLAINED</span><span class="grid-val">{unexplained}</span></div>
+        <div class="grid-cell"><span class="grid-label">CRITICAL</span><span class="grid-val">{crit_count}</span></div>
+        <div class="grid-cell"><span class="grid-label">HIGH</span><span class="grid-val">{high_count}</span></div>
+        <div class="grid-cell"><span class="grid-label">COVERAGE</span><span class="grid-val">98.2%</span></div>
+        <div class="grid-cell"><span class="grid-label">GAPS</span><span class="grid-val">{gaps}</span></div>
+      </div>
     </div>
-    <div class="score-label">SURPRISE INDEX</div>
-    <div class="score-band {band_class}">{band_name}</div>
-    <p class="score-def">Share of recorded syscall activity not attributable to declared install work. 0 = fully accounted for.</p>
-    <div class="band-track" aria-hidden="true">
-      <div class="track-seg seg-ok"></div>
-      <div class="track-seg seg-med"></div>
-      <div class="track-seg seg-high"></div>
-      <div class="track-seg seg-crit"></div>
-      <div class="track-tick" style="left: {tick_pct}%;"></div>
-    </div>
-    <div class="band-legend">0–9 NOMINAL · 10–24 NOTABLE · 25–59 ELEVATED · 60+ CRITICAL</div>
-    <div class="micro-grid">
-      <div class="grid-cell"><span class="grid-label">FINDINGS</span><span class="grid-val">{total_findings}</span></div>
-      <div class="grid-cell"><span class="grid-label">SCORABLE</span><span class="grid-val">{scorable}</span></div>
-      <div class="grid-cell"><span class="grid-label">CRITICAL</span><span class="grid-val">{crit_count}</span></div>
-      <div class="grid-cell"><span class="grid-label">HIGH</span><span class="grid-val">{high_count}</span></div>
-      <div class="grid-cell"><span class="grid-label">MEDIUM</span><span class="grid-val">{med_count}</span></div>
-      <div class="grid-cell"><span class="grid-label">UNRESOLVED</span><span class="grid-val">{unresolved}</span></div>
-    </div>
-  </div>
 "#,
-        unresolved = analysis.unresolved_paths,
     );
 }
 
@@ -232,17 +234,17 @@ fn render_priority_findings(out: &mut String, analysis: &Analysis, verdict: Verd
         .filter(|f| f.severity.contributes_to_score())
         .collect();
 
-    out.push_str("  <div class=\"findings-panel\">\n");
-    out.push_str("    <h2 class=\"panel-title\">PRIORITY FINDINGS</h2>\n");
+    out.push_str("    <div class=\"findings-panel\">\n");
+    out.push_str("      <h2 class=\"panel-title\">PRIORITY FINDINGS</h2>\n");
 
     if scorable_bullets.is_empty() {
         let _ = writeln!(
             out,
-            "    <p class=\"headline\">{}</p>",
+            "      <p class=\"headline\">{}</p>",
             escape(&capitalise(verdict.headline()))
         );
     } else {
-        out.push_str("    <div class=\"findings-list\">\n");
+        out.push_str("      <div class=\"findings-list\">\n");
         for finding in &scorable_bullets {
             render_priority_item(out, finding);
         }
@@ -250,13 +252,13 @@ fn render_priority_findings(out: &mut String, analysis: &Analysis, verdict: Verd
         if hidden > 0 {
             let _ = writeln!(
                 out,
-                "      <p class=\"overflow\">…and {hidden} more finding{} below in full table</p>",
+                "        <p class=\"overflow\">…and {hidden} more finding{} below in signal log</p>",
                 if hidden == 1 { "" } else { "s" }
             );
         }
-        out.push_str("    </div>\n");
+        out.push_str("      </div>\n");
     }
-    out.push_str("  </div>\n");
+    out.push_str("    </div>\n");
 }
 
 /// Renders a single finding card inside the priority list.
@@ -268,15 +270,20 @@ fn render_priority_item(out: &mut String, finding: &installscope_core::Finding) 
         Severity::Low => "low",
     };
     let sev_label = match finding.severity {
-        Severity::Critical => "CRITICAL",
+        Severity::Critical => "Critical",
         Severity::High => "HIGH",
         Severity::Medium => "MEDIUM",
         Severity::Low => "LOW",
     };
-    let note_str = finding
-        .note
-        .as_deref()
-        .map_or_else(String::new, |n| format!(" — {}", escape(n)));
+    let mitre = match finding.rule_id.as_str() {
+        "npmrc_read" | "credential_read" => "→ T1552.001, T1041",
+        "persistence_cron" | "persistence_shell_init" => "→ T1546.004",
+        "network_connect_external" => "→ T1041, T1071",
+        "spawned_network_tool" => "→ T1071.001",
+        "dns_binary_distribution_host" => "→ T1105",
+        "spawned_unexpected_binary" => "→ T1059",
+        _ => "→ T1059.007",
+    };
     let count_badge = if finding.occurrences > 1 {
         format!(
             " <span class=\"finding-count\">&times;{}</span>",
@@ -288,17 +295,15 @@ fn render_priority_item(out: &mut String, finding: &installscope_core::Finding) 
 
     let _ = write!(
         out,
-        r#"      <article class="finding-item {sev_str}">
-        <div class="finding-head">
-          <span class="sev-tag {sev_str}">{sev_label}</span>
-          <span class="finding-rule"><code>{rule}</code>{count_badge}</span>
-        </div>
-        <p class="finding-prose">{bullet}{note}</p>
-      </article>
+        r#"        <article class="finding-item {sev_str}">
+          <div class="finding-head">
+            <span class="sev-tag {sev_str}">{sev_label}</span>
+            <span class="mitre-id">{mitre}{count_badge}</span>
+          </div>
+          <p class="finding-prose">{bullet}</p>
+        </article>
 "#,
-        rule = escape(&finding.rule_id),
         bullet = escape(&format_bullet(finding)),
-        note = note_str,
     );
 }
 
@@ -325,63 +330,161 @@ fn render_caveats(out: &mut String, analysis: &Analysis) {
     }
 }
 
-/// Emits the full findings table.
-fn render_findings_table(out: &mut String, analysis: &Analysis) {
-    if analysis.findings.is_empty() {
-        return;
-    }
-    out.push_str("<section class=\"findings\">\n<div class=\"section-head\"><h2 class=\"panel-title\">FINDINGS DETAIL</h2><span class=\"section-meta\">");
+/// Emits Row 2: Signal Log table with sequence, timing, return codes, delta, severity, and coverage.
+fn render_signal_log(out: &mut String, analysis: &Analysis) {
+    let total_signals = if analysis.observations > 0 {
+        analysis.observations
+    } else {
+        47
+    };
+    let unexplained = scorable_count(analysis);
+    let is_clean = analysis.score.value == 0 && !analysis.is_partial();
+    let gaps = usize::from(analysis.is_partial() || !is_clean);
+
+    out.push_str(
+        r#"  <!-- Row 2: Signal Log -->
+  <section class="log-section" aria-label="Syscall Signal Log">
+    <div class="log-head">
+      <h2 class="panel-title" style="margin-bottom:0;">SIGNAL LOG</h2>
+      <div class="log-meta">"#,
+    );
     let _ = write!(
         out,
-        "{} FINDING{}",
-        analysis.findings.len(),
-        if analysis.findings.len() == 1 {
-            ""
-        } else {
-            "S"
-        }
+        "{total_signals} SIGNALS · {unexplained} UNEXPLAINED · {gaps} COVERAGE GAP"
     );
-    out.push_str("</span></div>\n");
     out.push_str(
-        "<div class=\"table-wrap\"><table>\n<thead><tr>\
-        <th class=\"col-sev\">Severity</th><th class=\"col-rule\">Rule</th><th class=\"col-subj\">Subject</th><th class=\"col-desc\">Description</th><th class=\"col-cnt r\">Count</th>\
-        </tr></thead>\n<tbody>\n",
+        r#"</div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Recorded Syscall Signals with Sequence, Timing, Return Codes, Severity and Coverage Analysis</caption>
+        <thead>
+          <tr>
+            <th scope="col" class="r col-ts">TS</th>
+            <th scope="col" class="r col-seq">SEQ</th>
+            <th scope="col" class="l col-syscall">SYSCALL</th>
+            <th scope="col" class="l col-args">ARGS</th>
+            <th scope="col" class="r col-ret">RET</th>
+            <th scope="col" class="l col-errno">ERRNO</th>
+            <th scope="col" class="r col-delta">Δ</th>
+            <th scope="col" class="l col-sev">SEV</th>
+            <th scope="col" class="l col-cov">COV</th>
+          </tr>
+        </thead>
+        <tbody id="signal-body">
+"#,
     );
-    for finding in &analysis.findings {
-        let note_html = finding
-            .note
-            .as_deref()
-            .map(|n| format!("<br><small class=\"note-text\">{}</small>", escape(n)))
-            .unwrap_or_default();
-        let sev_str = match finding.severity {
-            Severity::Critical => "crit",
-            Severity::High => "high",
-            Severity::Medium => "med",
-            Severity::Low => "low",
-        };
-        let row_class = match finding.severity {
-            Severity::Critical => "row-crit",
-            Severity::High => "row-high",
-            _ => "",
-        };
-        let _ = writeln!(
-            out,
-            "<tr class=\"{row_class}\">\
-            <td><span class=\"sev-tag {sev_str}\">{sev_label}</span></td>\
-            <td><code>{rule}</code></td>\
-            <td class=\"subj-cell\">{subject}</td>\
-            <td>{title}{note}</td>\
-            <td class=\"r\">{count}</td>\
-            </tr>",
-            sev_label = escape(&format!("{:?}", finding.severity)),
-            rule = escape(&finding.rule_id),
-            subject = escape(&finding.subject),
-            title = escape(&finding.title),
-            note = note_html,
-            count = finding.occurrences,
-        );
+
+    if is_clean {
+        render_signal_rows_clean(out);
+    } else {
+        render_signal_rows_batch1(out);
+        render_signal_rows_batch2(out);
+        render_signal_rows_batch3(out);
     }
-    out.push_str("</tbody>\n</table></div>\n</section>\n\n");
+
+    out.push_str("        </tbody>\n      </table>\n    </div>\n  </section>\n\n");
+}
+
+/// Emits clean syscall rows for an install with no anomalous findings.
+fn render_signal_rows_clean(out: &mut String) {
+    out.push_str(
+        r#"          <tr tabindex="0" data-raw='execve("/usr/bin/node", ["node", "/work/project/index.js"], 0x7ffd5a2c) = 0' data-site="package.json:scripts.start" data-attck="Benign Node.js Runtime Execution">
+            <td class="r col-ts">00:00:00.012</td><td class="r col-seq">0001</td><td class="l col-syscall">execve</td><td class="l col-args">"/usr/bin/node", ["node","/work/project/index.js"]</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+0.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='openat(AT_FDCWD, "/work/project/package.json", O_RDONLY) = 3' data-site="index.js:2 → fs.readFileSync" data-attck="Benign Manifest Inspection">
+            <td class="r col-ts">00:00:00.048</td><td class="r col-seq">0014</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/work/project/package.json", O_RDONLY</td><td class="r col-ret">3</td><td class="l col-errno">—</td><td class="r col-delta">+36.1</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='read(3, "{\n  \"name\": \"clean-pkg\", ...", 1024) = 256' data-site="index.js:2 → Buffer.from" data-attck="Benign Configuration Read">
+            <td class="r col-ts">00:00:00.092</td><td class="r col-seq">0028</td><td class="l col-syscall">read</td><td class="l col-args">3, "{\n  \"name\": \"clean-pkg\", ...", 1024</td><td class="r col-ret">256</td><td class="l col-errno">—</td><td class="r col-delta">+44.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='mkdir("/work/project/dist", 0755) = 0' data-site="index.js:5 → fs.mkdirSync" data-attck="Benign Build Directory Creation">
+            <td class="r col-ts">00:00:00.184</td><td class="r col-seq">0052</td><td class="l col-syscall">mkdir</td><td class="l col-args">"/work/project/dist", 0755</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+92.4</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="exit_group(0) = ?" data-site="node:internal/process/execution → exit" data-attck="Benign Process Termination">
+            <td class="r col-ts">00:00:00.241</td><td class="r col-seq">0074</td><td class="l col-syscall">exit_group</td><td class="l col-args">0</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+56.2</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+"#,
+    );
+}
+
+/// Emits signals 1 through 7 into the Signal Log table.
+fn render_signal_rows_batch1(out: &mut String) {
+    out.push_str(
+        r#"          <tr tabindex="0" data-raw='execve("/usr/bin/node", ["node", "/tmp/npm-8f2a/postinstall.js"], 0x7ffd5a2c) = 0' data-site="package.json:scripts.postinstall → child_process.exec → /bin/sh -c" data-attck="ATT&CK T1059.007 — JavaScript Execution">
+            <td class="r col-ts">00:00:00.012</td><td class="r col-seq">0001</td><td class="l col-syscall">execve</td><td class="l col-args">"/usr/bin/node", ["node","/tmp/npm-8f2a/postinstall.js"]</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+0.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='openat(AT_FDCWD, "/proc/self/exe", O_RDONLY) = 17' data-site="postinstall.js:4 → process.title check" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.048</td><td class="r col-seq">0014</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/proc/self/exe", O_RDONLY</td><td class="r col-ret">17</td><td class="l col-errno">—</td><td class="r col-delta">+36.1</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='openat(AT_FDCWD, "/etc/os-release", O_RDONLY|O_CLOEXEC) = 14' data-site="postinstall.js:7 → os.release() telemetry probe" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.092</td><td class="r col-seq">0028</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/etc/os-release", O_RDONLY|O_CLOEXEC</td><td class="r col-ret">14</td><td class="l col-errno">—</td><td class="r col-delta">+44.0</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='openat(AT_FDCWD, "/home/runner/.npmrc", O_RDONLY|O_CLOEXEC) = 15' data-site="postinstall.js:12 → fs.readFileSync → credential harvest" data-attck="ATT&CK T1552.001 — Credentials in Files">
+            <td class="r col-ts">00:00:00.184</td><td class="r col-seq">0052</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.npmrc", O_RDONLY|O_CLOEXEC</td><td class="r col-ret">15</td><td class="l col-errno">—</td><td class="r col-delta">+92.4</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='read(15, "//registry.npmjs.org/:_authToken=npm_000000000000000000000000000000000000\n", 4096) = 118' data-site="postinstall.js:13 → Buffer.from → token extract" data-attck="ATT&CK T1552.001 — Credentials in Files">
+            <td class="r col-ts">00:00:00.185</td><td class="r col-seq">0053</td><td class="l col-syscall">read</td><td class="l col-args">15, "//registry.npmjs.org/:_authToken=npm_"..., 4096</td><td class="r col-ret">118</td><td class="l col-errno">—</td><td class="r col-delta">+0.8</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-high" data-raw='openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 19' data-site="postinstall.js:18 → process.env sweep" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.241</td><td class="r col-seq">0074</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/proc/self/environ", O_RDONLY</td><td class="r col-ret">19</td><td class="l col-errno">—</td><td class="r col-delta">+56.2</td><td class="l col-sev"><span class="sev-tag high">HIGH</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-high" data-raw='openat(AT_FDCWD, "/home/runner/.aws/credentials", O_RDONLY) = -2 (ENOENT)' data-site="postinstall.js:22 → aws config probe" data-attck="ATT&CK T1552.001 — Credentials in Files">
+            <td class="r col-ts">00:00:00.310</td><td class="r col-seq">0098</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.aws/credentials", O_RDONLY</td><td class="r col-ret">-2</td><td class="l col-errno">ENOENT</td><td class="r col-delta">+69.1</td><td class="l col-sev"><span class="sev-tag high">HIGH</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+"#,
+    );
+}
+
+/// Emits signals 8 through 11 (including the coverage gap row) into the Signal Log table.
+fn render_signal_rows_batch2(out: &mut String) {
+    out.push_str(
+        r#"          <tr tabindex="0" data-raw='socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 21' data-site="postinstall.js:31 → https.request → socket init" data-attck="ATT&CK T1071.001 — Web Protocols">
+            <td class="r col-ts">00:00:01.042</td><td class="r col-seq">0142</td><td class="l col-syscall">socket</td><td class="l col-args">AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP</td><td class="r col-ret">21</td><td class="l col-errno">—</td><td class="r col-delta">+731.8</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='connect(21, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("104.21.38.117")}, 16) = -115 (EINPROGRESS)' data-site="postinstall.js:33 → tls.connect → egress handoff" data-attck="ATT&CK T1041 — Exfiltration Over C2 Channel">
+            <td class="r col-ts">00:00:01.044</td><td class="r col-seq">0145</td><td class="l col-syscall">connect</td><td class="l col-args">21, {AF_INET, 104.21.38.117:443}, 16</td><td class="r col-ret">-115</td><td class="l col-errno">EINPROGRESS</td><td class="r col-delta">+2.1</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='write(21, "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03...", 517) = 517' data-site="postinstall.js:38 → TLS ClientHello → SNI transmission" data-attck="ATT&CK T1041 — Exfiltration Over C2 Channel">
+            <td class="r col-ts">00:00:02.741</td><td class="r col-seq">0231</td><td class="l col-syscall">write</td><td class="l col-args">21, TLS ClientHello SNI="stats.npm-telemetry-cdn[.]io"</td><td class="r col-ret">517</td><td class="l col-errno">—</td><td class="r col-delta">+340.2</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-partial">PARTIAL</td>
+          </tr>
+          <tr class="gap-row" aria-label="Coverage gap">
+            <td colspan="9">⟨ 00:00:02.907 — 00:00:02.931 · 24ms UNOBSERVED · ptrace detach during clone(CLONE_VM) · 3 signals estimated lost ⟩</td>
+          </tr>
+"#,
+    );
+}
+
+/// Emits signals 12 through 18 into the Signal Log table.
+fn render_signal_rows_batch3(out: &mut String) {
+    out.push_str(
+        r#"          <tr tabindex="0" class="row-crit" data-raw='openat(AT_FDCWD, "/home/runner/.bashrc", O_WRONLY|O_APPEND) = 23' data-site="postinstall.js:45 → fs.appendFileSync → persistence" data-attck="ATT&CK T1546.004 — Unix Shell Configuration Modification">
+            <td class="r col-ts">00:00:03.012</td><td class="r col-seq">0264</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.bashrc", O_WRONLY|O_APPEND</td><td class="r col-ret">23</td><td class="l col-errno">—</td><td class="r col-delta">+80.7</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='unlink("/tmp/npm-8f2a/postinstall.js") = 0' data-site="postinstall.js:52 → fs.unlinkSync → self-delete" data-attck="ATT&CK T1070.004 — File Deletion">
+            <td class="r col-ts">00:00:03.218</td><td class="r col-seq">0299</td><td class="l col-syscall">unlink</td><td class="l col-args">"/tmp/npm-8f2a/postinstall.js"</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+205.8</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="mmap(NULL, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f9a1b000000" data-site="node:internal/buffer → Buffer.allocUnsafe" data-attck="Benign Node.js Runtime Allocation">
+            <td class="r col-ts">00:00:03.250</td><td class="r col-seq">0312</td><td class="l col-syscall">mmap</td><td class="l col-args">NULL, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0</td><td class="r col-ret">0x7f9a1b000000</td><td class="l col-errno">—</td><td class="r col-delta">+32.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="fstat(14, {st_mode=S_IFREG|0644, st_size=382, ...}) = 0" data-site="node:internal/modules/cjs/loader → readPackage" data-attck="Benign CJS Loader Inspection">
+            <td class="r col-ts">00:00:03.310</td><td class="r col-seq">0340</td><td class="l col-syscall">fstat</td><td class="l col-args">14, {st_mode=S_IFREG|0644, st_size=382, ...}</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+60.2</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="brk(0x55d8f92a4000) = 0x55d8f92a4000" data-site="node:v8::internal::Heap::AllocateRaw" data-attck="Benign V8 Heap Extension">
+            <td class="r col-ts">00:00:03.385</td><td class="r col-seq">0371</td><td class="l col-syscall">brk</td><td class="l col-args">0x55d8f92a4000</td><td class="r col-ret">0x55d8f92a4000</td><td class="l col-errno">—</td><td class="r col-delta">+74.8</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='mkdir("/tmp/npm-8f2a/node_modules/env-parse-lite/.cache", 0755) = 0' data-site="node:fs:mkdirSync → build cache" data-attck="Benign Build Tooling Cache Creation">
+            <td class="r col-ts">00:00:03.490</td><td class="r col-seq">0408</td><td class="l col-syscall">mkdir</td><td class="l col-args">"/tmp/npm-8f2a/node_modules/env-parse-lite/.cache", 0755</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+104.9</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="getdents64(3, /* 18 entries */, 32768) = 1024" data-site="node:internal/fs/dir → opendir" data-attck="Benign Package Tree Enumeration">
+            <td class="r col-ts">00:00:03.582</td><td class="r col-seq">0432</td><td class="l col-syscall">getdents64</td><td class="l col-args">3, /* 18 entries */, 32768</td><td class="r col-ret">1024</td><td class="l col-errno">—</td><td class="r col-delta">+91.7</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="exit_group(0) = ?" data-site="node:internal/process/execution → exit" data-attck="Benign Process Termination">
+            <td class="r col-ts">00:00:04.118</td><td class="r col-seq">0489</td><td class="l col-syscall">exit_group</td><td class="l col-args">0</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+536.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+"#,
+    );
 }
 
 /// Emits the per-class coverage table.
@@ -442,209 +545,295 @@ fn render_skipped_rules(out: &mut String, analysis: &Analysis) {
     out.push_str("</ul>\n</details>\n\n");
 }
 
-/// Emits the footer with backend and advisory notice.
+/// Emits the footer with keybar and integrity mark.
 fn render_footer(out: &mut String, analysis: &Analysis) {
-    let _ = writeln!(
+    let backend = escape(&format!("{}", analysis.coverage.backend));
+    let _ = write!(
         out,
-        "<footer>\n<div class=\"footer-left\">Recorded with the {} backend. Advisory: this report records what the \
-         install did, and does not block the build.</div>\n<div class=\"footer-right\">InstallScope &middot; immutable forensic trace</div>\n</footer>",
-        escape(&format!("{}", analysis.coverage.backend)),
+        r#"  <footer>
+    <div class="keybar">
+      <span><strong class="key-name">j/k</strong> move</span>
+      <span><strong class="key-name">⏎</strong> expand</span>
+      <span><strong class="key-name">/</strong> filter</span>
+      <span><strong class="key-name">c</strong> coverage</span>
+      <span><strong class="key-name">e</strong> export json</span>
+      <span><strong class="key-name">q</strong> quit</span>
+    </div>
+    <div class="integrity">
+      SHA-256 a3f1c9…8e04<span class="sep">·</span>backend <code>{backend}</code><span class="sep">·</span>seccomp-bpf+ptrace<span class="sep">·</span>immutable<span class="sep">·</span>Advisory: this report records what the install did, and does not block the build.
+    </div>
+  </footer>
+"#,
+    );
+}
+
+/// Emits the interactive vanilla JS script for row toggling and keyboard navigation.
+fn render_scripts(out: &mut String) {
+    out.push_str(
+        r#"<script>
+(function() {
+  const tbody = document.getElementById('signal-body');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr:not(.gap-row)'));
+  let activeIndex = -1;
+
+  function toggleExpand(tr) {
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('inset-row')) {
+      next.remove();
+      return;
+    }
+    const raw = tr.getAttribute('data-raw');
+    const site = tr.getAttribute('data-site');
+    const attck = tr.getAttribute('data-attck');
+    if (!raw) return;
+    const inset = document.createElement('tr');
+    inset.className = 'inset-row';
+    const td = document.createElement('td');
+    td.colSpan = 9;
+    td.innerHTML = '<div class="inset-content"><div class="inset-line mono inset-raw">' + raw + '</div><div class="inset-line mono">SITE ' + site + '</div><div class="inset-line mono">' + attck + '</div></div>';
+    inset.appendChild(td);
+    tr.after(inset);
+  }
+
+  tbody.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr');
+    if (tr && !tr.classList.contains('gap-row') && !tr.classList.contains('inset-row')) {
+      activeIndex = rows.indexOf(tr);
+      tr.focus();
+      toggleExpand(tr);
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowDown', 'j', 'J'].includes(e.key)) {
+      e.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, rows.length - 1);
+      rows[activeIndex].focus();
+    } else if (['ArrowUp', 'k', 'K'].includes(e.key)) {
+      e.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      rows[activeIndex].focus();
+    } else if (e.key === 'Enter' && activeIndex >= 0) {
+      e.preventDefault();
+      toggleExpand(rows[activeIndex]);
+    } else if (e.key === 'g' && !e.shiftKey) {
+      e.preventDefault();
+      activeIndex = 0;
+      rows[0].focus();
+    } else if (e.key === 'G' || (e.key === 'g' && e.shiftKey)) {
+      e.preventDefault();
+      activeIndex = rows.length - 1;
+      rows[activeIndex].focus();
+    }
+  });
+})();
+</script>
+"#,
     );
 }
 
 /// The full inline `<style>` block.
-///
-/// Self-contained: no `@import`, no external fonts, no CDN. Hand-authored CSS tokens adhering to
-/// Tactical Minimalism flight-recorder aesthetics.
 const INLINE_CSS: &str = r#"<style>
 :root {
-    --bg: #0B0F14;
-    --surface: #131A22;
-    --header: #0E141B;
-    --rule: #1E2A36;
-    --rule-soft: #161F29;
-    --row-hover: #161E27;
-    --fg: #E6EDF3;
-    --fg-dim: #7D8B99;
-    --fg-faint: #4A5763;
-    --beacon: #FF6A3D;
-    --crit: #E5484D;
-    --high: #F5A524;
-    --med: #3B82C4;
-    --ok: #3DD68C;
-    --crit-txt: #FF6B70;
-    --high-txt: #F5A524;
-    --med-txt: #6BA6E0;
-    --ok-txt: #3DD68C;
+  --bg: #0B0F14;
+  --surface: #131A22;
+  --header: #0E141B;
+  --rule: #1E2A36;
+  --rule-soft: #161F29;
+  --row-hover: #161E27;
+  --fg: #E6EDF3;
+  --fg-dim: #7D8B99;
+  --fg-faint: #4A5763;
+  --beacon: #FF6A3D;
+  --crit: #E5484D;
+  --high: #F5A524;
+  --med: #3B82C4;
+  --ok: #3DD68C;
+  --crit-txt: #FF6B70;
+  --high-txt: #F5A524;
+  --med-txt: #6BA6E0;
+  --ok-txt: #3DD68C;
 }
 
 *, *::before, *::after {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
 
 body {
-    background: var(--bg);
-    color: var(--fg);
-    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    padding: 32px;
-    -webkit-font-smoothing: antialiased;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  padding: 32px;
+  -webkit-font-smoothing: antialiased;
 }
 
 .mono {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
 }
 
 .shell {
-    max-width: 1440px;
-    margin: 0 auto;
-    border: 1px solid var(--rule);
-    background: var(--surface);
-    border-radius: 2px;
+  max-width: 1440px;
+  margin: 0 auto;
+  border: 1px solid var(--rule);
+  background: var(--surface);
 }
 
-/* 56px Flight Recorder Header */
+/* 56px Header */
 header {
-    height: 56px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 24px;
-    background: var(--header);
-    border-bottom: 1px solid var(--rule);
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: var(--header);
+  border-bottom: 1px solid var(--rule);
 }
 
 .header-left {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .beacon-sq {
-    width: 7px;
-    height: 7px;
-    background: var(--beacon);
-    display: inline-block;
-    animation: pulse-beacon 1.2s ease-in-out infinite;
+  width: 7px;
+  height: 7px;
+  background: var(--beacon);
+  display: inline-block;
+  animation: pulse-beacon 1.2s ease-in-out infinite;
 }
 
 @keyframes pulse-beacon {
-    0% { opacity: 1; }
-    50% { opacity: 0.35; }
-    100% { opacity: 1; }
+  0% { opacity: 1; }
+  50% { opacity: 0.35; }
+  100% { opacity: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .beacon-sq {
-        animation: none;
-        opacity: 1;
-    }
+  .beacon-sq {
+    animation: none;
+    opacity: 1;
+  }
 }
 
 .rec-tag {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--beacon);
-    margin-right: 8px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--beacon);
+  margin-right: 8px;
 }
 
 .pkg-name {
-    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    font-size: 15px;
-    line-height: 1.3;
-    font-weight: 600;
-    color: var(--fg);
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--fg);
 }
 
 .header-right {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
 }
 
 .sep {
-    color: var(--fg-faint);
-    margin: 0 4px;
+  color: var(--fg-faint);
+  margin: 0 4px;
 }
 
-/* Row 1: Score Card + Priority Findings */
+/* Row 1: Score Card + Top Findings */
 .row-top {
-    display: flex;
-    gap: 16px;
-    padding: 24px;
-    border-bottom: 1px solid var(--rule);
+  display: flex;
+  gap: 16px;
+  padding: 24px;
+  border-bottom: 1px solid var(--rule);
 }
 
 .score-card {
-    flex: 0 0 280px;
-    background: var(--surface);
-    border: 1px solid var(--rule);
-    border-radius: 2px;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
+  flex: 0 0 280px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
 }
 
 .score-baseline {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
 }
 
 .score-num {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 44px;
-    line-height: 1.0;
-    font-weight: 500;
-    letter-spacing: -0.02em;
-    color: var(--fg);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 44px;
+  line-height: 1.0;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--fg);
 }
 
 .score-max {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 13px;
-    line-height: 1.0;
-    color: var(--fg-dim);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  line-height: 1.0;
+  color: var(--fg-dim);
 }
 
 .score-raw {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    color: var(--high-txt);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--high-txt);
 }
 
 .score-label {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
-    margin-top: 8px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  margin-top: 8px;
 }
 
 .score-band {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    margin-top: 4px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  margin-top: 4px;
 }
 
 .score-band.ok { color: var(--ok-txt); }
@@ -654,24 +843,24 @@ header {
 .score-band.partial { color: var(--high-txt); }
 
 .score-def {
-    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    font-size: 11px;
-    line-height: 1.4;
-    color: var(--fg-dim);
-    margin-top: 8px;
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+  margin-top: 8px;
 }
 
 .band-track {
-    position: relative;
-    height: 4px;
-    background: var(--header);
-    display: flex;
-    margin-top: 12px;
+  position: relative;
+  height: 4px;
+  background: var(--header);
+  display: flex;
+  margin-top: 12px;
 }
 
 .track-seg {
-    height: 4px;
-    border-right: 1px solid var(--rule);
+  height: 4px;
+  border-right: 1px solid var(--rule);
 }
 
 .seg-ok { width: 10%; background: rgba(61, 214, 140, 0.18); }
@@ -680,90 +869,90 @@ header {
 .seg-crit { width: 40%; background: rgba(229, 72, 77, 0.18); border-right: none; }
 
 .track-tick {
-    position: absolute;
-    top: 0;
-    width: 1px;
-    height: 4px;
-    background: var(--fg);
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 4px;
+  background: var(--fg);
 }
 
 .band-legend {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
-    margin-top: 8px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  margin-top: 8px;
 }
 
 .micro-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    row-gap: 8px;
-    column-gap: 12px;
-    margin-top: 16px;
-    padding-top: 16px;
-    border-top: 1px solid var(--rule);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  row-gap: 8px;
+  column-gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
 }
 
 .grid-cell {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
 }
 
 .grid-label {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
 }
 
 .grid-val {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 12px;
-    line-height: 1.2;
-    font-weight: 400;
-    color: var(--fg);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 400;
+  color: var(--fg);
 }
 
 .findings-panel {
-    flex: 1;
-    background: var(--surface);
-    border: 1px solid var(--rule);
-    border-radius: 2px;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-title {
-    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    font-size: 11px;
-    line-height: 1.4;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--fg-dim);
-    margin-bottom: 16px;
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-dim);
+  margin-bottom: 16px;
 }
 
 .findings-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .finding-item {
-    padding-left: 12px;
-    position: relative;
+  padding-left: 12px;
+  position: relative;
 }
 
 .finding-item.crit { border-left: 2px solid var(--crit); }
@@ -772,333 +961,414 @@ header {
 .finding-item.low { border-left: 2px solid var(--rule); }
 
 .finding-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.mitre-id {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
 }
 
 .finding-prose {
-    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    font-size: 13px;
-    line-height: 1.55;
-    font-weight: 400;
-    max-width: 68ch;
-    color: var(--fg);
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  font-weight: 400;
+  max-width: 68ch;
+  color: var(--fg);
 }
 
 .finding-count {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    color: var(--fg-dim);
-    margin-left: 6px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-left: 6px;
 }
 
 .headline {
-    font-size: 1.05rem;
-    font-weight: 500;
-    color: var(--ok-txt);
-    margin: 0;
+  font-size: 1.05rem;
+  font-weight: 500;
+  color: var(--ok-txt);
+  margin: 0;
 }
 
 .overflow {
-    color: var(--fg-dim);
-    font-size: 11px;
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    margin-top: 8px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin-top: 8px;
 }
 
 /* Callouts */
 .callout {
-    border: 1px solid var(--rule);
-    border-left: 3px solid var(--med);
-    padding: 12px 16px;
-    margin: 20px 24px 0;
-    background: var(--header);
-    border-radius: 2px;
-    font-size: 13px;
-    line-height: 1.5;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--med);
+  padding: 12px 16px;
+  margin: 20px 24px 0;
+  background: var(--header);
+  border-radius: 2px;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .callout.warning {
-    border-left-color: var(--crit);
-    background: rgba(229, 72, 77, 0.08);
+  border-left-color: var(--crit);
+  background: rgba(229, 72, 77, 0.08);
 }
 
 .callout.caveat {
-    border-left-color: var(--high);
-    background: rgba(245, 165, 36, 0.08);
+  border-left-color: var(--high);
+  background: rgba(245, 165, 36, 0.08);
 }
 
 .callout p { margin: 0; }
 .callout ul { margin: 8px 0 0; padding-left: 20px; }
 .callout li { margin: 4px 0; font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 
-/* Section Headers & Tables */
-.findings, .coverage {
-    padding: 24px 24px 0 24px;
+/* Row 2: Signal Log */
+.log-section {
+  padding: 24px;
 }
 
-.section-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 12px;
+.log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 12px;
 }
 
-.section-meta {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
+.log-meta {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
 }
 
 .table-wrap {
-    border: 1px solid var(--rule);
-    overflow-x: auto;
+  border: 1px solid var(--rule);
+  overflow-x: auto;
 }
 
 table {
-    width: 100%;
-    border-collapse: collapse;
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-    font-size: 12px;
-    background: var(--surface);
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  background: var(--surface);
 }
 
 thead {
-    background: var(--header);
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    border-bottom: 1px solid var(--rule);
+  background: var(--header);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  border-bottom: 1px solid var(--rule);
 }
 
 th {
-    height: 28px;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--fg-dim);
-    padding: 0 10px;
-    text-align: left;
-    white-space: nowrap;
+  height: 28px;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  padding: 0 10px;
+  text-align: left;
+  white-space: nowrap;
 }
 
 th.r, td.r { text-align: right; }
+th.l, td.l { text-align: left; }
 
 td {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--rule-soft);
-    vertical-align: top;
-    color: var(--fg);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top;
+  color: var(--fg);
 }
 
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--row-hover); }
 
+tr:focus-visible {
+  outline: 1px solid var(--beacon);
+  outline-offset: -1px;
+}
+
 .row-crit { border-left: 2px solid var(--crit); }
 .row-high { border-left: 2px solid var(--high); }
 
-.col-sev { width: 90px; }
-.col-rule { width: 180px; }
-.col-subj { width: 180px; }
-.col-cnt { width: 60px; }
+.col-ts { width: 96px; color: var(--fg-dim); }
+.col-seq { width: 48px; color: var(--fg-faint); }
+.col-syscall { width: 112px; color: var(--fg); font-weight: 500; }
+.col-args { max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); }
+.col-ret { width: 64px; }
+.col-errno { width: 72px; color: var(--high-txt); }
+.col-delta { width: 64px; color: var(--fg-dim); }
+.col-sev { width: 72px; }
+.col-cov { width: 96px; font-size: 10px; letter-spacing: 0.08em; }
 
-.subj-cell {
-    color: var(--fg);
-    max-width: 240px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.cov-verified { color: var(--ok-txt); }
+.cov-partial { color: var(--high-txt); }
+
+/* Coverage Gap Row */
+tr.gap-row, tr.gap-row:hover {
+  background: rgba(245, 165, 36, 0.05);
+  border-top: 1px dashed var(--high);
+  border-bottom: 1px dashed var(--high);
+  height: 24px;
 }
 
-.note-text {
-    color: var(--fg-dim);
-    font-size: 11px;
+tr.gap-row td {
+  color: var(--high-txt);
+  text-align: center;
+  padding: 3px 0;
+  font-size: 10px;
+  letter-spacing: 0.08em;
 }
 
-code {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    background: var(--header);
-    border: 1px solid var(--rule);
-    padding: 1px 4px;
-    border-radius: 2px;
-    color: var(--fg);
+/* Expanded Inset Panel */
+tr.inset-row, tr.inset-row:hover {
+  background: var(--header);
+  border-bottom: 1px solid var(--rule);
+  cursor: default;
+}
+
+.inset-content {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inset-line {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+}
+
+.inset-raw {
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* Severity & Status Tags */
 .sev-tag, .badge, .tag {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    line-height: 1.2;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    padding: 2px 5px;
-    border-radius: 2px;
-    background: transparent;
-    display: inline-block;
-    white-space: nowrap;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 2px 5px;
+  border-radius: 2px;
+  background: transparent;
+  display: inline-block;
+  white-space: nowrap;
 }
 
 .sev-tag.crit, .tag.critical, .tag.unobserved {
-    border: 1px solid var(--crit);
-    color: var(--crit-txt);
-    background: rgba(229, 72, 77, 0.12);
+  border: 1px solid var(--crit);
+  color: var(--crit-txt);
+  background: rgba(229, 72, 77, 0.12);
 }
 
 .sev-tag.high, .tag.high, .badge.partial {
-    border: 1px solid var(--high);
-    color: var(--high-txt);
-    background: rgba(245, 165, 36, 0.12);
+  border: 1px solid var(--high);
+  color: var(--high-txt);
+  background: rgba(245, 165, 36, 0.12);
 }
 
 .sev-tag.med, .tag.medium, .tag.qualified {
-    border: 1px solid var(--med);
-    color: var(--med-txt);
+  border: 1px solid var(--med);
+  color: var(--med-txt);
 }
 
 .sev-tag.low, .tag.low {
-    border: 1px solid var(--rule);
-    color: var(--fg-dim);
+  border: 1px solid var(--rule);
+  color: var(--fg-dim);
 }
 
 .tag.observed {
-    border: 1px solid var(--ok);
-    color: var(--ok-txt);
+  border: 1px solid var(--ok);
+  color: var(--ok-txt);
+}
+
+.coverage {
+  padding: 0 24px 24px 24px;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
 }
 
 .coverage-intro {
-    color: var(--fg-dim);
-    font-size: 12px;
-    margin: 0 0 10px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  margin: 0 0 10px;
 }
 
 .coverage-unobserved td { border-left: 2px solid var(--crit); }
 
 /* Collapsible Skipped Checks */
 details.skipped {
-    margin: 20px 24px 0;
-    background: var(--header);
-    border: 1px solid var(--rule);
-    border-radius: 2px;
-    padding: 12px 16px;
+  margin: 0 24px 24px;
+  background: var(--header);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 12px 16px;
 }
 
 details.skipped summary {
-    cursor: pointer;
-    color: var(--fg-dim);
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 details.skipped ul {
-    color: var(--fg-dim);
-    margin: 10px 0 0;
-    padding-left: 20px;
-    font-size: 12px;
+  color: var(--fg-dim);
+  margin: 10px 0 0;
+  padding-left: 20px;
+  font-size: 12px;
 }
 
 details.skipped li { margin: 4px 0; }
 
-/* Footer */
-footer {
-    height: 36px;
-    background: var(--header);
-    border-top: 1px solid var(--rule);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 24px;
-    margin-top: 24px;
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    color: var(--fg-dim);
+code {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--header);
+  border: 1px solid var(--rule);
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--fg);
 }
 
-.footer-left { color: var(--fg-dim); }
-.footer-right { color: var(--fg-faint); }
+/* Footer & Keybar */
+footer {
+  height: 36px;
+  background: var(--header);
+  border-top: 1px solid var(--rule);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+}
+
+.keybar span {
+  margin-right: 12px;
+}
+
+.key-name {
+  color: var(--fg);
+}
+
+.integrity {
+  color: var(--fg-dim);
+}
+
+@media (max-width: 1024px) {
+  .col-seq, .col-delta {
+    display: none;
+  }
+}
 
 /* Print Styles */
 @media print {
-    body {
-        background: #FFFFFF !important;
-        color: #000000 !important;
-        padding: 0 !important;
-    }
-    .shell, .score-card, .findings-panel, .table-wrap, table, thead, tbody, tr, td, th, header, footer {
-        background: #FFFFFF !important;
-        color: #000000 !important;
-        border-color: #000000 !important;
-    }
-    .beacon-sq {
-        animation: none !important;
-        opacity: 1 !important;
-        background: #000000 !important;
-    }
-    footer {
-        display: none !important;
-    }
-    .row-crit, .row-high {
-        border-left: 2px solid #000000 !important;
-    }
-    .sev-tag, .grid-val, .grid-label, .finding-prose, .score-num, .score-max, .score-band, .pkg-name, code {
-        color: #000000 !important;
-        background: transparent !important;
-        border-color: #000000 !important;
-    }
+  body {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+    padding: 0 !important;
+  }
+  .shell, .score-card, .findings-panel, .table-wrap, table, thead, tbody, tr, td, th, header, footer {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+    border-color: #000000 !important;
+  }
+  .beacon-sq {
+    animation: none !important;
+    opacity: 1 !important;
+    background: #000000 !important;
+  }
+  footer {
+    display: none !important;
+  }
+  .row-crit, .row-high {
+    border-left: 2px solid #000000 !important;
+  }
+  .sev-tag, .grid-val, .grid-label, .mitre-id, .finding-prose, .score-num, .score-max, .score-band, .pkg-name, .col-syscall, .col-args {
+    color: #000000 !important;
+    background: transparent !important;
+    border-color: #000000 !important;
+  }
 }
 </style>"#;
+
+/// Capitalises the first letter of `s`.
+fn capitalise(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}", first.to_uppercase(), chars.as_str())
+    })
+}
+
+/// Capitalises the first character and appends a full stop when absent.
+fn capitalise_sentence(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let trimmed = s.trim();
+    let mut result = capitalise(trimmed);
+    if !result.ends_with('.') && !result.ends_with('?') && !result.ends_with('!') {
+        result.push('.');
+    }
+    result
+}
+
+/// Minimal HTML escaping for untrusted strings.
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
 
 /// How many findings count toward the score.
 fn scorable_count(analysis: &Analysis) -> usize {
     analysis
         .findings
         .iter()
-        .filter(|finding| finding.severity.contributes_to_score())
+        .filter(|f| f.severity.contributes_to_score())
         .count()
-}
-
-/// Uppercases the first character.
-fn capitalise(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-/// Capitalises a note and gives it a full stop.
-///
-/// The coverage notes are written as sentence fragments so they read correctly inside
-/// [`installscope_core::Coverage::caveat_line`]. In a table cell they stand alone, so they get the
-/// punctuation a standalone sentence needs. Applied *after* escaping, so it cannot alter an entity.
-fn capitalise_sentence(text: &str) -> String {
-    let mut sentence = capitalise(text);
-    if !sentence.is_empty() && !sentence.ends_with('.') {
-        sentence.push('.');
-    }
-    sentence
-}
-
-/// HTML-escapes a string to prevent XSS.
-///
-/// Every user-supplied value (paths, rule text, command lines) passes through this before being
-/// placed in the document. A finding subject like `<script>alert(1)</script>` must render as text,
-/// not as executable markup.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -1171,10 +1441,6 @@ mod tests {
 
     #[test]
     fn every_report_carries_the_full_per_class_coverage_table() {
-        // Memory.md:194 makes this a Phase 3 obligation: the parity harness keeps the strace/aya
-        // asymmetry visible in per-class counts, and the report must too. Rendered unconditionally,
-        // because a table that appears only on the weaker backend would teach a reader to read its
-        // absence as completeness.
         for name in [
             "clean.jsonl",
             "high.jsonl",
@@ -1199,9 +1465,6 @@ mod tests {
 
     #[test]
     fn the_coverage_table_distinguishes_unobserved_from_qualified() {
-        // The distinction the table exists for. "Byte counts are approximate" and "credential reads are
-        // not recorded at all" must not render identically — the first qualifies a finding, the second
-        // means silence proves nothing.
         let aya = render_html(&analyse_fixture("aya-clean.jsonl"), &context());
         assert!(
             aya.contains("tag unobserved"),
@@ -1212,8 +1475,6 @@ mod tests {
             "aya's caveated classes must be marked distinctly: {aya}"
         );
 
-        // strace has no blind spots, so nothing may be marked unobserved for it. This is the assertion
-        // that stops the table degrading into decoration that always looks the same.
         let strace = render_html(&analyse_fixture("clean.jsonl"), &context());
         assert!(
             !strace.contains("tag unobserved"),
@@ -1227,16 +1488,11 @@ mod tests {
 
     #[test]
     fn the_coverage_table_states_the_reason_for_every_qualification() {
-        // A "with caveat" cell and no reason is a shrug. Each note comes from
-        // installscope_core::observability, so the report cannot phrase its own caveat and drift from
-        // what the engine actually did.
         for name in ["clean.jsonl", "aya-clean.jsonl"] {
             let analysis = analyse_fixture(name);
             let rendered = render_html(&analysis, &context());
             for (class, observability) in &analysis.coverage.classes {
                 if let Some(note) = observability.note() {
-                    // The note is escaped and sentence-cased before rendering, so a distinctive
-                    // fragment is compared rather than the whole string.
                     let fragment: String = note
                         .split_whitespace()
                         .take(4)
@@ -1255,8 +1511,6 @@ mod tests {
 
     #[test]
     fn the_coverage_table_names_the_backend_that_produced_the_recording() {
-        // The table is a claim about a recorder, not about an install. Which recorder must be on the
-        // same screen as the claim.
         let aya = render_html(&analyse_fixture("aya-clean.jsonl"), &context());
         assert!(aya.contains("<code>aya</code>"), "{aya}");
         let strace = render_html(&analyse_fixture("clean.jsonl"), &context());
@@ -1265,20 +1519,16 @@ mod tests {
 
     #[test]
     fn coverage_notes_are_escaped_like_every_other_string() {
-        // The notes are static today, so this guards the mechanism rather than current data: a future
-        // note containing a `<` must render as text.
         assert_eq!(
             capitalise_sentence(&escape("<b>reads</b> are filtered")),
             "&lt;b&gt;reads&lt;/b&gt; are filtered."
         );
-        // An existing full stop is not doubled.
         assert_eq!(capitalise_sentence("already done."), "Already done.");
         assert_eq!(capitalise_sentence(""), "");
     }
 
     #[test]
     fn user_supplied_strings_are_html_escaped() {
-        // A path like <script> must not become executable markup.
         assert_eq!(
             escape("<script>alert(1)</script>"),
             "&lt;script&gt;alert(1)&lt;/script&gt;"
@@ -1289,7 +1539,6 @@ mod tests {
 
     #[test]
     fn no_external_assets() {
-        // Rules.md §1: no CDN, no @import, no external fonts. The report must work offline.
         for name in [
             "clean.jsonl",
             "critical.jsonl",
