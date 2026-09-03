@@ -100,7 +100,8 @@ pub fn render_diff_markdown(comparison: &Comparison) -> String {
 /// Writes a capped list of behaviors with a marker, noting what was withheld.
 fn write_capped(out: &mut String, marker: &str, behaviors: &[&Behavior]) {
     for behavior in behaviors.iter().take(MARKDOWN_PER_CLASS_CAP) {
-        let _ = writeln!(out, "- `{marker}` {}", behavior.summary());
+        let clean_summary = behavior.summary().replace('<', "&lt;").replace('>', "&gt;");
+        let _ = writeln!(out, "- `{marker}` {clean_summary}");
     }
     let hidden = behaviors.len().saturating_sub(MARKDOWN_PER_CLASS_CAP);
     if hidden > 0 {

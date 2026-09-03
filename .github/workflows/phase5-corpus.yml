@@ -108,6 +108,7 @@ jobs:
           VERSIONS: ${{ inputs.versions }}
           SHARDS: ${{ inputs.shards }}
           TIMEOUT: ${{ inputs.timeout_seconds }}
+          RESUME_FROM_RUN: ${{ inputs.resume_from_run }}
         run: |
           set -euo pipefail
           # Bounded rather than trusted. These reach a shell and a matrix, and an unbounded value here
@@ -126,6 +127,11 @@ jobs:
           check versions "$VERSIONS" 1 20
           check shards "$SHARDS" 1 256
           check timeout_seconds "$TIMEOUT" 30 3600
+          if [ -n "$RESUME_FROM_RUN" ]; then
+            case "$RESUME_FROM_RUN" in
+              ''|*[!0-9]*) echo "::error title=Bad input::resume_from_run must be a run ID integer, got: $RESUME_FROM_RUN"; exit 1 ;;
+            esac
+          fi
           echo "limit=$LIMIT versions=$VERSIONS shards=$SHARDS timeout=${TIMEOUT}s"
 
       - name: Download the previous run's results

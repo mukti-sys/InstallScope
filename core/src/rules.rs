@@ -145,6 +145,11 @@ pub struct Analysis {
     /// recording where every path is unresolved has not been meaningfully analysed for escapes, and
     /// PRD.md:58's reasoning applies: silence that looks like a pass is the dangerous output.
     pub unresolved_paths: u32,
+    /// Non-framing syscall observations evaluated in the stream.
+    ///
+    /// A recording with zero observations cannot be certified as clean — an install that produced no
+    /// events is either a command that failed before executing or a detached tracer.
+    pub observations: u64,
 }
 
 impl Analysis {
@@ -156,11 +161,14 @@ impl Analysis {
 
     /// True when a zero score can honestly be read as "nothing unexpected happened".
     ///
-    /// Requires a complete recording, no blind spots, and no unresolved paths. Anything less and a clean
-    /// score is a statement about the recording rather than about the install.
+    /// Requires a complete recording, no blind spots, no unresolved paths, and at least one observation.
+    /// Anything less and a clean score is a statement about the recording rather than about the install.
     #[must_use]
     pub fn clean_result_is_trustworthy(&self) -> bool {
-        !self.partial && self.coverage.is_complete() && self.unresolved_paths == 0
+        !self.partial
+            && self.coverage.is_complete()
+            && self.unresolved_paths == 0
+            && self.observations > 0
     }
 }
 
@@ -178,10 +186,12 @@ pub fn evaluate(catalog: &Catalog, events: &[Event]) -> Analysis {
 
     let mut raw: Vec<Finding> = Vec::new();
     let mut unresolved_paths: u32 = 0;
+    let mut observations: u64 = 0;
 
     for event in events {
         match &event.payload {
             Payload::FsWrite(write) => {
+                observations += 1;
                 let placement = placement_of(&write.target, &zones);
                 if placement.is_unresolvable() {
                     // Counted, not scored. The count is what tells a reader how much of the filesystem
@@ -196,10 +206,22 @@ pub fn evaluate(catalog: &Catalog, events: &[Event]) -> Analysis {
                 }
                 evaluate_write(catalog, event, write, placement, &mut raw);
             }
-            Payload::FsRead(read) => evaluate_read(catalog, event, read, &mut raw),
-            Payload::NetConnect(connect) => evaluate_connect(catalog, event, connect, &mut raw),
-            Payload::DnsQuery(query) => evaluate_dns(catalog, event, query, &mut raw),
-            Payload::ProcSpawn(spawn) => evaluate_spawn(catalog, event, spawn, &mut raw),
+            Payload::FsRead(read) => {
+                observations += 1;
+                evaluate_read(catalog, event, read, &mut raw);
+            }
+            Payload::NetConnect(connect) => {
+                observations += 1;
+                evaluate_connect(catalog, event, connect, &mut raw);
+            }
+            Payload::DnsQuery(query) => {
+                observations += 1;
+                evaluate_dns(catalog, event, query, &mut raw);
+            }
+            Payload::ProcSpawn(spawn) => {
+                observations += 1;
+                evaluate_spawn(catalog, event, spawn, &mut raw);
+            }
             Payload::SessionStart(_) | Payload::SessionEnd(_) | Payload::Heartbeat(_) => {}
         }
     }
@@ -239,6 +261,7 @@ pub fn evaluate(catalog: &Catalog, events: &[Event]) -> Analysis {
         partial_reasons,
         skipped_rules,
         unresolved_paths,
+        observations,
     }
 }
 
@@ -1477,5 +1500,17 @@ rules:
             .findings
             .iter()
             .all(|finding| finding.severity == Severity::Low));
+    }
+
+    #[test]
+    fn an_empty_recording_with_zero_observations_is_not_trustworthy_as_clean() {
+        let events = stream(Backend::Strace, Vec::new());
+        let analysis = evaluate(&catalog(), &events);
+        assert_eq!(analysis.observations, 0);
+        assert_eq!(analysis.score.value, 0);
+        assert!(
+            !analysis.clean_result_is_trustworthy(),
+            "a recording with zero observed events cannot be claimed as a trustworthy clean install"
+        );
     }
 }

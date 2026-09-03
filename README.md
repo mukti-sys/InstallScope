@@ -6,9 +6,8 @@
 
 The flight recorder for package installs.
 
-> 🚧 **Status:** Phase 4 in progress — recorder, rules engine, reports, snapshot registry and the
-> GitHub Action are implemented; the README below is developer-facing until Phase 6 writes the public
-> one.
+> 🚧 **Status:** Preparing for Phase 6 (Public Launch) — recorder, rules engine, reports, snapshot
+> registry, GitHub Action, and corpus backfill harness are implemented, audited, and hardened.
 
 ---
 

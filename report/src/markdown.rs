@@ -35,7 +35,8 @@ pub fn render_markdown(analysis: &Analysis, context: &ReportContext) -> String {
         // Bracketed and capitalised, matching Design.md:31. Impossible to miss is the requirement.
         out.push_str(" · **`[PARTIAL]`**");
     }
-    let _ = writeln!(out, " · `{}`", context.subject_label());
+    let clean_label = context.subject_label().replace('`', "'");
+    let _ = writeln!(out, " · `{clean_label}`");
     out.push('\n');
 
     // ---- the PARTIAL explanation ----------------------------------------------------------------

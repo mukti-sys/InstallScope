@@ -127,6 +127,15 @@ runs:
         printf '\n<sub>Full evidence: %s/%s/actions/runs/%s</sub>\n' \
           "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$RUN_ID" >> comment-body.md
 
+        # GitHub issue comment API enforces a 65,536-character limit. Truncate at 60,000 characters
+        # and append an explanatory note if an unusually large diff exceeded the ceiling.
+        body_len="$(wc -c < comment-body.md || wc -c comment-body.md | awk '{print $1}')"
+        if [ "$body_len" -gt 60000 ]; then
+          head -c 60000 comment-body.md > comment-body-truncated.md
+          printf '\n\n> *(Diff output truncated because it exceeded GitHub comment limit. See full evidence artifact above.)*\n' >> comment-body-truncated.md
+          mv comment-body-truncated.md comment-body.md
+        fi
+
         echo "--- comment body ---"
         cat comment-body.md
 
@@ -144,7 +153,7 @@ runs:
         # `gh api` rather than a third-party action: Architecture.md:42 asks for bash plus gh api, and it
         # keeps the job that holds the write token free of dependencies nobody in this repository reviews.
         existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-          --paginate --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -n 1)"
+          --paginate --jq '.[] | select(.body | startswith($marker)) | .id' --arg marker "$MARKER" | head -n 1)"
 
         if [ -n "$existing" ]; then
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \

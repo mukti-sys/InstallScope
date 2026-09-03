@@ -59,6 +59,8 @@ pub struct ParseStats {
     /// Diagnostics that specifically report strace losing data. Unlike ordinary chatter these do
     /// force PARTIAL, because the stream is then genuinely missing events.
     pub diagnostic_data_loss: u64,
+    /// Syscalls that indicate untraced execution channels or anti-debugging evasion (`io_uring`, `ptrace`).
+    pub evasion_attempts: u64,
     /// Events produced.
     pub events_emitted: u64,
 }
@@ -1043,6 +1045,11 @@ impl Parser {
                         }
                     }
                 }
+            }
+
+            // ---- evasion & untraced channels ----------------------------------------------------
+            "io_uring_setup" | "io_uring_enter" | "io_uring_register" | "ptrace" => {
+                self.stats.evasion_attempts += 1;
             }
 
             _ => {}

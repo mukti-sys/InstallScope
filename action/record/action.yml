@@ -237,7 +237,16 @@ runs:
         fi
 
         # Independent verification, rather than trusting the recorder's own exit code (Rules.md §2).
-        installscope verify installscope-work/recording/events.jsonl || true
+        set +e
+        installscope verify installscope-work/recording/events.jsonl
+        verify_status=$?
+        set -e
+        if [ "$verify_status" -eq 3 ]; then
+          echo "::warning title=PARTIAL stream verified::independent verification confirms the recording is PARTIAL"
+        elif [ "$verify_status" -ne 0 ]; then
+          echo "::error title=Verification failed::installscope verify exited $verify_status (corrupt or unreadable stream)"
+          exit "$verify_status"
+        fi
 
     - name: Evaluate and render the reports
       id: report

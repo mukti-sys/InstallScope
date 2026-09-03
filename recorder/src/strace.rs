@@ -53,8 +53,46 @@ const TRACE_SET: &str = concat!(
     "rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,",
     "chmod,fchmodat,chown,lchown,fchownat,link,linkat,symlink,symlinkat,",
     "socket,connect,sendto,sendmsg,send,sendmmsg,",
-    "execve,execveat,clone,clone3,fork,vfork"
+    "execve,execveat,clone,clone3,fork,vfork,",
+    "io_uring_setup,io_uring_enter,io_uring_register,ptrace"
 );
+
+/// Terminates a traced process and its entire process tree.
+///
+/// On Unix, the child is placed in its own process group at spawn. When terminating,
+/// we signal the entire process group (`-pgid`) with SIGTERM first so processes have a chance
+/// to flush logs and exit cleanly, then escalate to SIGKILL after a 2-second grace period.
+/// Calling `child.kill()` alone would only terminate the tracer (strace), which cannot forward
+/// SIGKILL, leaving child install processes running in the background as unmonitored orphans.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id().to_string();
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(format!("-{pgid}"))
+            .status();
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .status();
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 
 /// How much of each buffer strace prints. 512 bytes covers a DNS question comfortably while keeping
 /// trace files manageable; a shorter limit silently truncates hostnames.
@@ -321,6 +359,12 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+
     let spawn_started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -366,10 +410,8 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         if let Some(limit) = config.timeout {
             if spawn_started.elapsed() >= limit {
                 timed_out = true;
-                // SIGKILL rather than SIGTERM: strace forwards signals to the traced process, and a
-                // hung install may ignore a polite one. The events already on disk are kept.
-                let _ = child.kill();
-                let _ = child.wait();
+                // Terminate the entire process group so untrusted child processes do not survive.
+                kill_process_group(&mut child);
                 break None;
             }
         }
@@ -425,6 +467,8 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
         });
     }
 
+    let mut reasons = Vec::new();
+
     for (pid, path) in &trace_files {
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -432,6 +476,12 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
                 // A single unreadable trace file is a partial recording, not a total failure: the
                 // other pids' evidence is still real. Recorded as a reason so the gap is visible.
                 tracing::warn!(path = %path.display(), error = %source, "could not read trace file");
+                reasons.push(IncompleteReason::TraceTruncated {
+                    detail: format!(
+                        "could not read trace file for pid {pid} ({}): {source}",
+                        path.display()
+                    ),
+                });
                 continue;
             }
         };
@@ -451,10 +501,18 @@ pub fn record(config: &RecordConfig) -> Result<Recording> {
 
     // ---- decide complete vs PARTIAL ------------------------------------------------------------
     // Every condition that could make the stream a lie is enumerated. Silence is not an option.
-    let mut reasons = Vec::new();
     if timed_out {
         reasons.push(IncompleteReason::Timeout {
             limit_secs: config.timeout.map_or(0, |t| t.as_secs()),
+        });
+    }
+    if stats.evasion_attempts > 0 {
+        reasons.push(IncompleteReason::Other {
+            detail: format!(
+                "process attempted untraced execution or anti-debugging ({} evasion syscall{})",
+                stats.evasion_attempts,
+                if stats.evasion_attempts == 1 { "" } else { "s" },
+            ),
         });
     }
     if parser.cap_reached() {

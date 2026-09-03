@@ -251,7 +251,8 @@ INSTALLED_MANIFEST="$PROJECT_DIR/node_modules/$PACKAGE/package.json"
 if [ -f "$INSTALLED_MANIFEST" ]; then
   installed_version="$(node -e '
     try {
-      const m = require(process.argv[1]);
+      const fs = require("node:fs");
+      const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       process.stdout.write(String(m.version ?? "unknown"));
     } catch { process.stdout.write("unreadable"); }
   ' "$INSTALLED_MANIFEST" 2>/dev/null || echo unreadable)"

@@ -34,10 +34,13 @@
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{RegistryError, Result};
+
+static STORE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Compression level for snapshot blobs.
 ///
@@ -202,8 +205,11 @@ impl Store {
 
         // Written to a temporary name and renamed, so a process killed mid-write leaves no blob rather
         // than a truncated one under a valid-looking address. Same reasoning as the recorder flushing
-        // per event: the failure must be visible as absence, not as corruption.
-        let temporary = path.with_extension("partial");
+        // per event: the failure must be visible as absence, not as corruption. Unique suffix prevents
+        // concurrent writer collisions on the same content address.
+        let nonce = STORE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temporary = path.with_extension(format!("partial.{pid}.{nonce}"));
         {
             let mut file = std::fs::File::create(&temporary)
                 .map_err(|source| RegistryError::io(&temporary, source))?;
@@ -212,7 +218,15 @@ impl Store {
             file.sync_all()
                 .map_err(|source| RegistryError::io(&temporary, source))?;
         }
-        std::fs::rename(&temporary, &path).map_err(|source| RegistryError::io(&path, source))?;
+        match std::fs::rename(&temporary, &path) {
+            Ok(()) => {}
+            Err(_) if path.exists() => {
+                // Another concurrent worker finished storing the identical blob first. Clean up
+                // the temporary file and proceed.
+                let _ = std::fs::remove_file(&temporary);
+            }
+            Err(source) => return Err(RegistryError::io(&path, source)),
+        }
 
         Ok(digest)
     }

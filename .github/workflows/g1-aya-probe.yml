@@ -109,9 +109,15 @@ jobs:
       - name: Build eBPF program (nightly, bpfel-unknown-none)
         id: build_ebpf
         working-directory: harness/g1/g1-ebpf
+        env:
+          TOOLCHAIN: ${{ inputs.rust_toolchain }}
         run: |
           set -uo pipefail
-          cargo +${{ inputs.rust_toolchain }} build --release 2>&1 | tee ../../../out/build-ebpf.log
+          if [[ ! "$TOOLCHAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+            echo "::error title=Bad input::Invalid rust_toolchain: $TOOLCHAIN"
+            exit 1
+          fi
+          cargo "+${TOOLCHAIN}" build --release 2>&1 | tee ../../../out/build-ebpf.log
           status=${PIPESTATUS[0]}
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit "$status"

@@ -3,6 +3,7 @@ name = "installscope-ebpf"
 description = "eBPF programs for the InstallScope aya backend. Builds only for bpfel-unknown-none on nightly."
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 publish = false
 
 # Separate workspace from the product crates: this targets bpfel-unknown-none, is no_std, uses

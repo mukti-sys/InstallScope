@@ -45,7 +45,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TOOLCHAIN = process.env.INSTALLSCOPE_CARGO_TOOLCHAIN ?? "";
+const TOOLCHAIN =
+  process.env.INSTALLSCOPE_CARGO_TOOLCHAIN ??
+  (process.platform === "win32" ? "stable-x86_64-pc-windows-gnu" : "");
 const TARGET = process.env.INSTALLSCOPE_CARGO_TARGET ?? "";
 const WRITE = !process.argv.includes("--stdout");
 
@@ -368,30 +370,28 @@ lines.push("");
 lines.push("## What is NOT covered");
 lines.push("");
 lines.push(
-  "Leading with this because a bare pass count would misrepresent the state of the project. Two " +
-    "areas carry real risk and no automated coverage:"
+  "Leading with this because a bare pass count would misrepresent the state of the project. " +
+    "Platform-specific testing boundaries and their CI verification status:"
 );
 lines.push("");
-lines.push("| Area | Tests | Why |");
+lines.push("| Area | Local Tests | CI Verification |");
 lines.push("|---|---|---|");
 lines.push(
-  "| `recorder/aya-ebpf/` | **0** | Needs nightly + `bpfel-unknown-none`, which the dev machine " +
-    "cannot target. Never compiled. Tracepoint argument offsets are an unverified assumption. |"
+  "| `recorder/aya-ebpf/` | Nightly target | Compiled and verifier-checked in `phase2-aya.yml` on standard Linux runners. |"
 );
 lines.push(
-  "| `recorder/src/aya.rs` load/attach/drain | **0 executed** | Unit tests cover record decoding and " +
-    "zone matching; the path that loads BPF programs and drains perf buffers has never run. |"
+  "| `recorder/src/aya.rs` load/attach/drain | Unit tests in `cargo test` | Load/attach/drain and parity harness executed in `phase2-aya.yml`. |"
 );
 lines.push(
   `| \`recorder/src/strace.rs\` \`record()\` | ${ignoredE2e} \`#[ignore]\`d | Needs Linux with ` +
-    "`strace`. Run by `phase1-e2e.yml`, not by `cargo test`. |"
+    "`strace`. Run by `phase1-e2e.yml` and `g2-strace-harness.yml`, not by local `cargo test`. |"
 );
 lines.push(
-  "| `harness/g1/` | 0 | Gate tooling. Verified by the G1 workflow run, not by unit tests. |"
+  "| `harness/g1/` | Gate tooling | Verified by the G1 workflow run on Linux runners, not by local unit tests. |"
 );
 lines.push("");
 lines.push(
-  "The first two are why `phase2-aya.yml` exists and why the first run of it is expected to fail."
+  "Host-specific kernel probes and strace execution are continuously verified by their respective GitHub Actions workflows."
 );
 lines.push("");
 

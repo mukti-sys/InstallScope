@@ -661,3 +661,21 @@ fn every_emitted_event_carries_full_provenance() {
         assert_eq!(*event, back);
     }
 }
+
+#[test]
+fn evasion_syscalls_are_counted_as_evasion_attempts() {
+    let mut parser = Parser::new(FIXTURE_START_EPOCH);
+    parser.feed_line("1700000000.000000 io_uring_setup(32, {flags=0}) = 3", 1);
+    parser.feed_line("1700000000.000100 io_uring_enter(3, 1, 0, 0) = 1", 1);
+    parser.feed_line("1700000000.000200 io_uring_register(3, 0, 0x0, 0) = 0", 1);
+    parser.feed_line(
+        "1700000000.000300 ptrace(PTRACE_TRACEME, 0, 0, 0) = -1 EPERM",
+        1,
+    );
+
+    assert_eq!(
+        parser.stats().evasion_attempts,
+        4,
+        "io_uring and ptrace anti-debugging must be counted to force PARTIAL"
+    );
+}
