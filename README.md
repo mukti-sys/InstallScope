@@ -35,9 +35,11 @@ InstallScope provides runtime behavioral observation designed specifically for C
 
 ---
 
-## 3-Command Quickstart
+## Quickstart & Evaluation
 
 Evaluate an included forensic trace fixture without any Linux or kernel prerequisites:
+
+### Linux & macOS (Terminal)
 
 ```bash
 # 1. Clone the repository and enter the directory
@@ -51,7 +53,52 @@ cargo run -p installscope -- report corpus/demo/high.jsonl
 cat installscope-report/installscope-comment.md
 ```
 
-On Linux hosts, record any installation command live:
+### Windows (PowerShell)
+
+```powershell
+# 1. Clone the repository and enter the directory
+git clone https://github.com/mukti-sys/InstallScope.git
+cd InstallScope
+
+# 2. Evaluate a sample recording against the deterministic rule catalog
+cargo run -p installscope -- report corpus/demo/high.jsonl
+
+# 3. View the summary comment or open the dashboard in your default browser
+Get-Content installscope-report\installscope-comment.md
+Start-Process installscope-report\installscope-report.html
+```
+
+> **Windows Note:** In standard Command Prompt (`cmd.exe`), use `type installscope-report\installscope-comment.md` to display the file. Avoid chaining commands with `&&` in Windows PowerShell 5.1; run commands on separate lines or separate them with `;`.
+
+---
+
+## Installation & Platform Support
+
+InstallScope can be installed via Cargo or downloaded as precompiled standalone binaries:
+
+```bash
+# Install from source via Cargo (cross-platform)
+cargo install --git https://github.com/mukti-sys/InstallScope.git installscope
+```
+
+Prebuilt release binaries with SHA-256 checksums are available on [GitHub Releases](https://github.com/mukti-sys/InstallScope/releases):
+- **Windows (x86_64):** `installscope-x86_64-pc-windows-msvc.zip` (`installscope.exe`)
+- **Linux (x86_64):** `installscope-x86_64-unknown-linux-gnu.tar.gz` / `installscope-x86_64-unknown-linux-musl.tar.gz`
+- **macOS (Apple Silicon & Intel):** `installscope-aarch64-apple-darwin.tar.gz` / `installscope-x86_64-apple-darwin.tar.gz`
+
+### Platform Compatibility
+
+| Capability | Linux | macOS | Windows | Windows (WSL2) |
+|---|---|---|---|---|
+| **Forensic Reporting (`report`)** | ✅ Native | ✅ Native | ✅ Native (`installscope.exe`) | ✅ Native |
+| **Behavioral Diffing (`diff`)** | ✅ Native | ✅ Native | ✅ Native (`installscope.exe`) | ✅ Native |
+| **Stream Verification (`verify`)** | ✅ Native | ✅ Native | ✅ Native (`installscope.exe`) | ✅ Native |
+| **Lockfile Diffing (`lockfile-diff`)** | ✅ Native | ✅ Native | ✅ Native (`installscope.exe`) | ✅ Native |
+| **Live Install Recording (`record`)** | ✅ `strace` / `aya` eBPF | 🔄 Linux Container | 🔄 WSL2 / Container | ✅ Native `strace` |
+
+*Live recording intercepts kernel syscalls via `strace` or eBPF, which requires a Linux kernel. On Windows or macOS, run `installscope record` inside WSL2 or a container, or let the GitHub Action record automatically on Linux CI runners during pull requests.*
+
+On Linux or WSL2, record any installation command live:
 
 ```bash
 installscope record -- npm install
