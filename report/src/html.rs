@@ -349,8 +349,9 @@ fn render_signal_log(out: &mut String, analysis: &Analysis) {
         r#"  <!-- Row 2: Signal Log -->
   <section class="log-section" aria-label="Syscall Signal Log">
     <div class="log-head">
-      <h2 class="panel-title" style="margin-bottom:0;">SIGNAL LOG</h2>
-      <div class="log-meta">"#,
+      <div class="log-head-left">
+        <h2 class="panel-title" style="margin-bottom:0;">SIGNAL LOG</h2>
+        <div class="log-meta">"#,
     );
     let _ = write!(
         out,
@@ -358,6 +359,11 @@ fn render_signal_log(out: &mut String, analysis: &Analysis) {
     );
     out.push_str(
         r#"</div>
+      </div>
+      <div class="log-filter-wrap">
+        <input type="text" id="signal-filter" placeholder="Filter signals... (/)" aria-label="Filter signals">
+        <span id="filter-count" class="filter-count"></span>
+      </div>
     </div>
 
     <div class="table-wrap">
@@ -365,15 +371,15 @@ fn render_signal_log(out: &mut String, analysis: &Analysis) {
         <caption class="sr-only">Recorded Syscall Signals with Sequence, Timing, Return Codes, Severity and Coverage Analysis</caption>
         <thead>
           <tr>
-            <th scope="col" class="r col-ts">TS</th>
-            <th scope="col" class="r col-seq">SEQ</th>
-            <th scope="col" class="l col-syscall">SYSCALL</th>
-            <th scope="col" class="l col-args">ARGS</th>
-            <th scope="col" class="r col-ret">RET</th>
-            <th scope="col" class="l col-errno">ERRNO</th>
-            <th scope="col" class="r col-delta">Δ</th>
-            <th scope="col" class="l col-sev">SEV</th>
-            <th scope="col" class="l col-cov">COV</th>
+            <th scope="col" class="r col-ts"><abbr title="Timestamp: elapsed time since install start (HH:MM:SS.mmm)">TIME (TS)</abbr></th>
+            <th scope="col" class="r col-seq"><abbr title="Sequence number of the syscall in the trace">SEQ #</abbr></th>
+            <th scope="col" class="l col-syscall"><abbr title="System call executed (e.g. openat, execve, connect)">SYSCALL</abbr></th>
+            <th scope="col" class="l col-args"><abbr title="Arguments and parameters passed to the system call">ARGUMENTS (ARGS)</abbr></th>
+            <th scope="col" class="r col-ret"><abbr title="Kernel return code / file descriptor / exit status">RETURN (RET)</abbr></th>
+            <th scope="col" class="l col-errno"><abbr title="Error number / system error code (e.g. ENOENT, EINPROGRESS, or — for success)">ERRNO (ERR)</abbr></th>
+            <th scope="col" class="r col-delta"><abbr title="Delta: milliseconds elapsed since the preceding event">Δ TIME (MS)</abbr></th>
+            <th scope="col" class="l col-sev"><abbr title="Security finding severity (Critical, High, Medium, Low, or —)">SEVERITY (SEV)</abbr></th>
+            <th scope="col" class="l col-cov"><abbr title="Recorder observation coverage status: verified or incomplete">COVERAGE (COV)</abbr></th>
           </tr>
         </thead>
         <tbody id="signal-body">
@@ -493,7 +499,7 @@ fn render_signal_rows_batch3(out: &mut String) {
 
 /// Emits the per-class coverage table.
 fn render_coverage_table(out: &mut String, analysis: &Analysis) {
-    out.push_str("<section class=\"coverage\">\n<div class=\"section-head\"><h2 class=\"panel-title\">What this recording could observe</h2></div>\n");
+    out.push_str("<section class=\"coverage\" id=\"coverage-section\" tabindex=\"-1\">\n<div class=\"section-head\"><h2 class=\"panel-title\">What this recording could observe</h2></div>\n");
     let _ = writeln!(
         out,
         "<p class=\"coverage-intro\">Recorded with the <code>{}</code> backend. A class marked \
@@ -555,13 +561,13 @@ fn render_footer(out: &mut String, analysis: &Analysis) {
     let _ = write!(
         out,
         r#"  <footer>
-    <div class="keybar">
-      <span><strong class="key-name">j/k</strong> move</span>
-      <span><strong class="key-name">⏎</strong> expand</span>
-      <span><strong class="key-name">/</strong> filter</span>
-      <span><strong class="key-name">c</strong> coverage</span>
-      <span><strong class="key-name">e</strong> export json</span>
-      <span><strong class="key-name">q</strong> quit</span>
+    <div class="keybar" role="toolbar" aria-label="Keyboard shortcuts and actions">
+      <button type="button" class="key-btn" id="btn-move" title="Use j / k or Arrow keys to navigate rows"><kbd>j/k</kbd> move</button>
+      <button type="button" class="key-btn" id="btn-expand" title="Press Enter or click row to inspect event details"><kbd>⏎</kbd> expand</button>
+      <button type="button" class="key-btn" id="btn-filter" title="Press / to filter syscalls and arguments"><kbd>/</kbd> filter</button>
+      <button type="button" class="key-btn" id="btn-coverage" title="Press c to scroll to coverage matrix"><kbd>c</kbd> coverage</button>
+      <button type="button" class="key-btn" id="btn-export" title="Press e to export report as JSON"><kbd>e</kbd> export json</button>
+      <button type="button" class="key-btn" id="btn-quit" title="Press q or Esc to collapse insets and clear filter"><kbd>q</kbd> quit</button>
     </div>
     <div class="integrity">
       SHA-256 a3f1c9…8e04<span class="sep">·</span>backend <code>{backend}</code><span class="sep">·</span>seccomp-bpf+ptrace<span class="sep">·</span>immutable<span class="sep">·</span>Advisory: this report records what the install did, and does not block the build.
@@ -571,17 +577,29 @@ fn render_footer(out: &mut String, analysis: &Analysis) {
     );
 }
 
-/// Emits the interactive vanilla JS script for row toggling and keyboard navigation.
+/// Emits the interactive vanilla JS script for row toggling, filter, export, and keyboard navigation.
 fn render_scripts(out: &mut String) {
+    out.push_str("<script>\n(function() {\n");
+    render_scripts_core(out);
+    render_scripts_export(out);
+    render_scripts_nav(out);
+    out.push_str("})();\n</script>\n");
+}
+
+/// Emits state initialization, insets expansion, and real-time text filtering.
+fn render_scripts_core(out: &mut String) {
     out.push_str(
-        r#"<script>
-(function() {
-  const tbody = document.getElementById('signal-body');
+        r#"  const tbody = document.getElementById('signal-body');
+  const filterInput = document.getElementById('signal-filter');
+  const filterCount = document.getElementById('filter-count');
+  const covSection = document.getElementById('coverage-section');
   if (!tbody) return;
-  const rows = Array.from(tbody.querySelectorAll('tr:not(.gap-row)'));
+  const allRows = Array.from(tbody.querySelectorAll('tr:not(.gap-row)'));
+  let visibleRows = allRows.slice();
   let activeIndex = -1;
 
   function toggleExpand(tr) {
+    if (!tr) return;
     const next = tr.nextElementSibling;
     if (next && next.classList.contains('inset-row')) {
       next.remove();
@@ -600,40 +618,170 @@ fn render_scripts(out: &mut String) {
     tr.after(inset);
   }
 
+  function closeAllInsets() {
+    tbody.querySelectorAll('.inset-row').forEach(row => row.remove());
+  }
+
+  function applyFilter(query) {
+    const q = query.toLowerCase().trim();
+    closeAllInsets();
+    let matches = 0;
+    allRows.forEach(tr => {
+      const text = (tr.textContent + ' ' + (tr.getAttribute('data-site') || '') + ' ' + (tr.getAttribute('data-attck') || '')).toLowerCase();
+      if (!q || text.includes(q)) {
+        tr.style.display = '';
+        matches++;
+      } else {
+        tr.style.display = 'none';
+      }
+    });
+    visibleRows = allRows.filter(tr => tr.style.display !== 'none');
+    if (filterCount) {
+      filterCount.textContent = q ? matches + ' / ' + allRows.length + ' visible' : '';
+    }
+    activeIndex = visibleRows.length > 0 ? 0 : -1;
+    if (activeIndex >= 0) visibleRows[0].focus();
+  }
+"#,
+    );
+}
+
+/// Emits client-side JSON export and view reset logic.
+fn render_scripts_export(out: &mut String) {
+    out.push_str(
+        r#"  function exportReportJson() {
+    const scoreNum = document.querySelector('.score-num')?.textContent?.trim() || "0";
+    const scoreBand = document.querySelector('.score-band')?.textContent?.trim() || "";
+    const signals = allRows.map((tr, idx) => {
+      const cells = tr.querySelectorAll('td');
+      return {
+        seq: cells[1]?.textContent?.trim() || String(idx + 1),
+        time: cells[0]?.textContent?.trim() || "",
+        syscall: cells[2]?.textContent?.trim() || "",
+        args: cells[3]?.textContent?.trim() || "",
+        ret: cells[4]?.textContent?.trim() || "",
+        errno: cells[5]?.textContent?.trim() || "",
+        delta_ms: cells[6]?.textContent?.trim() || "",
+        severity: cells[7]?.textContent?.trim() || "—",
+        coverage: cells[8]?.textContent?.trim() || "",
+        raw_call: tr.getAttribute('data-raw') || "",
+        site: tr.getAttribute('data-site') || "",
+        attck: tr.getAttribute('data-attck') || ""
+      };
+    });
+    const reportData = {
+      generator: "InstallScope Forensic Readout",
+      timestamp: new Date().toISOString(),
+      score: { value: parseInt(scoreNum) || 0, band: scoreBand },
+      signals_count: signals.length,
+      signals: signals
+    };
+    const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'installscope-report.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function resetView() {
+    closeAllInsets();
+    if (filterInput) {
+      filterInput.value = '';
+      applyFilter('');
+      filterInput.blur();
+    }
+    if (visibleRows.length > 0) {
+      activeIndex = 0;
+      visibleRows[0].focus();
+    }
+  }
+"#,
+    );
+}
+
+/// Emits keyboard navigation and keybar button listener registrations.
+fn render_scripts_nav(out: &mut String) {
+    out.push_str(
+        r"  if (filterInput) {
+    filterInput.addEventListener('input', (e) => applyFilter(e.target.value));
+    filterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') resetView();
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (visibleRows.length > 0) visibleRows[0].focus();
+      }
+    });
+  }
+
   tbody.addEventListener('click', (e) => {
     const tr = e.target.closest('tr');
     if (tr && !tr.classList.contains('gap-row') && !tr.classList.contains('inset-row')) {
-      activeIndex = rows.indexOf(tr);
+      activeIndex = visibleRows.indexOf(tr);
       tr.focus();
       toggleExpand(tr);
     }
   });
 
   window.addEventListener('keydown', (e) => {
+    const isTyping = document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA');
+    if (isTyping && e.key !== 'Escape') return;
+
     if (['ArrowDown', 'j', 'J'].includes(e.key)) {
       e.preventDefault();
-      activeIndex = Math.min(activeIndex + 1, rows.length - 1);
-      rows[activeIndex].focus();
+      if (visibleRows.length > 0) {
+        activeIndex = Math.min(activeIndex + 1, visibleRows.length - 1);
+        visibleRows[activeIndex].focus();
+        visibleRows[activeIndex].scrollIntoView({ block: 'nearest' });
+      }
     } else if (['ArrowUp', 'k', 'K'].includes(e.key)) {
       e.preventDefault();
-      activeIndex = Math.max(activeIndex - 1, 0);
-      rows[activeIndex].focus();
-    } else if (e.key === 'Enter' && activeIndex >= 0) {
+      if (visibleRows.length > 0) {
+        activeIndex = Math.max(activeIndex - 1, 0);
+        visibleRows[activeIndex].focus();
+        visibleRows[activeIndex].scrollIntoView({ block: 'nearest' });
+      }
+    } else if (e.key === 'Enter' && activeIndex >= 0 && activeIndex < visibleRows.length) {
       e.preventDefault();
-      toggleExpand(rows[activeIndex]);
-    } else if (e.key === 'g' && !e.shiftKey) {
+      toggleExpand(visibleRows[activeIndex]);
+    } else if (e.key === '/' && !isTyping) {
       e.preventDefault();
-      activeIndex = 0;
-      rows[0].focus();
-    } else if (e.key === 'G' || (e.key === 'g' && e.shiftKey)) {
+      if (filterInput) { filterInput.focus(); filterInput.select(); }
+    } else if (['c', 'C'].includes(e.key) && !isTyping) {
       e.preventDefault();
-      activeIndex = rows.length - 1;
-      rows[activeIndex].focus();
+      if (covSection) covSection.scrollIntoView({ behavior: 'smooth' });
+    } else if (['e', 'E'].includes(e.key) && !isTyping) {
+      e.preventDefault();
+      exportReportJson();
+    } else if (['q', 'Q'].includes(e.key) || e.key === 'Escape') {
+      e.preventDefault();
+      resetView();
+    } else if (e.key === 'g' && !e.shiftKey && !isTyping) {
+      e.preventDefault();
+      if (visibleRows.length > 0) { activeIndex = 0; visibleRows[0].focus(); }
+    } else if ((e.key === 'G' || (e.key === 'g' && e.shiftKey)) && !isTyping) {
+      e.preventDefault();
+      if (visibleRows.length > 0) { activeIndex = visibleRows.length - 1; visibleRows[activeIndex].focus(); }
     }
   });
-})();
-</script>
-"#,
+
+  const btnFilter = document.getElementById('btn-filter');
+  const btnCoverage = document.getElementById('btn-coverage');
+  const btnExport = document.getElementById('btn-export');
+  const btnQuit = document.getElementById('btn-quit');
+  const btnExpand = document.getElementById('btn-expand');
+  if (btnFilter) btnFilter.addEventListener('click', () => { if (filterInput) { filterInput.focus(); filterInput.select(); } });
+  if (btnCoverage) btnCoverage.addEventListener('click', () => { if (covSection) covSection.scrollIntoView({ behavior: 'smooth' }); });
+  if (btnExport) btnExport.addEventListener('click', exportReportJson);
+  if (btnQuit) btnQuit.addEventListener('click', resetView);
+  if (btnExpand) btnExpand.addEventListener('click', () => {
+    if (activeIndex >= 0 && activeIndex < visibleRows.length) toggleExpand(visibleRows[activeIndex]);
+    else if (visibleRows.length > 0) { activeIndex = 0; visibleRows[0].focus(); toggleExpand(visibleRows[0]); }
+  });
+",
     );
 }
 
@@ -1044,8 +1192,17 @@ header {
 .log-head {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   margin-bottom: 12px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.log-head-left {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
 }
 
 .log-meta {
@@ -1057,6 +1214,41 @@ header {
   text-transform: uppercase;
   letter-spacing: 0.14em;
   color: var(--fg-dim);
+}
+
+.log-filter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#signal-filter {
+  background: var(--header);
+  border: 1px solid var(--rule);
+  color: var(--fg);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 2px;
+  width: 220px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+#signal-filter:focus {
+  border-color: var(--beacon);
+}
+
+.filter-count {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+abbr[title] {
+  text-decoration: underline dotted var(--fg-faint);
+  text-underline-offset: 3px;
+  cursor: help;
 }
 
 .table-wrap {
@@ -1271,29 +1463,67 @@ code {
 
 /* Footer & Keybar */
 footer {
-  height: 36px;
+  min-height: 42px;
+  height: auto;
   background: var(--header);
   border-top: 1px solid var(--rule);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
+  padding: 8px 24px;
+  gap: 12px;
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-variant-numeric: tabular-nums;
   font-size: 10px;
-  line-height: 1.2;
+  line-height: 1.3;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.14em;
   color: var(--fg-dim);
 }
 
-.keybar span {
-  margin-right: 12px;
+.keybar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
-.key-name {
+.key-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg-dim);
+  font-family: inherit;
+  font-size: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  padding: 2px 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 2px;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.key-btn:hover, .key-btn:focus-visible {
   color: var(--fg);
+  background: var(--row-hover);
+  border-color: var(--rule);
+  outline: none;
+}
+
+kbd {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-bottom: 2px solid var(--rule);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.1;
 }
 
 .integrity {
