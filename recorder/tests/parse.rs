@@ -677,3 +677,14 @@ fn evasion_syscalls_are_counted_as_evasion_attempts() {
         "io_uring ring submission and ptrace anti-debugging must be counted to force PARTIAL"
     );
 }
+
+#[test]
+fn benign_ptrace_traceme_handshake_is_not_evasion() {
+    let mut parser = Parser::new(FIXTURE_START_EPOCH);
+    parser.feed_line("1700000000.000100 ptrace(PTRACE_TRACEME, 0, 0, 0) = 0", 1);
+    assert_eq!(
+        parser.stats().evasion_attempts,
+        0,
+        "benign tracer handshake must not be flagged as evasion"
+    );
+}

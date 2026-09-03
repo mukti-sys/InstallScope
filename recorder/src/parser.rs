@@ -1048,8 +1048,20 @@ impl Parser {
             }
 
             // ---- evasion & untraced channels ----------------------------------------------------
-            "io_uring_enter" | "ptrace" => {
+            "io_uring_enter" => {
                 self.stats.evasion_attempts += 1;
+            }
+            "ptrace" => {
+                // A successful ptrace(PTRACE_TRACEME) = 0 is the child handshake allowing strace to attach.
+                // An anti-debugging check calls PTRACE_TRACEME expecting -1 EPERM to detect analysis,
+                // or calls PTRACE_ATTACH / PTRACE_SEIZE to interfere with tracing.
+                let is_benign_traceme = args
+                    .first()
+                    .is_some_and(|a| a.starts_with("PTRACE_TRACEME"))
+                    && ret.ok == Some(true);
+                if !is_benign_traceme {
+                    self.stats.evasion_attempts += 1;
+                }
             }
 
             _ => {}
