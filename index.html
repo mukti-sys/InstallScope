@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InstallScope — Forensic Install Readout</title>
+<style>
+:root {
+  --bg: #0B0F14;
+  --surface: #131A22;
+  --header: #0E141B;
+  --rule: #1E2A36;
+  --rule-soft: #161F29;
+  --row-hover: #161E27;
+  --fg: #E6EDF3;
+  --fg-dim: #7D8B99;
+  --fg-faint: #4A5763;
+  --beacon: #FF6A3D;
+  --crit: #E5484D;
+  --high: #F5A524;
+  --med: #3B82C4;
+  --ok: #3DD68C;
+  --crit-txt: #FF6B70;
+  --high-txt: #F5A524;
+  --med-txt: #6BA6E0;
+  --ok-txt: #3DD68C;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  padding: 32px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell {
+  max-width: 1440px;
+  margin: 0 auto;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+}
+
+/* 56px Header */
+header {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: var(--header);
+  border-bottom: 1px solid var(--rule);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.beacon-sq {
+  width: 7px;
+  height: 7px;
+  background: var(--beacon);
+  display: inline-block;
+  animation: pulse-beacon 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-beacon {
+  0% { opacity: 1; }
+  50% { opacity: 0.35; }
+  100% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .beacon-sq {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+.rec-tag {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--beacon);
+  margin-right: 8px;
+}
+
+.pkg-name {
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.header-right {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+}
+
+.sep {
+  color: var(--fg-faint);
+  margin: 0 4px;
+}
+
+/* Row 1: Score Card + Top Findings */
+.row-top {
+  display: flex;
+  gap: 16px;
+  padding: 24px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.score-card {
+  flex: 0 0 280px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.score-baseline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.score-num {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 44px;
+  line-height: 1.0;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+
+.score-max {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  line-height: 1.0;
+  color: var(--fg-dim);
+}
+
+.score-label {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  margin-top: 8px;
+}
+
+.score-band {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--high-txt);
+  margin-top: 4px;
+}
+
+.score-def {
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+  margin-top: 8px;
+}
+
+.band-track {
+  position: relative;
+  height: 4px;
+  background: var(--header);
+  display: flex;
+  margin-top: 12px;
+}
+
+.track-seg {
+  height: 4px;
+  border-right: 1px solid var(--rule);
+}
+
+.seg-ok { width: 10%; background: rgba(61, 214, 140, 0.18); }
+.seg-med { width: 15%; background: rgba(59, 130, 196, 0.18); }
+.seg-high { width: 35%; background: rgba(245, 165, 36, 0.18); }
+.seg-crit { width: 40%; background: rgba(229, 72, 77, 0.18); border-right: none; }
+
+.track-tick {
+  position: absolute;
+  left: 25%;
+  top: 0;
+  width: 1px;
+  height: 4px;
+  background: var(--fg);
+}
+
+.band-legend {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  margin-top: 8px;
+}
+
+.micro-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  row-gap: 8px;
+  column-gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+
+.grid-cell {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.grid-label {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+}
+
+.grid-val {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 400;
+  color: var(--fg);
+}
+
+.findings-panel {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-title {
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-dim);
+  margin-bottom: 16px;
+}
+
+.findings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.finding-item {
+  padding-left: 12px;
+  position: relative;
+}
+
+.finding-item.crit { border-left: 2px solid var(--crit); }
+.finding-item.high { border-left: 2px solid var(--high); }
+.finding-item.med { border-left: 2px solid var(--med); }
+
+.finding-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.sev-tag {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 2px 5px;
+  border-radius: 2px;
+  background: transparent;
+  display: inline-block;
+}
+
+.sev-tag.crit {
+  border: 1px solid var(--crit);
+  color: var(--crit-txt);
+  background: rgba(229, 72, 77, 0.12);
+}
+
+.sev-tag.high {
+  border: 1px solid var(--high);
+  color: var(--high-txt);
+}
+
+.sev-tag.med {
+  border: 1px solid var(--med);
+  color: var(--med-txt);
+}
+
+.mitre-id {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+
+.finding-prose {
+  font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  font-weight: 400;
+  max-width: 68ch;
+  color: var(--fg);
+}
+
+/* Row 2: Signal Log */
+.log-section {
+  padding: 24px 24px 0 24px;
+}
+
+.log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.log-meta {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+}
+
+.table-wrap {
+  border: 1px solid var(--rule);
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  background: var(--surface);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+thead {
+  background: var(--header);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  border-bottom: 1px solid var(--rule);
+}
+
+th {
+  height: 28px;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+  padding: 0 8px;
+  white-space: nowrap;
+  border-radius: 0;
+}
+
+th.r, td.r { text-align: right; }
+th.l, td.l { text-align: left; }
+
+.col-ts { width: 96px; }
+.col-seq { width: 48px; }
+.col-syscall { width: 112px; color: var(--fg); }
+.col-args { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-ret { width: 64px; }
+.col-errno { width: 72px; }
+.col-delta { width: 64px; }
+.col-sev { width: 72px; }
+.col-cov { width: 96px; }
+
+tbody tr {
+  height: 28px;
+  border-bottom: 1px solid var(--rule-soft);
+  cursor: pointer;
+  outline: none;
+}
+
+tbody tr:last-child {
+  border-bottom: none;
+}
+
+tbody tr:hover {
+  background: var(--row-hover);
+}
+
+tbody tr:focus-visible {
+  outline: 1px solid var(--beacon);
+  outline-offset: 2px;
+}
+
+td {
+  padding: 0 8px;
+  border-radius: 0;
+  white-space: nowrap;
+}
+
+.row-crit {
+  border-left: 2px solid var(--crit);
+}
+
+.row-high {
+  border-left: 2px solid var(--high);
+}
+
+.cov-verified { color: var(--ok-txt); }
+.cov-partial { color: var(--high-txt); }
+.cov-none { color: var(--fg-dim); }
+
+/* Coverage Gap Row */
+tr.gap-row, tr.gap-row:hover {
+  height: 24px;
+  background: var(--header);
+  border-top: 1px dashed rgba(245, 165, 36, 0.4);
+  border-bottom: 1px dashed rgba(245, 165, 36, 0.4);
+  cursor: default;
+}
+
+tr.gap-row td {
+  font-size: 11px;
+  color: var(--high-txt);
+  text-align: center;
+  padding: 0;
+}
+
+/* Expanded Inset Panel */
+tr.inset-row, tr.inset-row:hover {
+  background: var(--header);
+  border-bottom: 1px solid var(--rule);
+  cursor: default;
+}
+
+.inset-content {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inset-line {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+}
+
+.inset-raw {
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Footer & Keybar */
+footer {
+  height: 32px;
+  background: var(--header);
+  border-top: 1px solid var(--rule);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  margin-top: 24px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--fg-dim);
+}
+
+.keybar span {
+  margin-right: 12px;
+}
+
+.key-name {
+  color: var(--fg);
+}
+
+.integrity {
+  color: var(--fg-dim);
+}
+
+/* Responsive degradation: hide SEQ and Δ under 1024px */
+@media (max-width: 1024px) {
+  .col-seq, .col-delta {
+    display: none;
+  }
+}
+
+/* Print Styles */
+@media print {
+  body {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+    padding: 0 !important;
+  }
+  .shell, .score-card, .findings-panel, .table-wrap, table, thead, tbody, tr, td, th, header, footer {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+    border-color: #000000 !important;
+  }
+  .beacon-sq {
+    animation: none !important;
+    opacity: 1 !important;
+    background: #000000 !important;
+  }
+  footer {
+    display: none !important;
+  }
+  .row-crit, .row-high {
+    border-left: 2px solid #000000 !important;
+  }
+  .sev-tag, .grid-val, .grid-label, .mitre-id, .finding-prose, .score-num, .score-max, .score-band, .pkg-name, .col-syscall, .col-args {
+    color: #000000 !important;
+    background: transparent !important;
+    border-color: #000000 !important;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- Header -->
+  <header>
+    <div class="header-left">
+      <span class="beacon-sq" aria-hidden="true"></span>
+      <span class="rec-tag">REC</span>
+      <span class="pkg-name">env-parse-lite@1.4.2</span>
+    </div>
+    <div class="header-right">
+      REGISTRY registry.npmjs.org<span class="sep">·</span>SANDBOX gvisor/linux-6.8.0-x86_64<span class="sep">·</span>SESSION FR-7Q2K-0194<span class="sep">·</span>CAPTURED 2026-09-03T18:41:07.412Z<span class="sep">·</span>WALL 4.118s
+    </div>
+  </header>
+
+  <!-- Row 1: Score & Top Findings -->
+  <section class="row-top" aria-label="Risk Score and Priority Findings">
+    <div class="score-card">
+      <div class="score-baseline">
+        <span class="score-num">25</span>
+        <span class="score-max">/ 100</span>
+      </div>
+      <div class="score-label">SURPRISE INDEX</div>
+      <div class="score-band">ELEVATED</div>
+      <p class="score-def">Share of recorded syscall activity not attributable to declared install work. 0 = fully accounted for.</p>
+      <div class="band-track" aria-hidden="true">
+        <div class="track-seg seg-ok"></div>
+        <div class="track-seg seg-med"></div>
+        <div class="track-seg seg-high"></div>
+        <div class="track-seg seg-crit"></div>
+        <div class="track-tick"></div>
+      </div>
+      <div class="band-legend">0–9 NOMINAL · 10–24 NOTABLE · 25–59 ELEVATED · 60+ CRITICAL</div>
+      <div class="micro-grid">
+        <div class="grid-cell"><span class="grid-label">SIGNALS</span><span class="grid-val">47</span></div>
+        <div class="grid-cell"><span class="grid-label">UNEXPLAINED</span><span class="grid-val">11</span></div>
+        <div class="grid-cell"><span class="grid-label">CRITICAL</span><span class="grid-val">2</span></div>
+        <div class="grid-cell"><span class="grid-label">HIGH</span><span class="grid-val">3</span></div>
+        <div class="grid-cell"><span class="grid-label">COVERAGE</span><span class="grid-val">98.2%</span></div>
+        <div class="grid-cell"><span class="grid-label">GAPS</span><span class="grid-val">1</span></div>
+      </div>
+    </div>
+
+    <div class="findings-panel">
+      <h2 class="panel-title">PRIORITY FINDINGS</h2>
+      <div class="findings-list">
+        <article class="finding-item crit">
+          <div class="finding-head">
+            <span class="sev-tag crit">CRITICAL</span>
+            <span class="mitre-id">→ T1552.001, T1041</span>
+          </div>
+          <p class="finding-prose">Reads ~/.npmrc and /proc/self/environ, then opens TLS egress to an undeclared host 340ms later. 4,118 bytes written before FIN. The manifest declares no network use and the package is a synchronous string parser.</p>
+        </article>
+
+        <article class="finding-item crit">
+          <div class="finding-head">
+            <span class="sev-tag crit">CRITICAL</span>
+            <span class="mitre-id">→ T1546.004</span>
+          </div>
+          <p class="finding-prose">Appends 184 bytes to ~/.bashrc, establishing shell-init persistence that survives the container. The appended line fetches a second stage on the next interactive login.</p>
+        </article>
+
+        <article class="finding-item high">
+          <div class="finding-head">
+            <span class="sev-tag high">HIGH</span>
+            <span class="mitre-id">→ T1552.001</span>
+          </div>
+          <p class="finding-prose">Probed three credential paths — .aws/credentials, .docker/config.json, .ssh/id_ed25519 — all ENOENT. That is the absence of secrets on this host, not the absence of intent.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Row 2: Signal Log -->
+  <section class="log-section" aria-label="Syscall Signal Log">
+    <div class="log-head">
+      <h2 class="panel-title" style="margin-bottom:0;">SIGNAL LOG</h2>
+      <div class="log-meta">47 SIGNALS · 11 UNEXPLAINED · 1 COVERAGE GAP</div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Recorded Syscall Signals with Sequence, Timing, Return Codes, Severity and Coverage Analysis</caption>
+        <thead>
+          <tr>
+            <th scope="col" class="r col-ts">TS</th>
+            <th scope="col" class="r col-seq">SEQ</th>
+            <th scope="col" class="l col-syscall">SYSCALL</th>
+            <th scope="col" class="l col-args">ARGS</th>
+            <th scope="col" class="r col-ret">RET</th>
+            <th scope="col" class="l col-errno">ERRNO</th>
+            <th scope="col" class="r col-delta">Δ</th>
+            <th scope="col" class="l col-sev">SEV</th>
+            <th scope="col" class="l col-cov">COV</th>
+          </tr>
+        </thead>
+        <tbody id="signal-body">
+          <tr tabindex="0" data-raw='execve("/usr/bin/node", ["node", "/tmp/npm-8f2a/postinstall.js"], 0x7ffd5a2c) = 0' data-site="package.json:scripts.postinstall → child_process.exec → /bin/sh -c" data-attck="ATT&CK T1059.007 — JavaScript Execution">
+            <td class="r col-ts">00:00:00.012</td><td class="r col-seq">0001</td><td class="l col-syscall">execve</td><td class="l col-args">"/usr/bin/node", ["node","/tmp/npm-8f2a/postinstall.js"]</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+0.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='openat(AT_FDCWD, "/proc/self/exe", O_RDONLY) = 17' data-site="postinstall.js:4 → process.title check" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.048</td><td class="r col-seq">0014</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/proc/self/exe", O_RDONLY</td><td class="r col-ret">17</td><td class="l col-errno">—</td><td class="r col-delta">+36.1</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='openat(AT_FDCWD, "/etc/os-release", O_RDONLY|O_CLOEXEC) = 14' data-site="postinstall.js:7 → os.release() telemetry probe" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.092</td><td class="r col-seq">0028</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/etc/os-release", O_RDONLY|O_CLOEXEC</td><td class="r col-ret">14</td><td class="l col-errno">—</td><td class="r col-delta">+44.0</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='openat(AT_FDCWD, "/home/runner/.npmrc", O_RDONLY|O_CLOEXEC) = 15' data-site="postinstall.js:14 → fs.readFileSync" data-attck="ATT&CK T1552.001 — Credentials In Files">
+            <td class="r col-ts">00:00:00.184</td><td class="r col-seq">0052</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.npmrc", O_RDONLY|O_CLOEXEC</td><td class="r col-ret">15</td><td class="l col-errno">—</td><td class="r col-delta">+92.4</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='read(15, "//registry.npmjs.org/:_authToken=npm_4b8f...", 4096) = 118' data-site="postinstall.js:15 → buffer.toString()" data-attck="ATT&CK T1552.001 — Credentials In Files">
+            <td class="r col-ts">00:00:00.185</td><td class="r col-seq">0053</td><td class="l col-syscall">read</td><td class="l col-args">15, "//registry.npmjs.org/:_authToken=npm_"..., 4096</td><td class="r col-ret">118</td><td class="l col-errno">—</td><td class="r col-delta">+0.8</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-high" data-raw='openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 19' data-site="postinstall.js:19 → process.env crawl" data-attck="ATT&CK T1082 — System Information Discovery">
+            <td class="r col-ts">00:00:00.241</td><td class="r col-seq">0074</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/proc/self/environ", O_RDONLY</td><td class="r col-ret">19</td><td class="l col-errno">—</td><td class="r col-delta">+56.2</td><td class="l col-sev"><span class="sev-tag high">HIGH</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-high" data-raw='openat(AT_FDCWD, "/home/runner/.aws/credentials", O_RDONLY) = -2 ENOENT' data-site="postinstall.js:23 → fs.existsSync" data-attck="ATT&CK T1552.001 — Credentials In Files">
+            <td class="r col-ts">00:00:00.310</td><td class="r col-seq">0098</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.aws/credentials", O_RDONLY</td><td class="r col-ret">-2</td><td class="l col-errno">ENOENT</td><td class="r col-delta">+69.1</td><td class="l col-sev"><span class="sev-tag high">HIGH</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 21" data-site="postinstall.js:31 → https.request" data-attck="ATT&CK T1071.001 — Web Protocols">
+            <td class="r col-ts">00:00:01.042</td><td class="r col-seq">0142</td><td class="l col-syscall">socket</td><td class="l col-args">AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP</td><td class="r col-ret">21</td><td class="l col-errno">—</td><td class="r col-delta">+731.8</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw="connect(21, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(&quot;104.21.38.117&quot;)}, 16) = -115 EINPROGRESS" data-site="postinstall.js:33 → net.Socket.connect" data-attck="ATT&CK T1041 — Exfiltration Over C2 Channel">
+            <td class="r col-ts">00:00:01.044</td><td class="r col-seq">0145</td><td class="l col-syscall">connect</td><td class="l col-args">21, {AF_INET, 104.21.38.117:443}, 16</td><td class="r col-ret">-115</td><td class="l col-errno">EINPROGRESS</td><td class="r col-delta">+2.1</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" class="row-crit" data-raw='write(21, "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03...", 517) = 517' data-site="postinstall.js:41 → tls.TLSSocket.write" data-attck="ATT&CK T1041 — Exfiltration Over C2 Channel">
+            <td class="r col-ts">00:00:02.741</td><td class="r col-seq">0231</td><td class="l col-syscall">write</td><td class="l col-args">21, TLS ClientHello SNI="stats.npm-telemetry-cdn[.]io"</td><td class="r col-ret">517</td><td class="l col-errno">—</td><td class="r col-delta">+340.2</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-partial">PARTIAL</td>
+          </tr>
+
+          <!-- Coverage Gap Row -->
+          <tr class="gap-row" aria-label="Coverage gap: 24 milliseconds unobserved due to ptrace detach during clone">
+            <td colspan="9">⟨ 00:00:02.907 — 00:00:02.931 · 24ms UNOBSERVED · ptrace detach during clone(CLONE_VM) · 3 signals estimated lost ⟩</td>
+          </tr>
+
+          <tr tabindex="0" class="row-crit" data-raw='openat(AT_FDCWD, "/home/runner/.bashrc", O_WRONLY|O_APPEND) = 23' data-site="postinstall.js:52 → fs.appendFileSync" data-attck="ATT&CK T1546.004 — Unix Shell Configuration Modification">
+            <td class="r col-ts">00:00:03.012</td><td class="r col-seq">0264</td><td class="l col-syscall">openat</td><td class="l col-args">AT_FDCWD, "/home/runner/.bashrc", O_WRONLY|O_APPEND</td><td class="r col-ret">23</td><td class="l col-errno">—</td><td class="r col-delta">+80.7</td><td class="l col-sev"><span class="sev-tag crit">CRITICAL</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='unlink("/tmp/npm-8f2a/postinstall.js") = 0' data-site="postinstall.js:68 → fs.unlinkSync self-delete" data-attck="ATT&CK T1070.004 — File Deletion">
+            <td class="r col-ts">00:00:03.218</td><td class="r col-seq">0299</td><td class="l col-syscall">unlink</td><td class="l col-args">"/tmp/npm-8f2a/postinstall.js"</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+205.8</td><td class="l col-sev"><span class="sev-tag med">MEDIUM</span></td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="mmap(NULL, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f9a1b000000" data-site="node:internal/buffer:124 → Buffer.alloc" data-attck="Benign runtime heap allocation">
+            <td class="r col-ts">00:00:03.250</td><td class="r col-seq">0312</td><td class="l col-syscall">mmap</td><td class="l col-args">NULL, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0</td><td class="r col-ret">0x7f9a1b000000</td><td class="l col-errno">—</td><td class="r col-delta">+32.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="fstat(14, {st_mode=S_IFREG|0644, st_size=382, ...}) = 0" data-site="node:internal/modules/cjs/loader:412 → statSync" data-attck="Benign module loader resolution">
+            <td class="r col-ts">00:00:03.310</td><td class="r col-seq">0340</td><td class="l col-syscall">fstat</td><td class="l col-args">14, {st_mode=S_IFREG|0644, st_size=382, ...}</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+60.2</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="brk(0x55d8f92a4000) = 0x55d8f92a4000" data-site="node:internal/v8:88 → v8::internal::Heap" data-attck="Benign heap adjustment">
+            <td class="r col-ts">00:00:03.385</td><td class="r col-seq">0371</td><td class="l col-syscall">brk</td><td class="l col-args">0x55d8f92a4000</td><td class="r col-ret">0x55d8f92a4000</td><td class="l col-errno">—</td><td class="r col-delta">+74.8</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw='mkdir("/tmp/npm-8f2a/node_modules/env-parse-lite/.cache", 0755) = 0' data-site="postinstall.js:84 → fs.mkdirSync" data-attck="Benign cache folder initialization">
+            <td class="r col-ts">00:00:03.490</td><td class="r col-seq">0408</td><td class="l col-syscall">mkdir</td><td class="l col-args">"/tmp/npm-8f2a/node_modules/env-parse-lite/.cache", 0755</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+104.9</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="getdents64(3, /* 18 entries */, 32768) = 1024" data-site="node:internal/fs/dir:92 → opendir" data-attck="Benign directory scan">
+            <td class="r col-ts">00:00:03.582</td><td class="r col-seq">0432</td><td class="l col-syscall">getdents64</td><td class="l col-args">3, /* 18 entries */, 32768</td><td class="r col-ret">1024</td><td class="l col-errno">—</td><td class="r col-delta">+91.7</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+          <tr tabindex="0" data-raw="exit_group(0) = ?" data-site="postinstall.js:90 → process.exit(0)" data-attck="Benign script termination">
+            <td class="r col-ts">00:00:04.118</td><td class="r col-seq">0489</td><td class="l col-syscall">exit_group</td><td class="l col-args">0</td><td class="r col-ret">0</td><td class="l col-errno">—</td><td class="r col-delta">+536.0</td><td class="l col-sev">—</td><td class="l col-cov cov-verified">VERIFIED</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="keybar">
+      <span><strong class="key-name">j/k</strong> move</span>
+      <span><strong class="key-name">⏎</strong> expand</span>
+      <span><strong class="key-name">/</strong> filter</span>
+      <span><strong class="key-name">c</strong> coverage</span>
+      <span><strong class="key-name">e</strong> export json</span>
+      <span><strong class="key-name">q</strong> quit</span>
+    </div>
+    <div class="integrity">
+      SHA-256 a3f1c9…8e04<span class="sep">·</span>recorder v0.9.4<span class="sep">·</span>seccomp-bpf+ptrace<span class="sep">·</span>immutable
+    </div>
+  </footer>
+</div>
+
+<script>
+// ~40 lines of clean vanilla keyboard & row expansion logic
+(function() {
+  const tbody = document.getElementById('signal-body');
+  const rows = Array.from(tbody.querySelectorAll('tr:not(.gap-row):not(.inset-row)'));
+  let activeIndex = -1;
+
+  function toggleExpand(tr) {
+    const existing = tbody.querySelector('.inset-row');
+    if (existing) {
+      const prevOwner = existing.previousElementSibling;
+      existing.remove();
+      if (prevOwner === tr) return;
+    }
+    const raw = tr.getAttribute('data-raw');
+    const site = tr.getAttribute('data-site');
+    const attck = tr.getAttribute('data-attck');
+    if (!raw) return;
+    const inset = document.createElement('tr');
+    inset.className = 'inset-row';
+    const td = document.createElement('td');
+    td.colSpan = 9;
+    td.innerHTML = '<div class="inset-content"><div class="inset-line mono inset-raw">' + raw + '</div><div class="inset-line mono">SITE ' + site + '</div><div class="inset-line mono">' + attck + '</div></div>';
+    inset.appendChild(td);
+    tr.after(inset);
+  }
+
+  tbody.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr');
+    if (tr && !tr.classList.contains('gap-row') && !tr.classList.contains('inset-row')) {
+      activeIndex = rows.indexOf(tr);
+      tr.focus();
+      toggleExpand(tr);
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowDown', 'j', 'J'].includes(e.key)) {
+      e.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, rows.length - 1);
+      rows[activeIndex].focus();
+    } else if (['ArrowUp', 'k', 'K'].includes(e.key)) {
+      e.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      rows[activeIndex].focus();
+    } else if (e.key === 'Enter' && activeIndex >= 0) {
+      e.preventDefault();
+      toggleExpand(rows[activeIndex]);
+    } else if (e.key === 'g' && !e.shiftKey) {
+      e.preventDefault();
+      activeIndex = 0;
+      rows[0].focus();
+    } else if (e.key === 'G' || (e.key === 'g' && e.shiftKey)) {
+      e.preventDefault();
+      activeIndex = rows.length - 1;
+      rows[activeIndex].focus();
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
