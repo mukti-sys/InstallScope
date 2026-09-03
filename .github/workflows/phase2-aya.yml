@@ -16,6 +16,9 @@ name: Phase 2 — aya backend parity
 # Manual dispatch only: it needs sudo to load BPF programs, and a gate is run deliberately.
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       keep_going:
@@ -148,7 +151,7 @@ jobs:
         continue-on-error: true
         working-directory: recorder/aya-ebpf
         env:
-          TOOLCHAIN: ${{ inputs.rust_toolchain }}
+          TOOLCHAIN: ${{ inputs.rust_toolchain || 'nightly' }}
         run: |
           set -uo pipefail
           if [[ ! "$TOOLCHAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
