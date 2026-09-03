@@ -20,4 +20,13 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Internal planning and design docs
+Architecture.md
+Design.md
+Memory.md
+PRD.md
+Phases.md
+Rules.md
+Scope.md
+
 
