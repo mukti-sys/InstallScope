@@ -487,7 +487,7 @@ fn a_nonexistent_command_is_reported_rather_than_silently_empty() {
         return;
     }
     let dir = scratch("missing");
-    let config = config_for(&["/nonexistent/definitely-not-a-real-binary"], &dir);
+    let config = config_for(&["definitely-not-a-real-binary"], &dir);
 
     let recording = strace::record(&config).unwrap_or_else(|e| panic!("recording failed: {e}"));
 

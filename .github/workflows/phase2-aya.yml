@@ -16,9 +16,6 @@ name: Phase 2 — aya backend parity
 # Manual dispatch only: it needs sudo to load BPF programs, and a gate is run deliberately.
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       keep_going:
@@ -125,7 +122,7 @@ jobs:
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ inputs.rust_toolchain }}
+          toolchain: ${{ inputs.rust_toolchain || 'nightly' }}
           components: rust-src
 
       - name: Install stable Rust
