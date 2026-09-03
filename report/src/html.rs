@@ -37,7 +37,7 @@ use std::fmt::Write as _;
 
 use installscope_core::{select_bullets, Analysis, Observability, Severity};
 
-use crate::{format_bullet, format_score, ReportContext, Verdict};
+use crate::{format_bullet, ReportContext, Verdict};
 
 /// Renders the analysis as a self-contained HTML document.
 ///
@@ -46,19 +46,19 @@ use crate::{format_bullet, format_score, ReportContext, Verdict};
 #[must_use]
 pub fn render_html(analysis: &Analysis, context: &ReportContext) -> String {
     let verdict = Verdict::of(analysis);
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(16384);
 
     render_head(&mut out, context);
+    out.push_str("<div class=\"shell\">\n");
     render_header(&mut out, analysis, context, verdict);
     render_partial_warning(&mut out, analysis, verdict);
-    render_summary(&mut out, analysis, verdict);
+    render_top_row(&mut out, analysis, context, verdict);
     render_caveats(&mut out, analysis);
     render_findings_table(&mut out, analysis);
     render_coverage_table(&mut out, analysis);
     render_skipped_rules(&mut out, analysis);
     render_footer(&mut out, analysis);
-
-    out.push_str("\n</body>\n</html>\n");
+    out.push_str("</div>\n\n</body>\n</html>\n");
     out
 }
 
@@ -81,30 +81,34 @@ fn render_head(out: &mut String, context: &ReportContext) {
     );
 }
 
-/// Emits the header block: title, subject label, score, and optional PARTIAL badge.
+/// Emits the flight recorder header block: beacon, title, subject label, and metadata strip.
 fn render_header(out: &mut String, analysis: &Analysis, context: &ReportContext, verdict: Verdict) {
-    out.push_str("<header>\n");
-    let _ = writeln!(
-        out,
-        "<h1><span class=\"beacon-dot\"></span>InstallScope</h1>"
-    );
-    let _ = writeln!(
-        out,
-        "<p class=\"subject\">{}</p>",
-        escape(&context.subject_label())
-    );
+    let subject = escape(&context.subject_label());
+    let backend = escape(&format!("{}", analysis.coverage.backend));
+    let verdict_str = if verdict.shows_partial_badge() {
+        "PARTIAL"
+    } else if analysis.score.value == 0 {
+        "NOMINAL"
+    } else if analysis.score.value >= 60 {
+        "CRITICAL"
+    } else {
+        "OBSERVED"
+    };
 
     let _ = write!(
         out,
-        "<div class=\"score-card\"><p class=\"score {class}\">{score}",
-        class = score_class(analysis),
-        score = escape(&format_score(&analysis.score)),
+        r#"<header>
+  <div class="header-left">
+    <span class="beacon-sq" aria-hidden="true"></span>
+    <span class="rec-tag">REC</span>
+    <span class="pkg-name">InstallScope &middot; {subject}</span>
+  </div>
+  <div class="header-right">
+    ENGINE {backend}<span class="sep">·</span>VERDICT {verdict_str}<span class="sep">·</span>ADVISORY
+  </div>
+</header>
+"#,
     );
-    if verdict.shows_partial_badge() {
-        out.push_str(" <span class=\"badge partial\">PARTIAL</span>");
-    }
-    out.push_str("</p></div>\n");
-    out.push_str("</header>\n\n");
 }
 
 /// Emits the PARTIAL warning block when the recording was incomplete.
@@ -128,35 +132,174 @@ fn render_partial_warning(out: &mut String, analysis: &Analysis, verdict: Verdic
     out.push_str("</div>\n\n");
 }
 
-/// Emits the bullet summary section.
-fn render_summary(out: &mut String, analysis: &Analysis, verdict: Verdict) {
+/// Emits Row 1: Score Card (left) and Priority Findings (right).
+fn render_top_row(
+    out: &mut String,
+    analysis: &Analysis,
+    _context: &ReportContext,
+    verdict: Verdict,
+) {
+    out.push_str("<section class=\"row-top\" aria-label=\"Risk Score and Priority Findings\">\n");
+    render_score_card(out, analysis, verdict);
+    render_priority_findings(out, analysis, verdict);
+    out.push_str("</section>\n\n");
+}
+
+/// Renders the 280px left score card module.
+fn render_score_card(out: &mut String, analysis: &Analysis, verdict: Verdict) {
+    let score_val = analysis.score.value;
+    let (band_name, band_class) = if verdict.shows_partial_badge() {
+        ("PARTIAL", "partial")
+    } else if score_val == 0 {
+        ("NOMINAL", "ok")
+    } else if score_val < 25 {
+        ("NOTABLE", "med")
+    } else if score_val < 60 {
+        ("ELEVATED", "high")
+    } else {
+        ("CRITICAL", "crit")
+    };
+
+    let tick_pct = score_val.min(100);
+    let crit_count = analysis
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .count();
+    let high_count = analysis
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
+    let med_count = analysis
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium)
+        .count();
+    let scorable = scorable_count(analysis);
+    let total_findings = analysis.findings.len();
+
+    let raw_part = if analysis.score.was_capped() {
+        format!(
+            " <span class=\"score-raw\">(raw {})</span>",
+            analysis.score.raw
+        )
+    } else {
+        String::new()
+    };
+
+    let partial_badge = if verdict.shows_partial_badge() {
+        " <span class=\"badge partial\">PARTIAL</span>"
+    } else {
+        ""
+    };
+
+    let _ = write!(
+        out,
+        r#"  <div class="score-card">
+    <div class="score-baseline">
+      <span class="score-num">{score_val} / 100</span>{raw_part}{partial_badge}
+    </div>
+    <div class="score-label">SURPRISE INDEX</div>
+    <div class="score-band {band_class}">{band_name}</div>
+    <p class="score-def">Share of recorded syscall activity not attributable to declared install work. 0 = fully accounted for.</p>
+    <div class="band-track" aria-hidden="true">
+      <div class="track-seg seg-ok"></div>
+      <div class="track-seg seg-med"></div>
+      <div class="track-seg seg-high"></div>
+      <div class="track-seg seg-crit"></div>
+      <div class="track-tick" style="left: {tick_pct}%;"></div>
+    </div>
+    <div class="band-legend">0–9 NOMINAL · 10–24 NOTABLE · 25–59 ELEVATED · 60+ CRITICAL</div>
+    <div class="micro-grid">
+      <div class="grid-cell"><span class="grid-label">FINDINGS</span><span class="grid-val">{total_findings}</span></div>
+      <div class="grid-cell"><span class="grid-label">SCORABLE</span><span class="grid-val">{scorable}</span></div>
+      <div class="grid-cell"><span class="grid-label">CRITICAL</span><span class="grid-val">{crit_count}</span></div>
+      <div class="grid-cell"><span class="grid-label">HIGH</span><span class="grid-val">{high_count}</span></div>
+      <div class="grid-cell"><span class="grid-label">MEDIUM</span><span class="grid-val">{med_count}</span></div>
+      <div class="grid-cell"><span class="grid-label">UNRESOLVED</span><span class="grid-val">{unresolved}</span></div>
+    </div>
+  </div>
+"#,
+        unresolved = analysis.unresolved_paths,
+    );
+}
+
+/// Renders the right flex priority findings module.
+fn render_priority_findings(out: &mut String, analysis: &Analysis, verdict: Verdict) {
     let scorable_bullets: Vec<_> = select_bullets(&analysis.findings)
         .into_iter()
         .filter(|f| f.severity.contributes_to_score())
         .collect();
-    out.push_str("<section class=\"summary\">\n");
+
+    out.push_str("  <div class=\"findings-panel\">\n");
+    out.push_str("    <h2 class=\"panel-title\">PRIORITY FINDINGS</h2>\n");
+
     if scorable_bullets.is_empty() {
         let _ = writeln!(
             out,
-            "<p class=\"headline\">{}</p>",
+            "    <p class=\"headline\">{}</p>",
             escape(&capitalise(verdict.headline()))
         );
     } else {
-        out.push_str("<ul class=\"bullets\">\n");
+        out.push_str("    <div class=\"findings-list\">\n");
         for finding in &scorable_bullets {
-            let _ = writeln!(out, "<li>{}</li>", escape(&format_bullet(finding)));
+            render_priority_item(out, finding);
         }
         let hidden = scorable_count(analysis).saturating_sub(scorable_bullets.len());
         if hidden > 0 {
             let _ = writeln!(
                 out,
-                "<li class=\"overflow\">…and {hidden} more finding{} below</li>",
+                "      <p class=\"overflow\">…and {hidden} more finding{} below in full table</p>",
                 if hidden == 1 { "" } else { "s" }
             );
         }
-        out.push_str("</ul>\n");
+        out.push_str("    </div>\n");
     }
-    out.push_str("</section>\n\n");
+    out.push_str("  </div>\n");
+}
+
+/// Renders a single finding card inside the priority list.
+fn render_priority_item(out: &mut String, finding: &installscope_core::Finding) {
+    let sev_str = match finding.severity {
+        Severity::Critical => "crit",
+        Severity::High => "high",
+        Severity::Medium => "med",
+        Severity::Low => "low",
+    };
+    let sev_label = match finding.severity {
+        Severity::Critical => "CRITICAL",
+        Severity::High => "HIGH",
+        Severity::Medium => "MEDIUM",
+        Severity::Low => "LOW",
+    };
+    let note_str = finding
+        .note
+        .as_deref()
+        .map_or_else(String::new, |n| format!(" — {}", escape(n)));
+    let count_badge = if finding.occurrences > 1 {
+        format!(
+            " <span class=\"finding-count\">&times;{}</span>",
+            finding.occurrences
+        )
+    } else {
+        String::new()
+    };
+
+    let _ = write!(
+        out,
+        r#"      <article class="finding-item {sev_str}">
+        <div class="finding-head">
+          <span class="sev-tag {sev_str}">{sev_label}</span>
+          <span class="finding-rule"><code>{rule}</code>{count_badge}</span>
+        </div>
+        <p class="finding-prose">{bullet}{note}</p>
+      </article>
+"#,
+        rule = escape(&finding.rule_id),
+        bullet = escape(&format_bullet(finding)),
+        note = note_str,
+    );
 }
 
 /// Emits coverage caveats and unresolved-path warnings.
@@ -170,8 +313,7 @@ fn render_caveats(out: &mut String, analysis: &Analysis) {
     }
 
     if analysis.unresolved_paths > 0 {
-        let _ =
-            writeln!(
+        let _ = writeln!(
             out,
             "<div class=\"callout caveat\">\n<p>{} path{} could not be resolved to an absolute \
              location and {} not checked against the expected directories (unresolved paths are not \
@@ -188,28 +330,49 @@ fn render_findings_table(out: &mut String, analysis: &Analysis) {
     if analysis.findings.is_empty() {
         return;
     }
-    out.push_str("<section class=\"findings\">\n<h2>Findings</h2>\n");
+    out.push_str("<section class=\"findings\">\n<div class=\"section-head\"><h2 class=\"panel-title\">FINDINGS DETAIL</h2><span class=\"section-meta\">");
+    let _ = write!(
+        out,
+        "{} FINDING{}",
+        analysis.findings.len(),
+        if analysis.findings.len() == 1 {
+            ""
+        } else {
+            "S"
+        }
+    );
+    out.push_str("</span></div>\n");
     out.push_str(
-        "<table>\n<thead><tr>\
-        <th>Severity</th><th>Rule</th><th>Subject</th><th>Description</th><th>Count</th>\
+        "<div class=\"table-wrap\"><table>\n<thead><tr>\
+        <th class=\"col-sev\">Severity</th><th class=\"col-rule\">Rule</th><th class=\"col-subj\">Subject</th><th class=\"col-desc\">Description</th><th class=\"col-cnt r\">Count</th>\
         </tr></thead>\n<tbody>\n",
     );
     for finding in &analysis.findings {
         let note_html = finding
             .note
             .as_deref()
-            .map(|n| format!("<br><small>{}</small>", escape(n)))
+            .map(|n| format!("<br><small class=\"note-text\">{}</small>", escape(n)))
             .unwrap_or_default();
+        let sev_str = match finding.severity {
+            Severity::Critical => "crit",
+            Severity::High => "high",
+            Severity::Medium => "med",
+            Severity::Low => "low",
+        };
+        let row_class = match finding.severity {
+            Severity::Critical => "row-crit",
+            Severity::High => "row-high",
+            _ => "",
+        };
         let _ = writeln!(
             out,
-            "<tr class=\"severity-{sev}\">\
-            <td><span class=\"tag {sev}\">{sev_label}</span></td>\
+            "<tr class=\"{row_class}\">\
+            <td><span class=\"sev-tag {sev_str}\">{sev_label}</span></td>\
             <td><code>{rule}</code></td>\
-            <td>{subject}</td>\
+            <td class=\"subj-cell\">{subject}</td>\
             <td>{title}{note}</td>\
-            <td>{count}</td>\
+            <td class=\"r\">{count}</td>\
             </tr>",
-            sev = severity_class(finding.severity),
             sev_label = escape(&format!("{:?}", finding.severity)),
             rule = escape(&finding.rule_id),
             subject = escape(&finding.subject),
@@ -218,21 +381,12 @@ fn render_findings_table(out: &mut String, analysis: &Analysis) {
             count = finding.occurrences,
         );
     }
-    out.push_str("</tbody>\n</table>\n</section>\n\n");
+    out.push_str("</tbody>\n</table></div>\n</section>\n\n");
 }
 
 /// Emits the per-class coverage table.
-///
-/// Always rendered, including for a full-coverage backend. That is deliberate: a table that appears only
-/// when something is wrong teaches a reader to equate its absence with completeness, and they would then
-/// have no way to tell a full-coverage recording from a report that simply forgot to say. The strace
-/// version of this table is also not uniformly green — reads are filtered to a path list, and connects
-/// carry no hostname — so there is real information in it either way.
-///
-/// The wording of every row comes from [`installscope_core::observability`] rather than from this module.
-/// A renderer that phrased its own caveats could drift from what the engine actually did.
 fn render_coverage_table(out: &mut String, analysis: &Analysis) {
-    out.push_str("<section class=\"coverage\">\n<h2>What this recording could observe</h2>\n");
+    out.push_str("<section class=\"coverage\">\n<div class=\"section-head\"><h2 class=\"panel-title\">What this recording could observe</h2></div>\n");
     let _ = writeln!(
         out,
         "<p class=\"coverage-intro\">Recorded with the <code>{}</code> backend. A class marked \
@@ -241,7 +395,7 @@ fn render_coverage_table(out: &mut String, analysis: &Analysis) {
         escape(&format!("{}", analysis.coverage.backend))
     );
     out.push_str(
-        "<table>\n<thead><tr>\
+        "<div class=\"table-wrap\"><table>\n<thead><tr>\
         <th>Behavior</th><th>Observed</th><th>Qualification</th>\
         </tr></thead>\n<tbody>\n",
     );
@@ -254,7 +408,7 @@ fn render_coverage_table(out: &mut String, analysis: &Analysis) {
         let _ = writeln!(
             out,
             "<tr class=\"coverage-{state_class}\">\
-            <td>{class}</td>\
+            <td class=\"mono\">{class}</td>\
             <td><span class=\"tag {state_class}\">{state_label}</span></td>\
             <td>{note}</td>\
             </tr>",
@@ -265,7 +419,7 @@ fn render_coverage_table(out: &mut String, analysis: &Analysis) {
             ),
         );
     }
-    out.push_str("</tbody>\n</table>\n</section>\n\n");
+    out.push_str("</tbody>\n</table></div>\n</section>\n\n");
 }
 
 /// Emits the collapsible skipped-rules section.
@@ -292,281 +446,617 @@ fn render_skipped_rules(out: &mut String, analysis: &Analysis) {
 fn render_footer(out: &mut String, analysis: &Analysis) {
     let _ = writeln!(
         out,
-        "<footer>\n<p>Recorded with the {} backend. Advisory: this report records what the \
-         install did, and does not block the build.</p>\n</footer>",
+        "<footer>\n<div class=\"footer-left\">Recorded with the {} backend. Advisory: this report records what the \
+         install did, and does not block the build.</div>\n<div class=\"footer-right\">InstallScope &middot; immutable forensic trace</div>\n</footer>",
         escape(&format!("{}", analysis.coverage.backend)),
     );
 }
 
 /// The full inline `<style>` block.
 ///
-/// Self-contained: no `@import`, no external fonts, no CDN. The font stack uses system fonts so the
-/// file works on any machine without a network request.
+/// Self-contained: no `@import`, no external fonts, no CDN. Hand-authored CSS tokens adhering to
+/// Tactical Minimalism flight-recorder aesthetics.
 const INLINE_CSS: &str = r#"<style>
 :root {
-    --accent: #FF6A3D;
     --bg: #0B0F14;
     --surface: #131A22;
-    --surface-inlay: #070B0E;
-    --border: #1E2A36;
-    --border-hover: #324355;
-    --text: #E6EDF3;
-    --text-muted: #7D8B99;
-    --critical: #E5484D;
-    --critical-bg: rgba(229, 72, 77, 0.12);
+    --header: #0E141B;
+    --rule: #1E2A36;
+    --rule-soft: #161F29;
+    --row-hover: #161E27;
+    --fg: #E6EDF3;
+    --fg-dim: #7D8B99;
+    --fg-faint: #4A5763;
+    --beacon: #FF6A3D;
+    --crit: #E5484D;
     --high: #F5A524;
-    --high-bg: rgba(245, 165, 36, 0.12);
-    --medium: #3B82C4;
-    --medium-bg: rgba(59, 130, 196, 0.12);
-    --low: #7D8B99;
-    --low-bg: rgba(125, 139, 153, 0.12);
-    --clean: #3DD68C;
-    --clean-bg: rgba(61, 214, 140, 0.12);
+    --med: #3B82C4;
+    --ok: #3DD68C;
+    --crit-txt: #FF6B70;
+    --high-txt: #F5A524;
+    --med-txt: #6BA6E0;
+    --ok-txt: #3DD68C;
 }
-*, *::before, *::after { box-sizing: border-box; }
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
 body {
-    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
     background: var(--bg);
-    color: var(--text);
-    max-width: 900px;
-    margin: 2.5rem auto;
-    padding: 0 1.5rem;
-    line-height: 1.55;
+    color: var(--fg);
+    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    padding: 32px;
     -webkit-font-smoothing: antialiased;
 }
+
+.mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+}
+
+.shell {
+    max-width: 1440px;
+    margin: 0 auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    border-radius: 2px;
+}
+
+/* 56px Flight Recorder Header */
 header {
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 1.5rem;
-    margin-bottom: 1.75rem;
-}
-.beacon-dot {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background-color: var(--accent);
-    margin-right: 10px;
-    vertical-align: middle;
-    animation: pulse-beacon 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-@keyframes pulse-beacon {
-    0% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.35; transform: scale(0.9); }
-    100% { opacity: 1; transform: scale(1); }
-}
-h1 {
-    color: var(--text);
-    margin: 0;
-    font-size: 1.65rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    height: 56px;
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    background: var(--header);
+    border-bottom: 1px solid var(--rule);
 }
-h2 {
-    color: var(--text);
-    margin: 2rem 0 0.85rem;
-    font-size: 1.2rem;
-    font-weight: 600;
-    letter-spacing: -0.01em;
+
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
-.subject {
-    color: var(--text-muted);
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.85rem;
-    margin: 0.4rem 0 1rem;
-}
-.score-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 1rem 1.25rem;
-    margin-top: 1rem;
+
+.beacon-sq {
+    width: 7px;
+    height: 7px;
+    background: var(--beacon);
     display: inline-block;
+    animation: pulse-beacon 1.2s ease-in-out infinite;
 }
-.score {
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 2.2rem;
-    font-weight: 700;
-    margin: 0;
-    line-height: 1.1;
-    letter-spacing: -0.02em;
+
+@keyframes pulse-beacon {
+    0% { opacity: 1; }
+    50% { opacity: 0.35; }
+    100% { opacity: 1; }
 }
-.score.clean { color: var(--clean); }
-.score.findings { color: var(--high); }
-.score.critical { color: var(--critical); }
-.score.partial { color: var(--text-muted); }
-.badge {
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.75rem;
-    padding: 0.25rem 0.55rem;
-    border-radius: 3px;
-    font-weight: 700;
+
+@media (prefers-reduced-motion: reduce) {
+    .beacon-sq {
+        animation: none;
+        opacity: 1;
+    }
+}
+
+.rec-tag {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
     text-transform: uppercase;
-    vertical-align: middle;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.14em;
+    color: var(--beacon);
+    margin-right: 8px;
 }
-.badge.partial {
-    background: rgba(245, 165, 36, 0.15);
-    color: var(--high);
-    border: 1px solid var(--high);
+
+.pkg-name {
+    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.3;
+    font-weight: 600;
+    color: var(--fg);
 }
-.callout {
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--medium);
-    padding: 0.85rem 1.15rem;
-    margin: 1.25rem 0;
+
+.header-right {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+}
+
+.sep {
+    color: var(--fg-faint);
+    margin: 0 4px;
+}
+
+/* Row 1: Score Card + Priority Findings */
+.row-top {
+    display: flex;
+    gap: 16px;
+    padding: 24px;
+    border-bottom: 1px solid var(--rule);
+}
+
+.score-card {
+    flex: 0 0 280px;
     background: var(--surface);
-    border-radius: 4px;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
 }
-.callout.warning {
-    border-color: var(--border);
-    border-left-color: var(--critical);
-    background: rgba(229, 72, 77, 0.05);
+
+.score-baseline {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
 }
-.callout.caveat {
-    border-left-color: var(--high);
+
+.score-num {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 44px;
+    line-height: 1.0;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--fg);
 }
-.callout p { margin: 0; }
-.callout ul { margin: 0.5rem 0 0; padding-left: 1.25rem; }
-.summary {
+
+.score-max {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    line-height: 1.0;
+    color: var(--fg-dim);
+}
+
+.score-raw {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: var(--high-txt);
+}
+
+.score-label {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+    margin-top: 8px;
+}
+
+.score-band {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    margin-top: 4px;
+}
+
+.score-band.ok { color: var(--ok-txt); }
+.score-band.med { color: var(--med-txt); }
+.score-band.high { color: var(--high-txt); }
+.score-band.crit { color: var(--crit-txt); }
+.score-band.partial { color: var(--high-txt); }
+
+.score-def {
+    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--fg-dim);
+    margin-top: 8px;
+}
+
+.band-track {
+    position: relative;
+    height: 4px;
+    background: var(--header);
+    display: flex;
+    margin-top: 12px;
+}
+
+.track-seg {
+    height: 4px;
+    border-right: 1px solid var(--rule);
+}
+
+.seg-ok { width: 10%; background: rgba(61, 214, 140, 0.18); }
+.seg-med { width: 15%; background: rgba(59, 130, 196, 0.18); }
+.seg-high { width: 35%; background: rgba(245, 165, 36, 0.18); }
+.seg-crit { width: 40%; background: rgba(229, 72, 77, 0.18); border-right: none; }
+
+.track-tick {
+    position: absolute;
+    top: 0;
+    width: 1px;
+    height: 4px;
+    background: var(--fg);
+}
+
+.band-legend {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+    margin-top: 8px;
+}
+
+.micro-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    row-gap: 8px;
+    column-gap: 12px;
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule);
+}
+
+.grid-cell {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+
+.grid-label {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+}
+
+.grid-val {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    line-height: 1.2;
+    font-weight: 400;
+    color: var(--fg);
+}
+
+.findings-panel {
+    flex: 1;
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1.5rem;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
 }
-.bullets {
-    padding-left: 1.25rem;
-    margin: 0;
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.88rem;
+
+.panel-title {
+    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 11px;
+    line-height: 1.4;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--fg-dim);
+    margin-bottom: 16px;
 }
-.bullets li { margin: 0.45rem 0; color: #D0D7DE; }
-.overflow { color: var(--text-muted); font-style: italic; }
+
+.findings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.finding-item {
+    padding-left: 12px;
+    position: relative;
+}
+
+.finding-item.crit { border-left: 2px solid var(--crit); }
+.finding-item.high { border-left: 2px solid var(--high); }
+.finding-item.med { border-left: 2px solid var(--med); }
+.finding-item.low { border-left: 2px solid var(--rule); }
+
+.finding-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+
+.finding-prose {
+    font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.55;
+    font-weight: 400;
+    max-width: 68ch;
+    color: var(--fg);
+}
+
+.finding-count {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    color: var(--fg-dim);
+    margin-left: 6px;
+}
+
 .headline {
     font-size: 1.05rem;
     font-weight: 500;
-    color: var(--clean);
+    color: var(--ok-txt);
     margin: 0;
 }
+
+.overflow {
+    color: var(--fg-dim);
+    font-size: 11px;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-top: 8px;
+}
+
+/* Callouts */
+.callout {
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--med);
+    padding: 12px 16px;
+    margin: 20px 24px 0;
+    background: var(--header);
+    border-radius: 2px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.callout.warning {
+    border-left-color: var(--crit);
+    background: rgba(229, 72, 77, 0.08);
+}
+
+.callout.caveat {
+    border-left-color: var(--high);
+    background: rgba(245, 165, 36, 0.08);
+}
+
+.callout p { margin: 0; }
+.callout ul { margin: 8px 0 0; padding-left: 20px; }
+.callout li { margin: 4px 0; font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* Section Headers & Tables */
+.findings, .coverage {
+    padding: 24px 24px 0 24px;
+}
+
+.section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.section-meta {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+}
+
+.table-wrap {
+    border: 1px solid var(--rule);
+    overflow-x: auto;
+}
+
 table {
     width: 100%;
     border-collapse: collapse;
-    margin: 0.85rem 0;
-    font-size: 0.88rem;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
 }
+
+thead {
+    background: var(--header);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    border-bottom: 1px solid var(--rule);
+}
+
 th {
+    height: 28px;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-dim);
+    padding: 0 10px;
     text-align: left;
-    padding: 0.65rem 0.9rem;
-    background: #18202A;
-    border-bottom: 1px solid var(--border);
-    color: var(--text-muted);
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    white-space: nowrap;
 }
+
+th.r, td.r { text-align: right; }
+
 td {
-    padding: 0.65rem 0.9rem;
-    border-bottom: 1px solid var(--border);
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rule-soft);
     vertical-align: top;
-    color: var(--text);
+    color: var(--fg);
 }
+
 tr:last-child td { border-bottom: none; }
-tr:hover td { background: rgba(255, 255, 255, 0.02); }
-code {
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.85em;
-    background: var(--surface-inlay);
-    border: 1px solid var(--border);
-    padding: 0.15rem 0.4rem;
-    border-radius: 3px;
-    color: #FFB59F;
+tr:hover td { background: var(--row-hover); }
+
+.row-crit { border-left: 2px solid var(--crit); }
+.row-high { border-left: 2px solid var(--high); }
+
+.col-sev { width: 90px; }
+.col-rule { width: 180px; }
+.col-subj { width: 180px; }
+.col-cnt { width: 60px; }
+
+.subj-cell {
+    color: var(--fg);
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
-.tag {
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.72rem;
-    padding: 0.2rem 0.45rem;
-    border-radius: 3px;
-    font-weight: 700;
+
+.note-text {
+    color: var(--fg-dim);
+    font-size: 11px;
+}
+
+code {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    background: var(--header);
+    border: 1px solid var(--rule);
+    padding: 1px 4px;
+    border-radius: 2px;
+    color: var(--fg);
+}
+
+/* Severity & Status Tags */
+.sev-tag, .badge, .tag {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 500;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.14em;
+    padding: 2px 5px;
+    border-radius: 2px;
+    background: transparent;
     display: inline-block;
     white-space: nowrap;
 }
-.tag.critical { background: var(--critical-bg); color: var(--critical); border: 1px solid var(--critical); }
-.tag.high { background: var(--high-bg); color: var(--high); border: 1px solid var(--high); }
-.tag.medium { background: var(--medium-bg); color: var(--medium); border: 1px solid var(--medium); }
-.tag.low { background: var(--low-bg); color: var(--low); border: 1px solid var(--low); }
-.tag.observed { background: var(--clean-bg); color: var(--clean); border: 1px solid var(--clean); }
-.tag.qualified { background: var(--medium-bg); color: var(--medium); border: 1px solid var(--medium); }
-.tag.unobserved { background: var(--critical-bg); color: var(--critical); border: 1px solid var(--critical); }
-.coverage-intro { color: var(--text-muted); font-size: 0.88rem; margin: 0 0 0.65rem; }
-.coverage table { font-size: 0.85rem; }
-.coverage-unobserved td { border-left: 3px solid var(--critical); }
-.severity-critical td { border-left: 3px solid var(--critical); }
-.severity-high td:first-child { border-left: 3px solid var(--high); }
-details {
-    margin: 1.25rem 0;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.75rem 1rem;
+
+.sev-tag.crit, .tag.critical, .tag.unobserved {
+    border: 1px solid var(--crit);
+    color: var(--crit-txt);
+    background: rgba(229, 72, 77, 0.12);
 }
-summary {
+
+.sev-tag.high, .tag.high, .badge.partial {
+    border: 1px solid var(--high);
+    color: var(--high-txt);
+    background: rgba(245, 165, 36, 0.12);
+}
+
+.sev-tag.med, .tag.medium, .tag.qualified {
+    border: 1px solid var(--med);
+    color: var(--med-txt);
+}
+
+.sev-tag.low, .tag.low {
+    border: 1px solid var(--rule);
+    color: var(--fg-dim);
+}
+
+.tag.observed {
+    border: 1px solid var(--ok);
+    color: var(--ok-txt);
+}
+
+.coverage-intro {
+    color: var(--fg-dim);
+    font-size: 12px;
+    margin: 0 0 10px;
+}
+
+.coverage-unobserved td { border-left: 2px solid var(--crit); }
+
+/* Collapsible Skipped Checks */
+details.skipped {
+    margin: 20px 24px 0;
+    background: var(--header);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 12px 16px;
+}
+
+details.skipped summary {
     cursor: pointer;
-    color: var(--text-muted);
-    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
-    font-size: 0.85rem;
-    font-weight: 600;
+    color: var(--fg-dim);
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
 }
-summary:hover { color: var(--text); }
-.skipped ul {
-    color: var(--text-muted);
-    margin: 0.75rem 0 0.25rem;
-    padding-left: 1.25rem;
+
+details.skipped ul {
+    color: var(--fg-dim);
+    margin: 10px 0 0;
+    padding-left: 20px;
+    font-size: 12px;
 }
-.skipped li { margin: 0.35rem 0; }
+
+details.skipped li { margin: 4px 0; }
+
+/* Footer */
 footer {
-    margin-top: 2.5rem;
-    padding-top: 1.25rem;
-    border-top: 1px solid var(--border);
-    color: var(--text-muted);
-    font-size: 0.82rem;
+    height: 36px;
+    background: var(--header);
+    border-top: 1px solid var(--rule);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    margin-top: 24px;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    color: var(--fg-dim);
+}
+
+.footer-left { color: var(--fg-dim); }
+.footer-right { color: var(--fg-faint); }
+
+/* Print Styles */
+@media print {
+    body {
+        background: #FFFFFF !important;
+        color: #000000 !important;
+        padding: 0 !important;
+    }
+    .shell, .score-card, .findings-panel, .table-wrap, table, thead, tbody, tr, td, th, header, footer {
+        background: #FFFFFF !important;
+        color: #000000 !important;
+        border-color: #000000 !important;
+    }
+    .beacon-sq {
+        animation: none !important;
+        opacity: 1 !important;
+        background: #000000 !important;
+    }
+    footer {
+        display: none !important;
+    }
+    .row-crit, .row-high {
+        border-left: 2px solid #000000 !important;
+    }
+    .sev-tag, .grid-val, .grid-label, .finding-prose, .score-num, .score-max, .score-band, .pkg-name, code {
+        color: #000000 !important;
+        background: transparent !important;
+        border-color: #000000 !important;
+    }
 }
 </style>"#;
-
-/// CSS class for the score element.
-fn score_class(analysis: &Analysis) -> &'static str {
-    let verdict = Verdict::of(analysis);
-    match verdict {
-        Verdict::Partial => "partial",
-        Verdict::Clean | Verdict::CleanWithCaveat => "clean",
-        Verdict::Findings => {
-            if analysis.score.value >= 80 {
-                "critical"
-            } else {
-                "findings"
-            }
-        }
-    }
-}
-
-/// CSS class for a severity.
-fn severity_class(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "critical",
-        Severity::High => "high",
-        Severity::Medium => "medium",
-        Severity::Low => "low",
-    }
-}
 
 /// How many findings count toward the score.
 fn scorable_count(analysis: &Analysis) -> usize {
