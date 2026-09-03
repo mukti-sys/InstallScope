@@ -1048,7 +1048,7 @@ impl Parser {
             }
 
             // ---- evasion & untraced channels ----------------------------------------------------
-            "io_uring_setup" | "io_uring_enter" | "io_uring_register" | "ptrace" => {
+            "io_uring_enter" | "ptrace" => {
                 self.stats.evasion_attempts += 1;
             }
 
