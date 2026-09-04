@@ -65,8 +65,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" \
-            -DestinationPath "dist/installscope-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath "dist/installscope-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -94,9 +93,28 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Extract Release Notes
+        run: |
+          python3 -c "
+          import re
+          ref = '${{ github.ref_name }}'.lstrip('v')
+          with open('CHANGELOG.md') as f:
+              content = f.read()
+          match = re.search(r'## \[' + re.escape(ref) + r'\].*?\n(.*?)(?=\n## \[|\Z)', content, re.DOTALL)
+          if match:
+              with open('RELEASE_NOTES.md', 'w') as out:
+                  out.write(match.group(1).strip() + '\n')
+          else:
+              with open('RELEASE_NOTES.md', 'w') as out:
+                  out.write('InstallScope ${{ github.ref_name }}\n')
+          "
+          cat RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: InstallScope ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           files: |
             release-assets/*
           draft: false
