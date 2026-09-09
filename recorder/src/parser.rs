@@ -6,16 +6,25 @@
 //!
 //! # Traced syscalls, and why
 //!
-//! Writes: `openat`, `open`, `creat`, `truncate`, `write`, `pwrite64`, `writev`, `rename*`,
-//! `unlink*`, `mkdir*`, `rmdir`, `chmod`, `fchmodat`, `chown*`, `link*`, `symlink*`.
-//! Network: `connect`, `sendto`, `sendmsg`.
+//! Writes: `openat`, `openat2`, `open`, `creat`, `truncate`, `ftruncate`, `write`, `pwrite64`,
+//! `writev`, `pwritev`, `rename*`, `unlink*`, `mkdir*`, `rmdir`, `chmod`, `fchmod`, `fchmodat`,
+//! `chown`, `fchown`, `lchown`, `fchownat`, `link*`, `symlink*`.
+//! Network: `socket`, `connect`, `send`, `sendto`, `sendmsg`, `sendmmsg`.
 //! Process: `execve`, `execveat`, `clone`, `clone3`, `fork`, `vfork`.
 //! Bookkeeping: `close`, `chdir`, `fchdir`, `dup`, `dup2`, `dup3`.
+//! Evasion: `ptrace`.
+//!
+//! The authoritative list is [`crate::strace::TRACE_SET`], which is what actually reaches strace; this
+//! summary is a reader's convenience and `trace_set_and_parser_agree` asserts the two do not drift.
 //!
 //! `write` is traced here, unlike in the Phase 0 harness. The harness omitted it to keep traces
 //! small, at the documented cost of having no byte counts — which made Design.md:35's "wrote ~13 MB
 //! outside project dir" impossible to produce. Byte accounting is a Phase 1 requirement, so writes
 //! are traced and aggregated per descriptor.
+//!
+//! The descriptor-based forms (`fchmod`, `fchown`, `ftruncate`) are traced alongside their path forms
+//! because they change the same thing. Tracing only `chmod` left the top-severity
+//! `chmod_exec_outside_project` rule defeatable by opening the file first.
 //!
 //! Reads are filtered to credential- and environment-bearing paths. Recording every read would bury
 //! the evidence under npm's own traffic; the filter list lives here rather than in the schema so it
@@ -863,6 +872,66 @@ impl Parser {
                             flags: None,
                             mode: if name == "fchmodat" {
                                 args.get(2).cloned()
+                            } else {
+                                None
+                            },
+                            source: None,
+                            outcome,
+                        }),
+                    ),
+                    &mut out,
+                );
+            }
+
+            // ---- descriptor-based mutations ----------------------------------------------------
+            // The same changes as `chmod`/`chown`/`truncate`, reached through an open descriptor
+            // instead of a path. Tracing only the path forms left the top-severity chmod rule
+            // defeatable by opening the file first, which is one line of Node.
+            //
+            // The path comes from the fd, so it is only as good as the fd table — which is exactly the
+            // situation `write` is already in. When the descriptor cannot be resolved to a file the
+            // event is dropped rather than emitted with an invented path: a mutation whose target is
+            // unknown cannot be placed inside or outside a zone, and guessing is how a fabricated
+            // critical finding gets made.
+            "fchmod" | "fchown" | "ftruncate" => {
+                let Some(fd) = args.first().and_then(|a| fd_number(a)) else {
+                    return out;
+                };
+                // Prefer the -yy annotation, then the table. Same order as `write`, for the same
+                // reason: the kernel's own answer beats a reconstruction.
+                let target = args
+                    .first()
+                    .and_then(|a| fd_annotation(a))
+                    .filter(|a| a.starts_with('/'))
+                    .map(|a| TracedPath::new(a, PathOrigin::Kernel))
+                    .or_else(|| match self.fds.get(pid, fd) {
+                        Some(FdTarget::File { path, origin }) => {
+                            Some(TracedPath::new(path.clone(), *origin))
+                        }
+                        // fchmod on a socket is not a filesystem mutation, and an unknown descriptor
+                        // is not evidence about any path.
+                        Some(FdTarget::Socket { .. }) | None => None,
+                    });
+                let Some(target) = target else {
+                    return out;
+                };
+                let kind = match name {
+                    "fchmod" => WriteKind::Chmod,
+                    "fchown" => WriteKind::Chown,
+                    _ => WriteKind::Truncate,
+                };
+                self.emit(
+                    Event::observed(
+                        Self::meta(ts_ns, pid, name),
+                        Payload::FsWrite(FsWrite {
+                            target,
+                            kind,
+                            bytes: None,
+                            flags: None,
+                            // `fchmod(fd, mode)` — the mode is the second argument, and it is what the
+                            // executable-bit rule reads. `fchown` and `ftruncate` have no mode.
+                            mode: if name == "fchmod" {
+                                args.get(1).cloned()
                             } else {
                                 None
                             },

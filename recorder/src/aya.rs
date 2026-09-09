@@ -3,12 +3,31 @@
 //! Linux-only, and gated behind the `aya-backend` feature because it pulls in `aya` and requires a
 //! compiled eBPF object. `installscope record --backend strace` works without any of it.
 //!
-//! # UNVERIFIED
+//! # Verification status
 //!
-//! This has never run. G1 (#33297876067) proved a *tracepoint* program loads on `ubuntu-latest` and
-//! delivers perf events; it did not prove maps-in-tracepoints, entry/exit correlation, or the argument
-//! offsets these programs depend on. Expect the first real run to fail. The workflow dumps every
-//! tracepoint format file before loading so a mismatch is a five-minute fix rather than a guessing game.
+//! Verified on a live kernel. Run #33417231156 (commit `25c19e5`, kernel 6.17.0-1022-azure) compiled the
+//! probes for `bpfel-unknown-none`, loaded them under sudo, attached every program, recorded the
+//! synthetic parity workload, and reported PARITY OK — 29 shared facts, 40 differences, 0 unexplained.
+//! Getting there cost roughly fourteen iterations and six real bugs, each itemised in `Memory.md`: a BPF
+//! stack overflow from building `PendingOpen` as a local, `sched_process_fork` offsets that turned out to
+//! be `__data_loc` descriptors rather than inline arrays, out-of-order per-CPU delivery, missing legacy
+//! (non-`*at`) syscall probes, a `sched_process_exit` race that dropped trailing writes, and six parity
+//! classifier gaps.
+//!
+//! `phase2-aya.yml` re-runs that whole sequence on every push touching this file, the probes, or the
+//! shared ABI. It is the only thing that builds the probes; `rust.yml` lints and tests this loader on
+//! every push regardless.
+//!
+//! What that run did **not** establish, and what to suspect first when it next goes red:
+//!
+//! - **Tracepoint argument offsets are per-kernel.** `ARG0 = 16` with an 8-byte stride held on
+//!   6.17.0-1022-azure. A runner image bump can move it. The workflow dumps every format file *before*
+//!   building for exactly this reason.
+//! - **Probes that fail to attach without being `required` do not force PARTIAL** (see [`PROGRAMS`]), so
+//!   a legacy probe silently unavailable on a future kernel narrows coverage without saying so.
+//! - **Entry-only probes cannot report failure.** `connect`, `write`, and the path-only mutations hook
+//!   `sys_enter_*` with no exit counterpart, so a refused connect is translated as a success. This is a
+//!   known defect rather than a design choice; see [`crate::translate`].
 //!
 //! # How this differs structurally from the strace backend
 //!
@@ -59,7 +78,7 @@ const TRACKED_PIDS_MAP: &str = "TRACKED_PIDS";
 ///
 /// Three rather than one because `PerfEventArray<T>` is a typed channel: `output` sends exactly
 /// `size_of::<T>()` bytes. A single map would have to carry the largest record for every event, spending
-/// 1,600 bytes to report a 592-byte write — the difference between a ring that keeps up during a tarball
+/// 2,624 bytes to report a 592-byte write — the difference between a ring that keeps up during a tarball
 /// extraction and one that drops records, and dropped records force PARTIAL.
 ///
 /// Ordering is unaffected: [`Merger`] sorts by `ktime_ns` across every source, so which map a record

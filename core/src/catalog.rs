@@ -214,7 +214,9 @@ impl Catalog {
     /// The catalog compiled into the binary.
     ///
     /// Shipped as a default so `installscope` works on a fresh clone with no configuration, which
-    /// PRD.md:46 asks for. A `--rules` path overrides it.
+    /// PRD.md:46 asks for. `installscope report --rules <path>` loads one from disk instead, via
+    /// [`Self::load`] — which is how a private registry host or an extra expected build directory gets
+    /// added without a rebuild.
     ///
     /// # Errors
     /// [`CatalogError`] if the embedded file fails validation — which would be a build-time bug, caught

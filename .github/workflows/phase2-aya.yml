@@ -3,23 +3,52 @@ name: Phase 2 — aya backend parity
 # Phase 2's Done condition (Phases.md:24): "parity on synthetic workload in VM; ubuntu-latest Action
 # runs full record; agent stamps backend."
 #
-# This workflow is the first thing that has ever compiled or loaded the eBPF programs. Everything in
-# recorder/aya-ebpf/ was written on a machine with no Linux kernel and no bpfel-unknown-none target, so
-# the first run is expected to fail. It is built to fail *diagnosably*:
+# STATUS: PASSED. Run #33417231156 on commit 25c19e5 compiled the probes for bpfel-unknown-none,
+# loaded them under sudo, attached all 10+ tracepoints, recorded the synthetic workload with both
+# backends, and reported PARITY OK — 29 shared facts, 40 differences, 0 unexplained. Six real bugs were
+# found and fixed getting there (BPF stack overflow, wrong sched_process_fork offsets, per-CPU event
+# reordering, missing legacy syscall probes, a sched_process_exit race, and six parity classifier gaps);
+# they are itemised in Memory.md.
 #
-#   - every tracepoint format file is dumped BEFORE the build, because argument offsets are the
-#     load-bearing assumption in the probes and the format files are the authoritative source;
+# WHY THIS RUNS ON PUSH, NOT ONLY ON DISPATCH
+#
+# README.md states that the aya backend is verified continuously in CI. That was not literally true
+# while this workflow was dispatch-only: the probes could regress and nobody would learn until someone
+# remembered to press a button. The `paths` filter below is what makes the claim cheap enough to keep —
+# a commit that touches only docs, reports, rules, or the CLI does not spend a runner minute here.
+#
+# The eBPF programs themselves still need a nightly toolchain and bpf-linker, which is why they are not
+# in the default `cargo test` path. `rust.yml` lints and tests the *loader* (recorder/src/aya.rs) on
+# every push; this workflow is the only thing that builds and loads the *probes*.
+#
+# HOW IT IS BUILT TO FAIL
+#
+#   - every tracepoint format file is dumped BEFORE the build, because argument offsets are per-kernel
+#     and the format files are the authoritative source. A runner image bump that moves an offset shows
+#     up here as a diff rather than as a mystery;
 #   - the verifier's rejection log is captured verbatim rather than summarized;
 #   - the strace recording runs regardless, so a failed aya run still produces the baseline half of the
 #     comparison and the artifact is useful either way.
 #
-# Manual dispatch only: it needs sudo to load BPF programs, and a gate is run deliberately.
+# It needs sudo to load BPF programs. ubuntu-latest grants passwordless sudo.
 
 on:
+  push:
+    paths:
+      # The probes, the loader, the wire format they share, and this workflow. Nothing else can break
+      # aya parity without also touching one of these.
+      - "recorder/aya-ebpf/**"
+      - "recorder/src/aya.rs"
+      - "recorder/src/merge.rs"
+      - "recorder/src/translate.rs"
+      - "recorder/src/parity.rs"
+      - "abi/**"
+      - "harness/parity/**"
+      - ".github/workflows/phase2-aya.yml"
   workflow_dispatch:
     inputs:
       keep_going:
-        description: "Continue to the parity comparison even if some probes fail to attach (a partial attach is still evidence)"
+        description: "Report a parity failure without failing the run. Use when iterating on the probes; a push-triggered run always fails on a parity failure regardless of this setting."
         required: false
         default: "true"
       rust_toolchain:
@@ -32,6 +61,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Resolved once here rather than at each use site. `inputs` is null on a push event, so every
+  # `inputs.*` reference needs a fallback; centralising them means a new step cannot forget one and
+  # silently receive an empty string.
+  #
+  # TOOLCHAIN: floating `nightly` on purpose — bpfel-unknown-none needs `-Z build-std`, which is
+  # nightly-only, and pinning a date would quietly rot until someone noticed the pin was two years old.
+  # The cost is that an unrelated nightly regression can turn this red; when that happens, dispatch with
+  # an explicit older toolchain rather than disabling the workflow.
+  TOOLCHAIN: ${{ inputs.rust_toolchain || 'nightly' }}
+  # A parity failure on a push is a regression and must fail the run. On a dispatch it is usually
+  # someone iterating on the probes, so `keep_going` lets them see the full diff without a red run.
+  KEEP_GOING: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_going == 'true' }}
 
 concurrency:
   group: phase2-aya-${{ github.ref }}
@@ -122,7 +163,7 @@ jobs:
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ inputs.rust_toolchain || 'nightly' }}
+          toolchain: ${{ env.TOOLCHAIN }}
           components: rust-src
 
       - name: Install stable Rust
@@ -143,12 +184,11 @@ jobs:
       # ---- build ------------------------------------------------------------------------------
       - name: Build the eBPF programs
         id: build_ebpf
-        # First compilation ever. A failure here is the expected outcome, not a surprise, so the log is
-        # captured in full and the workflow continues to produce the strace baseline regardless.
+        # continue-on-error so the strace baseline still runs and the artifact is useful either way. The
+        # gate step at the end turns a non-zero status here into a failed run, so this is not a way for a
+        # broken build to pass.
         continue-on-error: true
         working-directory: recorder/aya-ebpf
-        env:
-          TOOLCHAIN: ${{ inputs.rust_toolchain || 'nightly' }}
         run: |
           set -uo pipefail
           if [[ ! "$TOOLCHAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
@@ -281,7 +321,10 @@ jobs:
       - name: Compare the two recordings
         id: parity
         if: always() && hashFiles('artifacts/aya/events.jsonl') != '' && hashFiles('artifacts/strace/events.jsonl') != ''
-        continue-on-error: ${{ inputs.keep_going == 'true' }}
+        # `KEEP_GOING` is false on a push (see the env block), so a parity regression fails the run. On a
+        # dispatch it defaults true so someone iterating on the probes sees the whole diff rather than a
+        # truncated one. The gate step still reports the status either way.
+        continue-on-error: ${{ env.KEEP_GOING == 'true' }}
         run: |
           set -uo pipefail
           ./target/release/installscope parity \
@@ -301,9 +344,10 @@ jobs:
           {
             echo "# Phase 2 — aya backend parity"
             echo ""
-            echo "**This workflow is the first thing to compile or load the eBPF programs.** Everything"
-            echo "in \`recorder/aya-ebpf/\` was written without a kernel to test against, so a failure"
-            echo "here is an expected step rather than a regression."
+            echo "Builds the eBPF probes for \`bpfel-unknown-none\`, loads them on this runner's kernel,"
+            echo "records the synthetic workload with both backends, and compares the two streams."
+            echo "Phase 2 first passed in run #33417231156; this run checks it still holds on"
+            echo "\`$(uname -r)\`."
             echo ""
             echo "| Stage | Result |"
             echo "|---|---|"
@@ -377,7 +421,7 @@ jobs:
           parity="${{ steps.parity.outputs.status }}"
 
           if [ "$ebpf" != "0" ]; then
-            echo "::error title=eBPF build failed::The probes did not compile. Check build-ebpf.log and the tracepoint format files in the artifact. Phase 2 remains open; Scope.md:59 pre-authorizes falling back to libbpf-rs or to a strace-only product."
+            echo "::error title=eBPF build failed::The probes did not compile. Check build-ebpf.log and the tracepoint format files in the artifact; a runner-image kernel bump that moves a tracepoint argument offset shows up here. Scope.md:59 pre-authorizes falling back to libbpf-rs or to a strace-only product if it cannot be recovered."
             exit 1
           fi
           if [ "$cli" != "0" ]; then
@@ -394,6 +438,13 @@ jobs:
           fi
           if [ "$aya" = "3" ]; then
             echo "::warning title=PARTIAL::the aya recording is incomplete; see the reasons in record-aya.log"
+          fi
+          if [ -z "$parity" ]; then
+            # Both streams exist or the step would have been skipped by its `if`, so an unset status here
+            # means the comparison never ran. Reported rather than passed: "parity not run" and "parity
+            # holds" are different results, and a green run must not stand for the first.
+            echo "::error title=Parity did not run::One of the two event streams is missing, so nothing was compared. Check aya-outcome.txt."
+            exit 1
           fi
           if [ "$parity" != "0" ]; then
             echo "::error title=Parity failed::The two backends disagree in ways nothing explains."

@@ -3,35 +3,41 @@
 //! Records the three event classes Phase 2 calls for — filesystem writes, TCP connects, and process
 //! spawns — and pushes them to userspace as [`installscope_abi`] records.
 //!
-//! # UNVERIFIED CODE
+//! # Verification status
 //!
-//! **None of this has been compiled or loaded.** It was written on a Windows machine with no Linux
-//! kernel and no ability to build for `bpfel-unknown-none`. G1 (run #33297876067) proved only that a
-//! *tracepoint* program using `bpf_get_current_comm` loads on `ubuntu-latest`; it explicitly did not
-//! prove the capabilities this file needs. `Rules.md` §5 says admitted uncertainty beats
-//! plausible-looking wrong code, so the specific assumptions are listed below rather than buried:
+//! These programs compile, load, and run. Run #33417231156 (commit `25c19e5`, kernel
+//! 6.17.0-1022-azure) built them for `bpfel-unknown-none`, loaded them under sudo, attached every
+//! program, and recorded the synthetic parity workload with PARITY OK against strace — 29 shared facts,
+//! 40 differences, 0 unexplained. `phase2-aya.yml` repeats that on every push touching this crate.
 //!
-//! 1. **Syscall tracepoint argument offsets.** VERIFIED in run 33385367711 against kernel
+//! The assumptions below were the load-bearing ones. Three are now measured; three remain inferred from
+//! a passing run rather than from a direct check, and are marked as such. `Rules.md` §5 asks for admitted
+//! uncertainty over plausible-looking confidence, so the distinction is kept rather than flattened.
+//!
+//! 1. **Syscall tracepoint argument offsets.** MEASURED in run 33385367711 against kernel
 //!    6.17.0-1022-azure: `sys_enter_openat` reports `dfd@16 filename@24 flags@32 mode@40`, and
-//!    `sys_exit_openat` reports `ret@16`, so `ARG0 = 16` with an 8-byte stride is correct. The workflow
-//!    keeps dumping the format files because this is per-kernel, not universal.
-//! 2. **`sched_process_fork` field offsets.** Initially wrong. Its comm fields are `__data_loc char[]`
-//!    descriptors rather than inline arrays, so the pids sit at 12 and 20, not 24 and 44. Corrected.
-//! 3. **`bpf_probe_read_user_str_bytes` semantics.** Assumed to return the byte slice including the
-//!    NUL terminator, which is why lengths are adjusted below. Still unverified.
-//! 4. **Per-CPU scratch maps.** Every record larger than a fraction of the 512-byte BPF stack is built in
-//!    a `PerCpuArray` and copied out: `FsRecord` is 592 bytes, `ProcRecord` 1,600, `PendingOpen` 528.
-//!    Only `NetRecord` (80) is a local. Getting this wrong surfaces at *link* time as LLVM's "Looks like
-//!    the BPF stack limit is exceeded", which names the function but not the variable — that is how run
-//!    33387878144 failed.
-//! 5. **Entry/exit correlation through a `HashMap`.** Standard practice, but map-in-tracepoint on this
-//!    kernel is unproven, and a dropped entry silently loses one open.
-//! 6. **Verifier acceptance overall.** Loop bounds, bounds checks, and program size all have to satisfy
-//!    the verifier, and no amount of local reasoning substitutes for loading it.
-//!
-//! Expect the first real build to fail. The point of writing it now is that the *shape* — which
-//! syscalls, which fields, which truncation semantics — is a design decision that can be reviewed
-//! independently of whether it compiles.
+//!    `sys_exit_openat` reports `ret@16`, so `ARG0 = 16` with an 8-byte stride is correct **on that
+//!    kernel**. This is per-kernel, not universal, which is why the workflow still dumps every format
+//!    file before building — a runner image bump is the most likely cause of a future red run.
+//! 2. **`sched_process_fork` field offsets.** MEASURED, and initially wrong. Its comm fields are
+//!    `__data_loc char[]` descriptors rather than inline arrays, so the pids sit at 12 and 20, not 24 and
+//!    44. The format-file dump caught it.
+//! 3. **Per-CPU scratch maps.** MEASURED the hard way: run 33387878144 failed at *link* time with LLVM's
+//!    "Looks like the BPF stack limit is exceeded", which names the function but not the variable. Every
+//!    record larger than a fraction of the 512-byte BPF stack is now built in a `PerCpuArray` and copied
+//!    out — `FsRecord` is 592 bytes, `ProcRecord` 2,624, `PendingOpen` 528. Only `NetRecord` (80) is a
+//!    local.
+//! 4. **`bpf_probe_read_user_str_bytes` semantics.** INFERRED. Assumed to return the byte slice including
+//!    the NUL terminator, which is why lengths are adjusted below. The parity run produced correct paths,
+//!    which is consistent with the assumption but does not isolate it — an off-by-one here would show up
+//!    as a trailing NUL in a path, and parity normalizes paths before comparing.
+//! 5. **Entry/exit correlation through a `HashMap`.** WORKS on the tested kernel: `openat` splits entry
+//!    (which knows the path) from exit (which knows the descriptor), and the descriptor is what gives a
+//!    later `write` its path. A dropped entry silently loses one open; the insert failure at the
+//!    `OPEN_INFLIGHT` call site is discarded rather than counted, which is a known gap.
+//! 6. **Verifier acceptance.** ESTABLISHED for the current program set on the current kernel. Any edit
+//!    that adds a loop, a bounds check, or program size re-opens it, and no amount of local reasoning
+//!    substitutes for loading it.
 //!
 //! # What is deliberately absent
 //!
@@ -98,7 +104,7 @@ use installscope_abi::{
 ///
 /// Three maps rather than one because `PerfEventArray<T>::output` takes `&T` and sends exactly
 /// `size_of::<T>()` bytes — it is a typed channel, not a byte stream. A single map would therefore have
-/// to carry the largest record for every event, sending 1,600 bytes to report a 592-byte write. On a
+/// to carry the largest record for every event, sending 2,624 bytes to report a 592-byte write. On a
 /// tarball extraction that is the difference between a ring that keeps up and one that drops records,
 /// and dropped records force PARTIAL.
 ///
@@ -643,7 +649,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
 
     let mut record = NetRecord::zeroed();
     // 80 bytes, so this one genuinely fits on the 512-byte BPF stack — unlike FsRecord (592),
-    // ProcRecord (1600), and PendingOpen (528), which all live in per-CPU maps.
+    // ProcRecord (2624), and PendingOpen (528), which all live in per-CPU maps.
     record.header = header(KIND_NET_CONNECT);
 
     match u32::from(family) {

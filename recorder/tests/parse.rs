@@ -337,6 +337,78 @@ fn records_rename_symlink_delete_and_chmod_with_their_details() {
 }
 
 #[test]
+fn records_descriptor_based_mutations_against_the_descriptor_s_path() {
+    // `chmod(path, 0755)` and `fchmod(open(path), 0755)` change the same bit on the same file. Before
+    // these were traced, the top-severity `chmod_exec_outside_project` rule could be evaded by opening
+    // the file first — one line of Node. The path comes from the fd table, exactly as it does for
+    // `write`, so the resolution machinery is shared rather than duplicated.
+    let (events, _) = parse_fixture("complete");
+    let all = writes(&events);
+    let target = "/usr/local/bin/synthetic-fd-tool";
+
+    let fchmod = all
+        .iter()
+        .find(|w| w.kind == WriteKind::Chmod && w.target.path == target)
+        .expect("fchmod on an open descriptor must be recorded");
+    assert_eq!(
+        fchmod.target.origin,
+        PathOrigin::Kernel,
+        "the -yy annotation on the fd is the kernel's own answer and must be preferred"
+    );
+    assert!(
+        fchmod.mode.as_deref().unwrap_or_default().contains("755"),
+        "the mode must survive: it is what the executable-bit rule reads, got {:?}",
+        fchmod.mode
+    );
+
+    let fchown = all
+        .iter()
+        .find(|w| w.kind == WriteKind::Chown && w.target.path == target)
+        .expect("fchown must be recorded");
+    assert!(
+        fchown.mode.is_none(),
+        "fchown has no mode argument; reporting one would be inventing a field"
+    );
+
+    assert!(
+        all.iter()
+            .any(|w| w.kind == WriteKind::Truncate && w.target.path == target),
+        "ftruncate must be recorded as a truncation of the descriptor's path"
+    );
+}
+
+#[test]
+fn a_descriptor_mutation_with_no_resolvable_target_produces_nothing() {
+    // Refusal, not extraction. `fchmod(99, ...)` on an unknown descriptor and `fchmod(sock, ...)` on a
+    // socket are both mutations whose target this recorder cannot name. Emitting them with a guessed
+    // path would manufacture a "wrote outside expected dirs" finding; emitting them with an empty path
+    // would put a meaningless row in a forensic report. Both are dropped.
+    let (events, _) = parse_fixture("complete");
+    let all = writes(&events);
+
+    assert!(
+        all.iter().all(|w| !w.target.path.is_empty()),
+        "no mutation may carry an empty path"
+    );
+    assert!(
+        !all.iter()
+            .any(|w| w.kind == WriteKind::Chmod && w.target.path.contains("TCP")),
+        "a socket descriptor must never be presented as a filesystem path"
+    );
+    // The fixture contains exactly three chmods: the path-based one, the descriptor-based one, and two
+    // unresolvable attempts that must contribute nothing.
+    let chmods = all.iter().filter(|w| w.kind == WriteKind::Chmod).count();
+    assert_eq!(
+        chmods, 2,
+        "expected the path chmod and the fd chmod only; the unresolvable ones must be dropped, got {:?}",
+        all.iter()
+            .filter(|w| w.kind == WriteKind::Chmod)
+            .map(|w| (&w.target.path, w.target.origin))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn records_credential_reads_including_failed_attempts() {
     let (events, _) = parse_fixture("complete");
     let all = reads(&events);

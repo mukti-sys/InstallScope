@@ -42,16 +42,36 @@ use crate::{RecorderError, Result, AGENT_VERSION};
 ///   `sendmmsg`, so omitting them means a recording can show a connection to port 53 while producing
 ///   no DNS evidence at all;
 /// - `execve*`: spawns;
-/// - `clone*`/`fork`/`vfork`: inherit the fd table into children.
+/// - `clone*`/`fork`/`vfork`: inherit the fd table into children;
+/// - `fchmod`/`fchown`/`ftruncate`: the descriptor-based forms of mutations already traced by path.
 ///
-/// Deliberately absent: `read`, `stat`, `access`, `mmap`. They are the bulk of an install's syscalls
-/// and contribute no finding that the above do not already establish.
+/// # Why the descriptor-based forms are here
+///
+/// `chmod("x", 0755)` and `fchmod(open("x"), 0755)` change the same bit on the same file. Tracing only
+/// the first meant "made a file executable" — the `chmod_exec_outside_project` rule — could be defeated
+/// by opening the file first, which is one line of Node. The fd table already resolves a descriptor to a
+/// path for `write`, so the same resolution serves these; there was no reason for the gap beyond nobody
+/// having closed it.
+///
+/// Deliberately absent, and each for a reason rather than by oversight:
+///
+/// - `read`, `stat`, `access`, `mmap` — the bulk of an install's syscalls, contributing no finding the
+///   set above does not already establish. `read` of an *interesting* path is captured at `openat`.
+/// - `bind`, `listen`, `accept` — a package that opens a listening port is genuinely invisible, and
+///   closing that gap needs a new event shape rather than a new name in this list. Recorded as a known
+///   coverage gap in [`installscope_core::coverage`] rather than papered over.
+/// - `io_uring_setup`/`io_uring_enter` — a ring can perform opens, writes, and connects without issuing
+///   any syscall in this set. `io_uring_enter` was traced briefly and removed: Node's event loop calls it
+///   continuously, so it produced a PARTIAL on every recording. Ring-*creation* tracing is the right
+///   shape and is not implemented. This is the largest hole in the set and it is named in the coverage
+///   table.
+/// - `sendfile`, `copy_file_range`, `splice` — move bytes without a `write`, so a byte total is a floor.
 const TRACE_SET: &str = concat!(
-    "openat,openat2,open,creat,truncate,",
+    "openat,openat2,open,creat,truncate,ftruncate,",
     "write,pwrite64,writev,pwritev,close,dup,dup2,dup3,",
     "chdir,fchdir,",
     "rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,",
-    "chmod,fchmodat,chown,lchown,fchownat,link,linkat,symlink,symlinkat,",
+    "chmod,fchmod,fchmodat,chown,fchown,lchown,fchownat,link,linkat,symlink,symlinkat,",
     "socket,connect,sendto,sendmsg,send,sendmmsg,",
     "execve,execveat,clone,clone3,fork,vfork,",
     "ptrace"
@@ -686,5 +706,54 @@ mod tests {
                 "{required} is handled by the parser but not traced"
             );
         }
+    }
+
+    #[test]
+    fn descriptor_based_mutations_are_traced_alongside_their_path_forms() {
+        // `chmod("x", 0755)` and `fchmod(open("x"), 0755)` change the same bit on the same file.
+        // Tracing only the first made the top-severity chmod rule defeatable by opening the file
+        // first, which is one line of Node. Asserted as pairs so a future edit cannot drop one half.
+        for (path_form, fd_form) in [
+            ("chmod", "fchmod"),
+            ("chown", "fchown"),
+            ("truncate", "ftruncate"),
+        ] {
+            assert!(
+                TRACE_SET.split(',').any(|s| s == path_form),
+                "{path_form} must be traced"
+            );
+            assert!(
+                TRACE_SET.split(',').any(|s| s == fd_form),
+                "{fd_form} is the descriptor form of {path_form} and must be traced with it, or the \
+                 rule that reads it can be evaded by opening the file first"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trace_set_has_no_duplicates_and_no_empty_entries() {
+        // strace accepts a duplicate silently, so this would never surface as an error — but a repeated
+        // name is a sign of a merge that went wrong, and an empty entry (a stray comma) makes strace
+        // reject the whole expression and exit, which surfaces as "produced no trace files".
+        let names: Vec<&str> = TRACE_SET.split(',').collect();
+        for name in &names {
+            assert!(
+                !name.is_empty(),
+                "an empty entry would make strace reject the set"
+            );
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{name} is not a plausible syscall name"
+            );
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "the trace set contains a duplicate: {names:?}"
+        );
     }
 }

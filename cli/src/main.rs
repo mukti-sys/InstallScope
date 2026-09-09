@@ -333,6 +333,16 @@ struct ReportArgs {
     #[arg(short, long, default_value = "installscope-report")]
     out: PathBuf,
 
+    /// Rule catalog to evaluate against. Defaults to the catalog compiled into this binary.
+    ///
+    /// The embedded catalog is deliberately conservative and repo-controlled, but it cannot know a
+    /// private registry hostname, an internal mirror, or a build directory specific to one project —
+    /// and without this flag the only way to add one would be to fork and rebuild. The file is
+    /// validated before any analysis runs, so a malformed catalog fails loudly and early rather than
+    /// producing a quietly wrong report.
+    #[arg(long, value_name = "PATH")]
+    rules: Option<PathBuf>,
+
     /// Which format(s) to emit.
     #[arg(long, value_enum, default_value_t = ReportFormat::All)]
     format: ReportFormat,
@@ -1172,8 +1182,25 @@ fn run_report(args: &ReportArgs) -> Result<ExitCode> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let catalog =
-        installscope_core::Catalog::embedded().context("loading the embedded rule catalog")?;
+    // A user-supplied catalog is validated by `Catalog::load` before anything is analysed, so a
+    // malformed or future-versioned file is an error here rather than a report missing rules nobody
+    // noticed were absent. The path is echoed so a report is traceable to the catalog that produced it.
+    let catalog = match &args.rules {
+        Some(path) => {
+            let catalog = installscope_core::Catalog::load(path)
+                .with_context(|| format!("loading the rule catalog at {}", path.display()))?;
+            eprintln!(
+                "installscope: using the rule catalog at {} ({} rules, {} enabled)",
+                path.display(),
+                catalog.rules.len(),
+                catalog.rules.iter().filter(|rule| rule.enabled).count()
+            );
+            catalog
+        }
+        None => {
+            installscope_core::Catalog::embedded().context("loading the embedded rule catalog")?
+        }
+    };
     let analysis = installscope_core::evaluate(&catalog, &events);
 
     let context = installscope_report::ReportContext {
@@ -1208,7 +1235,11 @@ fn run_report(args: &ReportArgs) -> Result<ExitCode> {
     }
 
     if emit_html {
-        let html = installscope_report::render_html(&analysis, &context);
+        // The events are passed alongside the analysis because the HTML signal log is a log of the
+        // recording: it renders one row per observation in this stream. A renderer given only the
+        // analysis could show findings but not the observations that produced none, and "what else did
+        // this install do" is the question the artifact exists to answer.
+        let html = installscope_report::render_html(&analysis, &context, &events);
         let path = args.out.join("installscope-report.html");
         std::fs::write(&path, &html).with_context(|| format!("writing {}", path.display()))?;
         eprintln!("wrote {}", path.display());
@@ -1565,5 +1596,80 @@ mod tests {
             }
             other => panic!("expected snapshot verify, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn report_defaults_to_the_embedded_catalog() {
+        // No `--rules` means the catalog compiled into the binary, so a fresh clone works with no
+        // configuration (PRD.md:46).
+        let cli = Cli::try_parse_from(["installscope", "report", "events.jsonl"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Report(args) => assert!(
+                args.rules.is_none(),
+                "the default must be the embedded catalog"
+            ),
+            other => panic!("expected report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_accepts_a_rules_path() {
+        // The flag exists because the embedded catalog cannot know a private registry hostname or an
+        // internal mirror, and without it the only way to add one is to fork and rebuild.
+        let cli = Cli::try_parse_from([
+            "installscope",
+            "report",
+            "events.jsonl",
+            "--rules",
+            "custom/catalog.yaml",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        match cli.command {
+            Command::Report(args) => {
+                assert_eq!(args.rules, Some(PathBuf::from("custom/catalog.yaml")));
+            }
+            other => panic!("expected report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_supplied_catalog_changes_what_is_reported() {
+        // The whole point of the flag, asserted at the layer that decides rather than at the parse
+        // boundary: a host the embedded catalog does not know produces a finding, and the same host in a
+        // user's `registry_hosts` does not. Without this the flag could be wired to nothing and still
+        // parse cleanly.
+        let embedded = installscope_core::Catalog::embedded().expect("embedded catalog");
+        let source = include_str!("../../rules/catalog.yaml").replace(
+            "registry_hosts:\n  - registry.npmjs.org",
+            "registry_hosts:\n  - artifactory.internal.example\n  - registry.npmjs.org",
+        );
+        assert_ne!(
+            source,
+            include_str!("../../rules/catalog.yaml"),
+            "the substitution must have applied, or the comparison below is vacuous"
+        );
+        let custom = installscope_core::Catalog::from_yaml(&source).expect("custom catalog");
+
+        assert!(
+            !embedded.is_registry_host("artifactory.internal.example"),
+            "the embedded catalog must not already know this host, or the test proves nothing"
+        );
+        assert!(
+            custom.is_registry_host("artifactory.internal.example"),
+            "the supplied catalog must take effect"
+        );
+    }
+
+    #[test]
+    fn a_malformed_supplied_catalog_is_an_error_not_a_silent_fallback() {
+        // Falling back to the embedded catalog on a bad file would produce a report that looks fine while
+        // silently ignoring every rule the user configured.
+        let err = installscope_core::Catalog::from_yaml("version: 99\nrules: []\n")
+            .expect_err("a future catalog version must be refused");
+        assert!(
+            err.to_string().contains("99"),
+            "the error must name what was wrong: {err}"
+        );
     }
 }

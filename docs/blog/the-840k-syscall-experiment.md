@@ -12,9 +12,9 @@ Each of these answers an important question: *Has someone reported this? Who sig
 
 None of them answer the basic runtime question: **What did the package actually do on disk and wire when it ran?**
 
-To establish an empirical baseline before releasing [InstallScope](https://github.com/mukti-sys/InstallScope), we built an automated, content-addressed recording harness and ran it over 50 top npm packages across 200 consecutive version pairs.
+To establish an empirical baseline before releasing [InstallScope](https://github.com/mukti-sys/InstallScope), we built an automated, content-addressed recording harness and ran it over 50 widely-used npm packages across 200 consecutive version pairs.
 
-Here is what 840,069 syscall observations taught us about real-world package installations.
+Here is what 840,069 behavior observations taught us about real-world package installations.
 
 ---
 
@@ -22,27 +22,37 @@ Here is what 840,069 syscall observations taught us about real-world package ins
 
 We selected 50 widely-used packages spanning pure JavaScript utilities, CLI tools, network clients, and native binary addons (including `bcrypt`, `sqlite3`, `protobufjs`, `sharp`, `esbuild`, `puppeteer`, and `playwright`). For each package, we resolved the five most recent consecutive release versions.
 
-Every recording ran in an ephemeral `ubuntu-latest` runner under strict containment:
+The package list is `harness/g2/packages.txt`, chosen by hand for coverage of install-time behaviors rather than by download rank. Nothing in the pipeline establishes a ranking, so this is not a "top 50 by downloads" dataset and the harness refuses to describe it as one.
 
-- **Syscall Tracer:** Instrumented with `strace -f -ff -yy -ttt` capturing file descriptor mutations, network connections, DNS questions, and process execution trees.
-- **Controlled Environment:** Fixed working directories, isolated home and temp zones, and structured logging.
-- **Integrity Validation:** Every recording was re-parsed and validated by an independent verifier. If a tracer was interrupted, an event log truncated, or an unparseable binary buffer written, the session was marked `PARTIAL`.
+Every recording ran in an ephemeral `ubuntu-latest` runner under controlled conditions:
 
-Across 250 recordings, **250 completed cleanly (100% completion, 0 partials)**, generating a content-addressed dataset of 22.21 MB compressed with `zstd`.
+- **Syscall Tracer:** `strace -f -ff -yy -ttt`, capturing filesystem mutations, network connections, DNS questions, and process execution trees.
+- **Controlled Environment:** A fresh project, cache, home, and temp directory per recording, so one package's install cannot show up as another's behavior.
+- **Integrity Validation:** Every recording was re-parsed by an independent verifier. An interrupted tracer, a truncated event log, or an unparseable buffer marks the session `PARTIAL`, and a `PARTIAL` recording is refused by the snapshot store rather than diffed.
+
+Across 250 recordings, **250 completed cleanly (100% completion, 0 partials)**, producing a content-addressed dataset of 22.21 MB compressed with `zstd`.
+
+One caveat on that completion rate: it was measured on a list of well-behaved, widely-used packages. It does not predict the rate on a list chosen to include awkward ones.
 
 ---
 
 ## The Raw Telemetry
 
-Across the corpus, the recorder observed **840,069 total syscall events**, of which **195,780 were distinct behavioral observations**:
+Across the corpus, the recorder observed **840,069 behavior observations**, of which **195,780 were distinct**:
 
-| Observation Class | Total Observed Events |
+| Observation Class | Observations |
 |---|---|
-| Filesystem Writes (`openat`, `creat`, `unlink`, `mkdir`) | 838,016 |
-| External Network Connections (`connect`, `socket`) | 1,023 |
-| Credential / Environment Reads (`.npmrc`, SSH paths) | 500 |
-| Spawned Process Invocations (`execve`, `clone`) | 558 |
-| DNS Question Payloads Decoded | 512 |
+| Filesystem (`openat`, `creat`, `mkdir`, `unlink`, `rename`, …) | 837,988 |
+| External network connections (`connect`) | 1,023 |
+| Spawned process invocations (`execve`) | 558 |
+| Credential / environment reads (`.npmrc`, SSH paths) | 500 |
+| **Total** | **840,069** |
+
+Two things about those numbers are worth stating plainly, because a table like this invites being quoted without them.
+
+**Observations are not distinct behaviors.** 840,069 counts every behavior in every recording; 195,780 counts how many *different* ones exist. The gap is almost entirely `node_modules` and cache writes that every install performs. The second figure is the honest one for a claim about a dataset's size, and it is the one the harness prints first.
+
+**Filesystem dominates by three orders of magnitude.** 99.8% of the observations are writes. Any conclusion drawn from the network, process, or credential rows rests on hundreds of events, not hundreds of thousands, and should be read with that in mind.
 
 ---
 
@@ -103,12 +113,31 @@ By storing verified execution traces in a content-addressed snapshot registry, I
 ## Architecture: Why `strace` for CI?
 
 When building InstallScope, we designed two distinct backends:
-1. An in-kernel eBPF backend using pure Rust (`aya`), hooking 10+ kernel tracepoints (`sys_enter_execve`, `sys_enter_connect`, etc.).
+1. An in-kernel eBPF backend using pure Rust (`aya`) — 22 tracepoint programs (`sys_enter_execve`, `sys_enter_connect`, and the write/mutation family), filtered to the recorded process tree in-kernel.
 2. A userspace recorder instrumenting `strace` with dedicated process group management.
 
-While eBPF offers near-zero overhead for production runtime daemons, GitHub Actions hosted runners (`ubuntu-latest`) do not grant root eBPF capabilities (`CAP_BPF`, `CAP_SYS_ADMIN`) to standard workflows.
+eBPF avoids the per-syscall ptrace stop, which is the reason to want it. But loading a BPF program needs `CAP_BPF`/`CAP_PERFMON`, which means root — and while a GitHub-hosted `ubuntu-latest` runner does grant passwordless sudo, an action that requires it is an action many repositories will not adopt.
 
-Userspace `strace` with `-f -ff -yy -ttt` requires zero elevated kernel privileges, resolves file descriptors to absolute canonical paths in userspace, and decodes socket structures reliably. For an installation command running in CI for 15 seconds, the microseconds of tracer overhead are negligible, while the ability to run out-of-the-box on any standard runner is paramount.
+Userspace `strace` with `-f -ff -yy -ttt` needs nothing beyond `ptrace`, gets the kernel's own resolved paths from `-yy` rather than reconstructing them, and decodes socket structures reliably. For an install running for fifteen seconds in CI, tracer overhead is not the binding constraint; working out of the box on any runner is. So `strace` is the default and the permanent fallback, and the eBPF backend is optional.
+
+We have not benchmarked either backend against an untraced install. The overhead difference between them is a well-understood property of the two mechanisms, not something this corpus measured, and it is not stated as a number anywhere in the project.
+
+**The two backends do not have equal coverage**, which matters more than overhead. The eBPF probes are scoped to filesystem writes, network connects, and process spawns; they record no credential reads and no DNS queries at all. A zero score from an eBPF recording is therefore a weaker claim than a zero from `strace`, and every report names the backend that produced it alongside a per-class coverage table. Conflating the two would be exactly the false confidence this project exists to avoid.
+
+---
+
+## What This Recorder Cannot See
+
+A tool that implies more coverage than it has is the failure mode we built this to detect in others, so the gaps are documented rather than left to be discovered:
+
+- **`io_uring` is not traced.** A package that submits opens, writes, or connects through an io_uring ring issues none of the syscalls in the traced set. The recording will report `complete` having observed none of it. Nothing in the corpus above used io_uring, which is why the dataset is unaffected — but that is a fact about the packages sampled, not a property of the recorder.
+- **Inbound sockets are not traced.** A package that binds and listens produces no event.
+- **Encrypted resolution is indistinguishable from other traffic.** DNS questions are decoded from datagrams sent to port 53; DNS-over-HTTPS and DNS-over-TLS appear only as ordinary connections.
+- **Byte volumes are a floor.** `sendfile`, `copy_file_range`, and writes through a shared mapping move bytes without a traced `write`, so a total understates rather than measures.
+
+One gap that used to be on this list is closed: `fchmod`, `fchown`, and `ftruncate` are traced alongside their path-based forms, so making a file executable through an open descriptor is no longer invisible. It was worth closing precisely because it was cheap to exploit — `fs.openSync` then `fs.fchmodSync` is two lines.
+
+Each of these appears in the per-class coverage table on every report, so a clean result states what it could not check.
 
 ---
 
@@ -116,19 +145,21 @@ Userspace `strace` with `-f -ff -yy -ttt` requires zero elevated kernel privileg
 
 To ensure reports remain trusted, InstallScope enforces strict false-positive discipline:
 
-- **The Bounded Score (0–100):** Only high-severity and critical events (writes outside declared project/cache zones, reverse shells, downloads piped directly to interpreters) contribute to the Surprise Index score.
-- **Low Findings are Informational:** Routine reads of `.npmrc` or standard compiler toolchain invocations are ranked for inspection, but excluded from score sums so legitimate builds never trigger false alarms.
-- **Unresolved Paths are Caveated:** If an install uses relative directory descriptors that cannot be resolved to an absolute path, the report explicitly states that those paths were not scored as outside-zone escapes, rather than guessing and generating false critical alerts.
-- **Visible PARTIAL Badges:** If a recording is truncated, a tracer killed, or an event log corrupted, InstallScope prints a visible `[PARTIAL]` badge. Silence is never mistaken for a clean install.
+- **The Bounded Score (0–100):** Critical, high, and medium findings contribute to the Surprise Index; the sum is capped at 100 and the uncapped raw value is retained so the flattening stays visible.
+- **Low Findings are Informational:** Routine reads of `.npmrc` and standard compiler toolchain invocations are reported and ranked, but excluded from the score sum, so an install that merely does a lot of ordinary things cannot reach an alarming number.
+- **Unresolved Paths are Caveated:** If an install uses relative directory descriptors the recorder cannot resolve to an absolute path, the report counts them and states they were not checked against the expected directories — rather than guessing and manufacturing a critical finding.
+- **Visible PARTIAL Badges:** If a recording is truncated, a tracer killed, or an event log corrupted, the report leads with a `[PARTIAL]` badge and the recorder's own reason for it. Silence is never rendered as a clean install.
+- **The Score is Not a Baseline Comparison.** It is a weighted sum of the rules that fired on one recording, which makes it a triage signal rather than a measurement. The version-to-version diff described above is the baseline-relative half of the product, and it is a separate output.
 
 ---
 
 ## Conclusion & Next Steps
 
-Attestations verify who signed an artifact. Static analysis inspects what an author claims their code does. But runtime syscalls represent the immutable ground truth of what actually executed.
+Attestations verify who signed an artifact. Static analysis inspects what an author claims their code does. Recorded syscalls are evidence of what a specific install actually did on a specific machine — bounded by what the recorder was watching, which is why every report says what it could not see.
 
-InstallScope brings flight recording to package installs: lightweight, deterministic, and built directly for the pull request review boundary.
+InstallScope brings flight recording to package installs: deterministic, advisory by default, and built for the pull request review boundary.
 
 - **GitHub Repository:** [mukti-sys/InstallScope](https://github.com/mukti-sys/InstallScope)
 - **Rule Catalog:** [rules/catalog.yaml](https://github.com/mukti-sys/InstallScope/blob/main/rules/catalog.yaml)
-- **Dataset & Verification:** [TESTS.md](https://github.com/mukti-sys/InstallScope/blob/main/TESTS.md)
+- **Test Log & Coverage Boundaries:** [TESTS.md](https://github.com/mukti-sys/InstallScope/blob/main/TESTS.md)
+- **Dataset:** run [#33632942704](https://github.com/mukti-sys/InstallScope/actions/runs/33632942704) — `dataset.json` and `DATASET.md` in its `corpus` artifact are the source for every figure quoted here.

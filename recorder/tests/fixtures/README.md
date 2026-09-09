@@ -26,6 +26,12 @@
 #  - connect split across <unfinished ...> / <... resumed> with EINPROGRESS
 #  - clone, so the child inherits the fd table
 #  - chmod +x, rename, symlink, unlink, mkdir
+#  - fchmod/fchown/ftruncate through an OPEN DESCRIPTOR, which must resolve to the same path the
+#    path-based forms would produce. Without these traced, `chmod +x` outside the project could be
+#    performed as `fchmod(open(path), 0755)` and the top-severity rule would never fire.
+#  - fchmod on an UNKNOWN descriptor (99) and on a SOCKET descriptor, both of which must produce NO
+#    event: a mutation whose target cannot be resolved is not evidence about any path, and inventing
+#    one is how a fabricated critical finding gets made.
 #  - exit notice
 #
 ## What trace.4101 (forked child) covers

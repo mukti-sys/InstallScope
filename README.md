@@ -29,7 +29,7 @@ The flight recorder for package installs.
 
 When a pull request adds or updates a dependency, InstallScope captures the **syscall-level ground truth** of what that package's install scripts actually do — filesystem mutations, network sockets, DNS lookups, credential reads, and spawned processes — and posts an austere, single-page forensic report directly to the PR.
 
-Package install scripts (`postinstall`, `preinstall`, `build.rs`) execute arbitrary code with full user privileges. `npm audit` only flags known CVEs against published advisory databases; static scanners inspect ASTs and package manifests before execution; container sandboxes add friction without producing structured review evidence.
+Package install scripts (`postinstall`, `preinstall`, `build.rs`) execute arbitrary code with full user privileges. `npm audit` only flags known CVEs against published advisory databases; static scanners inspect ASTs and package manifests before execution; container isolation tools add friction without producing structured review evidence.
 
 InstallScope provides runtime behavioral observation designed specifically for CI pull request reviews.
 
@@ -126,17 +126,21 @@ Where InstallScope sits relative to existing tools:
 
 ## The 840,069 Syscall Experiment
 
-To validate InstallScope at real scale before release, we ran an automated backfill over **50 top npm packages**, recording **250 complete installations** across **200 consecutive version pairs** on ephemeral GitHub Actions runners:
+To establish an empirical baseline before release, we ran an automated backfill over **50 widely-used npm packages**, recording **250 complete installations** across **200 consecutive version pairs** on ephemeral GitHub Actions runners ([run #33632942704](https://github.com/mukti-sys/InstallScope/actions/runs/33632942704)):
 
 - **100% Completion:** 250 verified recordings, 0 unhandled failures, 0 dropped trace streams.
-- **840,069 Total Observations:** 195,780 distinct syscall behaviors reduced to content-addressed profiles.
-- **Reproducibility:** Across 20 parallel runner environments, 200 consecutive version comparisons completed with **0 blocked comparisons**.
+- **840,069 Observations, 195,780 Distinct:** the first counts every behavior in every recording; the second counts how many *different* ones exist. The gap is `node_modules` and cache writes that every install performs, and the second number is the honest one for a claim about dataset size.
+- **Reproducibility:** across 20 parallel runner environments, 200 version comparisons completed with **0 blocked comparisons** — meaning two recordings of the same package made at different times, in different directories, on different machines reduced to comparable behavior sets.
+
+Every figure is computed from the stored recordings rather than from the plan, by `harness/corpus/summarize-corpus.mjs`. The run's `corpus` artifact contains `dataset.json` and `DATASET.md`, which are the primary source; the harness explicitly refuses to describe the list as "top N by downloads" because nothing in the pipeline establishes a download ranking.
 
 ### What we learned from empirical data:
 
-1. **Network traffic is ubiquitous but static:** In our dataset, 1,023 external network connections and 500 credential reads occurred. Crucially, **none of them differed between versions** of the same package — these were standard registry fetches and local `.npmrc` reads by `npm`.
-2. **What actually changes across versions:** Across 200 version transitions, 197 produced purely internal filesystem changes (`node_modules` structure). Only 3 produced new process spawns, all representing legitimate compiler toolchains in native packages (`bcrypt` introducing `node-gyp-build`, `sqlite3` invoking `prebuild-install`, and `protobufjs` invoking `sh`).
-3. **The Lesson for PR Review:** Alert fatigue kills security tools. An install contacting `registry.npmjs.org` is normal; an install whose version bump suddenly introduces an unpinned HTTP request to an unknown IP is a surprise. InstallScope's version-diff engine surfaces the difference.
+1. **Network traffic is ubiquitous but static:** 1,023 external network connections and 500 credential reads occurred. **None of them differed between versions** of the same package — these were registry fetches and local `.npmrc` reads by `npm` itself.
+2. **What actually changes across versions:** of 200 version transitions, 197 produced purely internal filesystem changes (`node_modules` structure). Only 3 produced new process spawns, all legitimate compiler toolchains in native packages (`bcrypt` introducing `node-gyp-build`, `sqlite3` invoking `prebuild-install`, `protobufjs` invoking `sh`).
+3. **The lesson for PR review:** alert fatigue kills security tools. An install contacting `registry.npmjs.org` is normal; an install whose version bump suddenly introduces an unpinned request to an unknown host is a surprise. The version-diff engine surfaces the difference.
+
+One caveat worth stating: 99.8% of those observations are filesystem writes, so conclusions about the network, process, and credential classes rest on hundreds of events rather than hundreds of thousands. And a 100% completion rate measured on well-behaved, widely-used packages does not predict the rate on a list chosen to include awkward ones.
 
 ---
 
@@ -220,7 +224,7 @@ jobs:
 
 ## Backend Architecture
 
-InstallScope provides two recording engines evaluated through an automated parity verification suite:
+InstallScope provides two recording engines, compared against each other by an automated parity suite:
 
 ```
                   ┌────────────────────────────────────────┐
@@ -234,16 +238,18 @@ InstallScope provides two recording engines evaluated through an automated parit
    │          (v1.0)           │             │          (v1.1)           │
    ├───────────────────────────┤             ├───────────────────────────┤
    │ • Default for CI & Action │             │ • In-kernel ring tracing  │
-   │ • Zero root privileges    │             │ • 10+ tracepoint probes   │
-   │ • Full path resolution    │             │ • Zero tracer overhead    │
-   │ • Process tree kill on TO │             │ • Verified in G1 CI gate  │
+   │ • Needs only ptrace       │             │ • 22 tracepoint programs  │
+   │ • Kernel-resolved paths   │             │ • No per-syscall stop     │
+   │ • Process tree kill on TO │             │ • Needs root (CAP_BPF)    │
    └───────────────────────────┘             └───────────────────────────┘
 ```
 
-- **`strace` (v1.0 - Default)**: Standard engine used by the GitHub Action. Intercepts syscall boundaries with `-f -ff -yy -ttt`. Resolves file descriptors to absolute canonical paths and socket connections to remote IPs. Terminates entire untrusted process trees via dedicated process group signaling (`SIGTERM` → 2s grace → `SIGKILL -<pgid>`).
-- **`aya` eBPF (v1.1 - Optional)**: In-kernel tracepoint backend using pure Rust `aya`. Verified continuously in CI (`phase2-aya.yml`) against standard Linux runners.
-- **Process Spawn Parity**: `strace` and `aya` hook execution at slightly different kernel boundaries (shebang script execution vs binary interpreter invocation), so cross-backend process spawn parity is classified as best-effort in `parity.rs`.
-- **False-Positive Discipline**: Unresolved paths without a determinable parent directory are counted and displayed in reports, but deliberately not scored as outside-zone to avoid manufacturing false critical findings.
+- **`strace` (v1.0 - Default)**: The engine the GitHub Action uses. Traces a fixed syscall set with `-f -ff -yy -ttt`, resolving file descriptors to the kernel's own absolute paths and socket connections to remote addresses. Terminates entire untrusted process trees via process group signaling (`SIGTERM` → 2s grace → `SIGKILL -<pgid>`). Needs no privilege beyond `ptrace`, which is why it is the default and the permanent fallback.
+- **`aya` eBPF (v1.1 - Optional)**: In-kernel tracepoint backend in pure Rust. 22 programs, filtered to the recorded process tree in-kernel via `sched_process_fork` so a CI recording does not also capture the runner's own daemons. First verified in [run #33417231156](https://github.com/mukti-sys/InstallScope/actions/runs/33417231156) (parity OK: 29 shared facts, 40 differences, 0 unexplained), and re-verified by `phase2-aya.yml` on every commit touching the probes, the loader, or their shared ABI. Requires root to load BPF programs, so the Action does not use it.
+- **Overhead**: eBPF avoids the per-syscall ptrace stop that `strace` incurs, which is why it exists. It is not free — probe execution, map lookups, and perf-buffer delivery all cost — and neither backend has been benchmarked against an untraced install. Treat the difference as directional rather than measured.
+- **Coverage is not equal between them.** The aya probes are scoped to filesystem writes, network connects, and process spawns ([`Phases.md`:23](#)), so they record **no credential reads and no DNS queries at all**. A zero score from an aya recording is a weaker claim than a zero from strace, and every report states which backend produced it along with a per-class coverage table. The two are not interchangeable.
+- **Process Spawn Parity**: The backends hook execution at slightly different kernel boundaries (shebang script execution vs binary interpreter invocation), so cross-backend spawn parity is classified as best-effort in `parity.rs`.
+- **False-Positive Discipline**: Paths the recorder could not resolve to an absolute location are counted and shown, but deliberately not scored as outside-zone — guessing there would manufacture critical findings.
 
 ---
 
@@ -253,7 +259,8 @@ InstallScope provides two recording engines evaluated through an automated parit
 |---|---|
 | `installscope record -- <cmd>` | Execute and record an install command into `events.jsonl` |
 | `installscope verify <file>` | Validate event stream integrity; returns exit code 3 on `PARTIAL` |
-| `installscope report <file>` | Score recording against rule catalog → emits SARIF, HTML, and Markdown |
+| `installscope report <file>` | Score recording against the rule catalog → emits SARIF, HTML, and Markdown |
+| `installscope report --rules <file>` | Score against a catalog you supply instead of the embedded one |
 | `installscope lockfile-diff` | Inspect `package-lock.json` or `pnpm-lock.yaml` to detect install script triggers |
 | `installscope snapshot push` | Store a verified event stream in the content-addressed registry |
 | `installscope snapshot verify` | Re-verify content addresses and hashes of all stored snapshots |
@@ -267,7 +274,7 @@ InstallScope provides two recording engines evaluated through an automated parit
 The test suite enforces zero-warning compliance across all crates:
 
 ```bash
-# Run unit & integration tests (556 tests)
+# Run unit & integration tests
 cargo test --workspace
 
 # Strict clippy linting
@@ -276,22 +283,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Format check
 cargo fmt --check
 
-# Run golden test harness (121 checks)
+# Run golden test harnesses
 node harness/corpus/test-corpus.mjs
 node harness/g2/test-parse.mjs
 ```
 
-Detailed test logs and verification matrices across host architectures are documented in [TESTS.md](TESTS.md).
+Counts, per-crate breakdowns, and — more usefully — an explicit table of **what a local run cannot cover** are in [TESTS.md](TESTS.md), which is generated by `node scripts/test-log.mjs` and fails CI if it goes stale. A count typed by hand is wrong as soon as the next test lands.
 
 ---
 
 ## Community & Good First Issues
 
-We welcome contributions from systems and security engineers. Three starter issues are ready for community involvement:
+We welcome contributions from systems and security engineers. Three starter issues are ready:
 
-1. **Community Rules (`rules/catalog.yaml`):** Add detection for remote script downloads piped to interpreters from unpinned URLs.
-2. **Lockfile Support:** Extend `lockfile/` to parse Yarn Berry (v2+) `yarn.lock` formats.
-3. **CLI Ergonomics:** Add `--zone-extra <path>` flags to allow maintainers to declare custom build directories.
+1. **Community Rules (`rules/catalog.yaml`):** The catalog is loadable at runtime via `report --rules <path>`, so a new host list or severity can be proposed and tested without touching Rust. The gap most worth closing: a rule for writes to shell-init and persistence paths inside the home directory, which the zone model currently treats as expected.
+2. **Lockfile Support:** Extend `lockfile/` to parse Yarn Berry (v2+) `yarn.lock`. The npm v1–v3 and pnpm v5–v9 parsers with their fixture suites are the pattern to follow.
+3. **Recorder Coverage:** Trace `bind`, `listen`, and `accept`. A package that opens a listening port currently produces no event at all — see the coverage table any report prints. This needs a new event shape in the schema rather than just another syscall name, which makes it a good way to learn the whole pipeline.
 
 ---
 

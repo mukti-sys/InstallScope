@@ -180,11 +180,11 @@ mod tests {
     use super::*;
     use installscope_core::{Catalog, Event};
 
-    /// Loads and analyses a demo fixture.
+    /// Loads a demo fixture's event stream.
     ///
-    /// Shared by every renderer's tests so all three are exercised against the same evidence — which is
-    /// what makes "the three surfaces agree" a checkable claim rather than an intention.
-    pub(crate) fn analyse_fixture(name: &str) -> Analysis {
+    /// The HTML renderer needs the stream itself, not just the analysis: its signal log is a log *of the
+    /// recording*, so a test that could not supply the events could not check that the log matches them.
+    pub(crate) fn fixture_events(name: &str) -> Vec<Event> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("corpus")
@@ -192,15 +192,22 @@ mod tests {
             .join(name);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
-        let events: Vec<Event> = text
-            .lines()
+        text.lines()
             .enumerate()
             .filter(|(_, line)| !line.trim().is_empty())
             .map(|(index, line)| {
                 Event::from_jsonl(line, index + 1)
                     .unwrap_or_else(|error| panic!("line {}: {error}", index + 1))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Loads and analyses a demo fixture.
+    ///
+    /// Shared by every renderer's tests so all three are exercised against the same evidence — which is
+    /// what makes "the three surfaces agree" a checkable claim rather than an intention.
+    pub(crate) fn analyse_fixture(name: &str) -> Analysis {
+        let events = fixture_events(name);
         let catalog = Catalog::embedded().expect("catalog");
         installscope_core::evaluate(&catalog, &events)
     }

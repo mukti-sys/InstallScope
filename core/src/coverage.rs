@@ -102,26 +102,53 @@ impl Observability {
 ///
 /// Every entry is a statement about the recorder rather than about any particular install, and each is
 /// traceable to a decision recorded in the probe module or in `Memory.md`.
+///
+/// # No class is [`Observability::Observed`] on the strength of "we trace the obvious syscalls"
+///
+/// An earlier version of this table marked strace's filesystem and process classes `Observed`, meaning
+/// silence in them was evidence of absence. That was too strong. strace sees the syscalls in
+/// `recorder::strace::TRACE_SET` and nothing else, and there are documented ways to mutate a file or run
+/// a program that are not in that set. A class is `Observed` here only when the backend's view of it has
+/// no known gap; where a gap exists it is named, because a caveat a reader can evaluate is worth more
+/// than a reassurance they cannot.
+///
+/// Two of the gaps that produced this note have since been closed rather than caveated: `fchmod`,
+/// `fchown`, and `ftruncate` are now traced, so a descriptor-based mutation is no longer invisible. The
+/// note below is narrower as a result. `io_uring` remains the substantive hole and is stated plainly,
+/// because closing it needs ring-creation tracing rather than another syscall name.
 #[must_use]
 pub fn observability(backend: Backend, class: ObservationClass) -> Observability {
     match (backend, class) {
         // ---- strace ----------------------------------------------------------------------------
-        (Backend::Strace, ObservationClass::FilesystemWrites | ObservationClass::ProcessSpawns) => {
-            Observability::Observed
-        }
+        (Backend::Strace, ObservationClass::FilesystemWrites) => Observability::Partial(
+            "mutations are seen through the traced syscall set, which covers both the path and \
+             descriptor forms of every operation it traces. Not covered: an `io_uring` submission, \
+             which can open and write without issuing a traced syscall at all",
+        ),
+        (Backend::Strace, ObservationClass::ProcessSpawns) => Observability::Partial(
+            "execution is observed at `execve`/`execveat`; argument vectors are captured up to \
+             strace's 512-byte string limit and a longer command line is flagged truncated rather \
+             than shown in full",
+        ),
         (Backend::Strace, ObservationClass::CredentialReads) => Observability::Partial(
             "reads are filtered to a list of credential- and environment-bearing paths; a read of \
              some other sensitive file is not reported",
         ),
         (Backend::Strace, ObservationClass::NetworkConnections) => Observability::Partial(
             "destinations are IP addresses; strace cannot prove which DNS answer a connect used, so \
-             no hostname is attached",
+             no hostname is attached. Inbound sockets are not traced, so a package that binds and \
+             listens produces no event",
         ),
         (Backend::Strace, ObservationClass::DnsQueries) => Observability::Partial(
-            "questions are decoded from datagram payloads; a payload truncated by strace's buffer \
-             yields no event rather than a partial hostname",
+            "questions are decoded from datagram payloads sent to port 53; a payload truncated by \
+             strace's buffer yields no event rather than a partial hostname, and resolution over \
+             DNS-over-HTTPS or DNS-over-TLS is indistinguishable from ordinary traffic",
         ),
-        (Backend::Strace, ObservationClass::WriteVolumes) => Observability::Observed,
+        (Backend::Strace, ObservationClass::WriteVolumes) => Observability::Partial(
+            "byte counts come from the write-family syscalls; volume moved by `sendfile`, \
+             `copy_file_range`, or a shared mapping is not counted, so a total is a floor rather \
+             than a measurement",
+        ),
 
         // ---- aya -------------------------------------------------------------------------------
         (Backend::Aya, ObservationClass::FilesystemWrites) => Observability::Partial(
@@ -188,16 +215,41 @@ impl Coverage {
             .collect()
     }
 
-    /// True when this backend sees every class, so a clean report means a clean install.
+    /// True when this backend has no class it cannot see at all.
+    ///
+    /// Deliberately *not* "sees everything". Every class can still carry a [`Observability::Partial`]
+    /// caveat — strace has known gaps in each of them, listed in [`observability`] — and this returning
+    /// `true` means only that silence in each class is worth something, not that it is conclusive. The
+    /// caveats travel with the report either way, and [`Self::qualifications`] enumerates them.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.blind_spots().is_empty()
+    }
+
+    /// Classes this backend sees with a stated limitation.
+    ///
+    /// Separate from [`Self::blind_spots`] because the two support different claims: a blind spot means
+    /// an absent finding says nothing at all, while a qualification means it says less than it appears
+    /// to. A report that shows neither is overstating its own coverage.
+    #[must_use]
+    pub fn qualifications(&self) -> Vec<(ObservationClass, &'static str)> {
+        self.classes
+            .iter()
+            .filter_map(|(class, observability)| match observability {
+                Observability::Partial(reason) => Some((*class, *reason)),
+                Observability::Observed | Observability::Unobserved(_) => None,
+            })
+            .collect()
     }
 
     /// One-line caveat for a report footer, or `None` when there is nothing to caveat.
     ///
     /// Phrased as what was *not checked* rather than as a reassurance, because a reader skimming a
     /// zero-score report needs the limitation to land.
+    ///
+    /// Only blind spots reach this line. Per-class qualifications are numerous and specific, and
+    /// collapsing six of them into one sentence would produce a paragraph nobody reads; they are
+    /// rendered in the per-class table instead, which every report surface carries.
     #[must_use]
     pub fn caveat_line(&self) -> Option<String> {
         let blind = self.blind_spots();
@@ -219,7 +271,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strace_sees_every_class() {
+    fn strace_has_no_blind_spot_but_no_unqualified_class_either() {
+        // Two claims that are easy to conflate. strace can see something in every class, so silence is
+        // never meaningless — but it sees each class through a bounded syscall set, so silence is never
+        // conclusive either. The table has to say both.
         let coverage = Coverage::for_backend(Backend::Strace);
         assert!(
             coverage.is_complete(),
@@ -230,9 +285,77 @@ mod tests {
         for (class, observability) in &coverage.classes {
             assert!(
                 observability.silence_is_meaningful(),
-                "{class}: strace silence must be evidence of absence"
+                "{class}: strace silence must carry some weight"
+            );
+            assert!(
+                observability.note().is_some(),
+                "{class}: strace's view of every class has a documented gap; claiming an \
+                 unqualified Observed would overstate it"
             );
         }
+        assert_eq!(
+            coverage.qualifications().len(),
+            ObservationClass::ALL.len(),
+            "every strace class is qualified"
+        );
+    }
+
+    #[test]
+    fn the_strace_gaps_that_matter_are_named() {
+        // Each remaining gap is a documented way to mutate a file, run a program, resolve a name, or
+        // move bytes without producing an event, and each has to be visible to a reader rather than
+        // living only in a commit message.
+        let filesystem = observability(Backend::Strace, ObservationClass::FilesystemWrites)
+            .note()
+            .expect("filesystem writes are qualified");
+        assert!(
+            filesystem.contains("io_uring"),
+            "io_uring can write without a traced syscall: {filesystem}"
+        );
+
+        let network = observability(Backend::Strace, ObservationClass::NetworkConnections)
+            .note()
+            .expect("network connections are qualified");
+        assert!(
+            network.contains("listen"),
+            "inbound sockets are not traced: {network}"
+        );
+
+        let dns = observability(Backend::Strace, ObservationClass::DnsQueries)
+            .note()
+            .expect("DNS is qualified");
+        assert!(
+            dns.contains("DNS-over-HTTPS"),
+            "encrypted resolution is indistinguishable from other traffic: {dns}"
+        );
+
+        let volumes = observability(Backend::Strace, ObservationClass::WriteVolumes)
+            .note()
+            .expect("write volumes are qualified");
+        assert!(
+            volumes.contains("floor"),
+            "a byte total is a floor, not a measurement: {volumes}"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_gap_is_closed_and_no_longer_claimed() {
+        // `fchmod`, `fchown`, and `ftruncate` are traced now, so the filesystem caveat must not still
+        // name them as blind. A stale caveat is a smaller failure than a missing one, but it is still a
+        // false statement about coverage — and it would make a reader distrust the caveats that are real.
+        let filesystem = observability(Backend::Strace, ObservationClass::FilesystemWrites)
+            .note()
+            .expect("filesystem writes are qualified");
+        for closed in ["fchmod", "fchown", "ftruncate"] {
+            assert!(
+                !filesystem.contains(closed),
+                "{closed} is traced now; the caveat must not still claim it is invisible: {filesystem}"
+            );
+        }
+        assert!(
+            filesystem.contains("descriptor forms"),
+            "the caveat should say what it now does cover, not only what it does not: {filesystem}"
+        );
     }
 
     #[test]
