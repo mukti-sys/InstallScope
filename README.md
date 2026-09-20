@@ -23,6 +23,8 @@ The flight recorder for package installs.
 > <sup>[view full evidence report (.html) ↗] · [download SARIF ↗] · `events.jsonl` (sha256:e3b0c442...)</sup><br>
 > <sup>Recorded with the strace engine (v1.0). Advisory: this comment reports observed install behaviors, and does not block the build.</sup>
 
+Live demo: https://github.com/mukti-sys/installscope-demo/pull/1
+
 ---
 
 ## What is InstallScope?
@@ -169,6 +171,8 @@ If a patch release touches no new domains, spawns no new processes, and writes o
 ---
 
 ## GitHub Action Setup
+
+Live demo: https://github.com/mukti-sys/installscope-demo/pull/1
 
 InstallScope uses two separate workflows to maintain a strict security boundary:
 
