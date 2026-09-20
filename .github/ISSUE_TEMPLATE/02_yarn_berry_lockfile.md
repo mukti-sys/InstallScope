@@ -10,10 +10,10 @@ InstallScope currently parses `package-lock.json` (v1, v2, v3) and `pnpm-lock.ya
 
 ### Scope & Tasks
 1. Extend `lockfile/` with a Yarn parser that extracts package descriptors and detects install scripts (`postinstall`, `build`).
-2. Add a `LockfileFormat::YarnBerry` variant in `lockfile/src/types.rs`.
+2. Add an `Ecosystem::YarnBerry` variant in `lockfile/src/model.rs`.
 3. Add unit test fixtures covering additions and version updates in `yarn.lock`.
 4. Update `action/record/action.yml` trigger paths to include `**/yarn.lock`.
 
 ### References
 - Lockfile parser: `lockfile/src/lib.rs`
-- Type definitions: `lockfile/src/types.rs`
+- Type definitions: `lockfile/src/model.rs`

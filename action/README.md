@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/record@v0.1.0
+      - uses: mukti-sys/InstallScope/action/record@f4d58d21f104a6aa3d52e1904b117f32654004d3
 ```
 
 ```yaml
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/comment@v0.1.0
+      - uses: mukti-sys/InstallScope/action/comment@f4d58d21f104a6aa3d52e1904b117f32654004d3
 ```
 
 ## Why two workflows

@@ -51,4 +51,4 @@ Every one of these is reflected in the per-class coverage table each report carr
 
 #### Empirical Dataset & Verification
 - **50-Package Backfill Corpus:** 250 recordings across 200 consecutive version pairs, 100% completion, 0 blocked comparisons. 840,069 behavior observations of which 195,780 are distinct. Every figure is computed from the stored recordings rather than from the plan, by `harness/corpus/summarize-corpus.mjs`; the run is [#33632942704](https://github.com/mukti-sys/InstallScope/actions/runs/33632942704) and `dataset.json` / `DATASET.md` in its `corpus` artifact are the primary source.
-- **Rigorous Test Suite:** 578 unit and integration tests with zero compiler warnings under strict `-D warnings` deny lints. Counts per crate, and an explicit list of what a local run cannot cover, are in [TESTS.md](TESTS.md).
+- **Rigorous Test Suite:** 581 unit and integration tests with zero compiler warnings under strict `-D warnings` deny lints. Counts per crate, and an explicit list of what a local run cannot cover, are in [TESTS.md](TESTS.md).

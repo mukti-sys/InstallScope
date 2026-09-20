@@ -21,7 +21,7 @@ Existing supply chain tools largely fall into three buckets:
 2. **Provenance attestations (Sigstore, npm provenance):** Prove *who built and signed* the package. But as recent ecosystem attacks have shown, an attacker with a compromised maintainer token can sign malicious code with valid provenance.
 3. **Static AST scanners:** Guess intent by inspecting manifests and syntax trees without running the code.
 
-Meanwhile, package install scripts (`postinstall`, `build.rs`) run with full user permissions. If an update quietely connects to an external IP, dumps credentials from `~/.npmrc`, or writes to `/etc/cron.d`, maintainers have no structured evidence before merging.
+Meanwhile, package install scripts (`postinstall`, `build.rs`) run with full user permissions. If an update quietly connects to an external IP, dumps credentials from `~/.npmrc`, or writes to `/etc/cron.d`, maintainers have no structured evidence before merging.
 
 ### What 840,069 observations taught us
 
@@ -45,7 +45,7 @@ This confirmed our design choice: the real signal isn't naive absolute alerting,
 - **Security Boundary:** The GitHub Action uses two separate workflows: the record workflow runs the install with a read-only token; the comment workflow reads the uploaded artifact and posts the comment without ever checking out or executing untrusted PR code.
 - **False-Positive Discipline:** Low findings (routine config reads) are excluded from the score sum to prevent alert fatigue. If an install path cannot be resolved to an absolute directory, it's counted and caveated rather than guessed as an outside-zone write. If a recording is truncated, the report leads with a `[PARTIAL]` badge.
 
-Written in Rust (578 unit and integration tests, 0 compiler warnings under `-D warnings`). Dual-licensed under MIT and Apache-2.0.
+Written in Rust (581 unit and integration tests, 0 compiler warnings under `-D warnings`). Dual-licensed under MIT and Apache-2.0.
 
 Code: https://github.com/mukti-sys/InstallScope  
 Blog post on the 840k syscall experiment: https://github.com/mukti-sys/InstallScope/blob/main/docs/blog/the-840k-syscall-experiment.md

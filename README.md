@@ -82,9 +82,9 @@ cargo install --git https://github.com/mukti-sys/InstallScope.git installscope
 ```
 
 Prebuilt release binaries with SHA-256 checksums are available on [GitHub Releases](https://github.com/mukti-sys/InstallScope/releases):
-- **Windows (x86_64):** `installscope-x86_64-pc-windows-msvc.zip` (`installscope.exe`)
-- **Linux (x86_64):** `installscope-x86_64-unknown-linux-gnu.tar.gz` / `installscope-x86_64-unknown-linux-musl.tar.gz`
-- **macOS (Apple Silicon & Intel):** `installscope-aarch64-apple-darwin.tar.gz` / `installscope-x86_64-apple-darwin.tar.gz`
+- **Windows (x86_64):** `installscope-v0.1.0-x86_64-pc-windows-msvc.zip` (`installscope.exe`)
+- **Linux (x86_64):** `installscope-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` / `installscope-v0.1.0-x86_64-unknown-linux-musl.tar.gz`
+- **macOS (Apple Silicon & Intel):** `installscope-v0.1.0-aarch64-apple-darwin.tar.gz` / `installscope-v0.1.0-x86_64-apple-darwin.tar.gz`
 
 ### Platform Compatibility
 
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/record@v0.1.0
+      - uses: mukti-sys/InstallScope/action/record@f4d58d21f104a6aa3d52e1904b117f32654004d3
         with:
           fail-above: "" # Leave empty for advisory comments; set integer (e.g. 70) to block PR
 ```
@@ -218,7 +218,7 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/comment@v0.1.0
+      - uses: mukti-sys/InstallScope/action/comment@f4d58d21f104a6aa3d52e1904b117f32654004d3
 ```
 
 ---
@@ -248,7 +248,7 @@ InstallScope provides two recording engines, compared against each other by an a
 - **`strace` (v1.0 - Default)**: The engine the GitHub Action uses. Traces a fixed syscall set with `-f -ff -yy -ttt`, resolving file descriptors to the kernel's own absolute paths and socket connections to remote addresses. Terminates entire untrusted process trees via process group signaling (`SIGTERM` → 2s grace → `SIGKILL -<pgid>`). Needs no privilege beyond `ptrace`, which is why it is the default and the permanent fallback.
 - **`aya` eBPF (v1.1 - Optional)**: In-kernel tracepoint backend in pure Rust. 22 programs, filtered to the recorded process tree in-kernel via `sched_process_fork` so a CI recording does not also capture the runner's own daemons. First verified in [run #33417231156](https://github.com/mukti-sys/InstallScope/actions/runs/33417231156) (parity OK: 29 shared facts, 40 differences, 0 unexplained), and re-verified by `phase2-aya.yml` on every commit touching the probes, the loader, or their shared ABI. Requires root to load BPF programs, so the Action does not use it.
 - **Overhead**: eBPF avoids the per-syscall ptrace stop that `strace` incurs, which is why it exists. It is not free — probe execution, map lookups, and perf-buffer delivery all cost — and neither backend has been benchmarked against an untraced install. Treat the difference as directional rather than measured.
-- **Coverage is not equal between them.** The aya probes are scoped to filesystem writes, network connects, and process spawns ([`Phases.md`:23](#)), so they record **no credential reads and no DNS queries at all**. A zero score from an aya recording is a weaker claim than a zero from strace, and every report states which backend produced it along with a per-class coverage table. The two are not interchangeable.
+- **Coverage is not equal between them.** The aya probes are scoped to filesystem writes, network connects, and process spawns, so they record **no credential reads and no DNS queries at all**. A zero score from an aya recording is a weaker claim than a zero from strace, and every report states which backend produced it along with a per-class coverage table. The two are not interchangeable.
 - **Process Spawn Parity**: The backends hook execution at slightly different kernel boundaries (shebang script execution vs binary interpreter invocation), so cross-backend spawn parity is classified as best-effort in `parity.rs`.
 - **False-Positive Discipline**: Paths the recorder could not resolve to an absolute location are counted and shown, but deliberately not scored as outside-zone — guessing there would manufacture critical findings.
 

@@ -62,11 +62,13 @@ runs:
       shell: bash
       env:
         DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
       run: |
         set -euo pipefail
 
         if [ "$DOWNLOAD_OUTCOME" = "failure" ]; then
-          echo "::warning title=Artifact download failed::failed to download artifact '${{ inputs.artifact-name }}' from run ${{ github.event.workflow_run.id }}; check permissions (actions: read required)"
+          echo "::warning title=Artifact download failed::failed to download artifact '${ARTIFACT_NAME}' from run ${WORKFLOW_RUN_ID}; check permissions (actions: read required)"
         fi
 
         if [ ! -d installscope-artifact ]; then
