@@ -16,7 +16,7 @@ inputs:
     default: "installscope-report"
   token:
     description: >-
-      Token used to post the comment. Needs `pull-requests: write` and nothing else.
+      Token used to post the comment. Needs `pull-requests: write` and `actions: read`.
     required: false
     default: ${{ github.token }}
   marker:
@@ -60,8 +60,14 @@ runs:
     - name: Validate the artifact before trusting anything in it
       id: validate
       shell: bash
+      env:
+        DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
       run: |
         set -euo pipefail
+
+        if [ "$DOWNLOAD_OUTCOME" = "failure" ]; then
+          echo "::warning title=Artifact download failed::failed to download artifact '${{ inputs.artifact-name }}' from run ${{ github.event.workflow_run.id }}; check permissions (actions: read required)"
+        fi
 
         if [ ! -d installscope-artifact ]; then
           # No artifact means the recording workflow decided there was nothing to record, or it failed
@@ -152,8 +158,8 @@ runs:
 
         # `gh api` rather than a third-party action: Architecture.md:42 asks for bash plus gh api, and it
         # keeps the job that holds the write token free of dependencies nobody in this repository reviews.
-        existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-          --paginate --jq '.[] | select(.body | startswith($marker)) | .id' --arg marker "$MARKER" | head -n 1)"
+        existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+          | jq -r --arg marker "$MARKER" '.[] | select(.body | startswith($marker)) | .id' | head -n 1)"
 
         if [ -n "$existing" ]; then
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \

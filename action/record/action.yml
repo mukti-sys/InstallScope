@@ -99,18 +99,24 @@ runs:
     - name: Cache the installscope build
       uses: Swatinem/rust-cache@v2
       with:
-        workspaces: ${{ github.action_path }}/../ -> target
+        workspaces: ${{ github.action_path }}/../.. -> target
         key: installscope-action
 
     - name: Build installscope
       shell: bash
-      working-directory: ${{ github.action_path }}/..
+      working-directory: ${{ github.action_path }}/../..
       run: |
         set -euo pipefail
         # Built from the action's own checkout rather than downloaded. A security tool that fetches its
         # own binary at runtime has a supply chain problem of exactly the kind it exists to record.
         cargo build --release --locked -p installscope
         echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+    - name: Verify installscope binary
+      shell: bash
+      run: |
+        set -euo pipefail
+        installscope --version
 
     - name: Identify the lockfile and decide whether to record
       id: trigger

@@ -210,6 +210,7 @@ on:
 permissions:
   pull-requests: write
   contents: read
+  actions: read
 
 jobs:
   comment:
