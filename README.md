@@ -217,7 +217,7 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/comment@v0
+      - uses: mukti-sys/InstallScope/action/comment@v0.1.0
 ```
 
 ---
