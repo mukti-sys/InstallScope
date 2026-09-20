@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mukti-sys/InstallScope/action/record@v0
+      - uses: mukti-sys/InstallScope/action/record@v0.1.0
         with:
           fail-above: "" # Leave empty for advisory comments; set integer (e.g. 70) to block PR
 ```
