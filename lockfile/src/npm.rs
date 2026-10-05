@@ -549,7 +549,10 @@ mod tests {
             "lockfileVersion": 3,
             "packages": { "": { "name": "root", "version": "1.0.0" } }
         }"#;
-        assert!(parse(text).expect("parse").packages.is_empty());
+        assert!(
+            parse(text).expect("parse").packages.is_empty(),
+            "root package should not be listed as a dependency"
+        );
     }
 
     #[test]

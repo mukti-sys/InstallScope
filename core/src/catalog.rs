@@ -496,7 +496,11 @@ rules:
         let catalog = Catalog::from_yaml(MINIMAL).expect("valid");
         assert_eq!(catalog.rules.len(), 1);
         assert!(catalog.rules[0].enabled, "enabled defaults to true");
-        assert!(catalog.registry_hosts.is_empty());
+        assert!(
+            catalog.registry_hosts.is_empty(),
+            "minimal catalog has no registry hosts: {:?}",
+            catalog.registry_hosts
+        );
     }
 
     #[test]

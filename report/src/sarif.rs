@@ -297,7 +297,10 @@ mod tests {
             .filter_map(|rule| rule["id"].as_str())
             .collect();
         let results = run["results"].as_array().expect("results array");
-        assert!(!results.is_empty());
+        assert!(
+            !results.is_empty(),
+            "expected SARIF results array not to be empty"
+        );
         for result in results {
             let rule_id = result["ruleId"].as_str().expect("a ruleId");
             assert!(

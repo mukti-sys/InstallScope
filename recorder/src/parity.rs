@@ -812,7 +812,7 @@ mod tests {
         let report = compare(&strace, &aya);
         assert!(report.passed(), "{}", report.summary());
         assert_eq!(report.agreed.len(), 3);
-        assert!(report.differences.is_empty());
+        assert!(report.differences.is_empty(), "{:?}", report.differences);
     }
 
     #[test]
@@ -980,7 +980,7 @@ mod tests {
         assert!(!report.passed(), "{}", report.summary());
         assert_eq!(report.partial_inputs, vec![Backend::Aya]);
         // No unexplained differences — the failure is entirely the PARTIAL input.
-        assert!(report.failures().is_empty());
+        assert!(report.failures().is_empty(), "{:?}", report.failures());
         assert!(report.summary().contains("not valid"));
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
         let aya = vec![complete_end(Backend::Aya)];
         let report = compare(&strace, &aya);
         assert!(report.passed(), "{}", report.summary());
-        assert!(report.differences.is_empty());
+        assert!(report.differences.is_empty(), "{:?}", report.differences);
     }
 
     #[test]

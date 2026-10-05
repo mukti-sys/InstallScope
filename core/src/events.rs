@@ -849,7 +849,11 @@ mod tests {
     fn complete_session_end_has_no_reasons() {
         let end = SessionEnd::complete(Some(0), 1, 2, 3);
         assert!(end.complete);
-        assert!(end.incomplete_reasons.is_empty());
+        assert!(
+            end.incomplete_reasons.is_empty(),
+            "complete session should have no incomplete reasons: {:?}",
+            end.incomplete_reasons
+        );
     }
 
     #[test]

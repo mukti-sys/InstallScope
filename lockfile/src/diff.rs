@@ -460,7 +460,10 @@ mod tests {
         let before = lockfile(vec![registry("ms", "2.1.3", "sha512-aaa")]);
         let after = before.clone();
         let result = diff(&before, &after);
-        assert!(result.is_empty());
+        assert!(
+            result.is_empty(),
+            "expected unchanged lockfile to produce no changes"
+        );
         assert!(!result.should_record());
     }
 
@@ -575,7 +578,7 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         assert!(matches!(result.changes[0], Change::Removed { .. }));
         assert!(!result.should_record());
-        assert!(result.recordable().is_empty());
+        assert_eq!(result.recordable(), []);
     }
 
     #[test]

@@ -441,7 +441,10 @@ fn a_timeout_records_as_partial_with_a_timeout_reason() {
     let summary = summarize_stream(&contents)
         .unwrap_or_else(|e| panic!("a PARTIAL stream must still be readable: {e}"));
     assert!(summary.is_partial());
-    assert!(!summary.incomplete_reasons.is_empty());
+    assert!(
+        !summary.incomplete_reasons.is_empty(),
+        "partial stream must have incomplete reasons"
+    );
 }
 
 #[test]

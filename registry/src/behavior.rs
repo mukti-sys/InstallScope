@@ -1092,7 +1092,7 @@ mod tests {
                     "{summary:?} contains banned framing {banned:?}"
                 );
             }
-            assert!(!summary.is_empty());
+            assert!(!summary.is_empty(), "summary must not be empty");
         }
     }
 

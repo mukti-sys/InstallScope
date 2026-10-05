@@ -477,7 +477,10 @@ mod tests {
             summary.is_partial(),
             "an abandoned session must render as PARTIAL"
         );
-        assert!(!summary.incomplete_reasons.is_empty());
+        assert!(
+            !summary.incomplete_reasons.is_empty(),
+            "an abandoned session must list incomplete reasons"
+        );
     }
 
     #[test]

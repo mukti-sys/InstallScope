@@ -283,7 +283,7 @@ mod tests {
         // The normal first-run state. Erroring would make every fresh checkout look broken.
         let scratch = Scratch::new("absent");
         let index = Index::load(scratch.path()).expect("load");
-        assert!(index.is_empty());
+        assert!(index.is_empty(), "fresh index should be empty");
         assert_eq!(index.len(), 0);
     }
 

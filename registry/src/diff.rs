@@ -407,7 +407,7 @@ mod tests {
         assert!(result.comparable());
         assert!(!result.is_identical());
         assert_eq!(result.added.len(), 1);
-        assert!(result.removed.is_empty());
+        assert!(result.removed.is_empty(), "{:?}", result.removed);
         assert_eq!(result.unchanged, 1);
         assert!(result.headline().contains("behavior changed"));
         assert_eq!(result.changed_classes(), vec![BehaviorClass::Network]);
@@ -651,7 +651,7 @@ mod tests {
         let after = recording("1.0.1", profile(Backend::Strace, true, vec![]));
         let result = compare("x", &before, &after);
         assert_eq!(result.removed.len(), 1);
-        assert!(result.added.is_empty());
+        assert!(result.added.is_empty(), "{:?}", result.added);
         assert_eq!(result.removed_in(BehaviorClass::Network).len(), 1);
     }
 

@@ -130,7 +130,11 @@ fn a_clean_strace_result_is_trustworthy() {
     assert!(analysis.clean_result_is_trustworthy());
     assert_eq!(analysis.unresolved_paths, 0);
     assert!(analysis.coverage.is_complete());
-    assert!(analysis.skipped_rules.is_empty());
+    assert!(
+        analysis.skipped_rules.is_empty(),
+        "{:?}",
+        analysis.skipped_rules
+    );
     assert_eq!(analysis.coverage.caveat_line(), None);
 }
 
@@ -191,7 +195,7 @@ fn a_binary_download_is_reported_but_not_alarming() {
 fn the_worst_finding_leads_the_bullets() {
     let analysis = analyse("high.jsonl");
     let bullets = installscope_core::select_bullets(&analysis.findings);
-    assert!(!bullets.is_empty());
+    assert!(!bullets.is_empty(), "expected bullets not to be empty");
     assert_eq!(
         bullets[0].severity,
         Severity::High,
@@ -280,7 +284,10 @@ fn the_credential_read_names_the_file_it_read() {
         "subject was {:?}",
         finding.subject
     );
-    assert!(!finding.evidence.is_empty());
+    assert!(
+        !finding.evidence.is_empty(),
+        "expected finding evidence not to be empty"
+    );
     assert!(finding.evidence[0].ts_ns > 0);
 }
 

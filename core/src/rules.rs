@@ -770,7 +770,7 @@ mod tests {
             )],
         );
         let analysis = evaluate(&catalog(), &events);
-        assert!(analysis.findings.is_empty());
+        assert!(analysis.findings.is_empty(), "{:?}", analysis.findings);
         assert_eq!(analysis.unresolved_paths, 1);
     }
 
@@ -1150,7 +1150,7 @@ mod tests {
     fn a_single_label_name_is_search_domain_noise() {
         let events = stream(Backend::Strace, vec![dns("wpad")]);
         let analysis = evaluate(&catalog(), &events);
-        assert!(analysis.findings.is_empty());
+        assert!(analysis.findings.is_empty(), "{:?}", analysis.findings);
     }
 
     // ---- spawns ---------------------------------------------------------------------------------
@@ -1227,7 +1227,11 @@ mod tests {
     fn a_strace_recording_has_no_skipped_rules() {
         let events = stream(Backend::Strace, vec![dns("registry.npmjs.org")]);
         let analysis = evaluate(&catalog(), &events);
-        assert!(analysis.skipped_rules.is_empty());
+        assert!(
+            analysis.skipped_rules.is_empty(),
+            "{:?}",
+            analysis.skipped_rules
+        );
         assert!(analysis.coverage.is_complete());
         assert!(analysis.clean_result_is_trustworthy());
     }
@@ -1435,7 +1439,10 @@ rules:
             ],
         );
         let analysis = evaluate(&catalog(), &events);
-        assert!(!analysis.findings.is_empty());
+        assert!(
+            !analysis.findings.is_empty(),
+            "expected malicious events to trigger findings"
+        );
         for finding in &analysis.findings {
             assert!(
                 !finding.evidence.is_empty(),
@@ -1443,8 +1450,11 @@ rules:
                 finding.rule_id
             );
             for evidence in &finding.evidence {
-                assert!(!evidence.op.is_empty());
-                assert!(!evidence.detail.is_empty());
+                assert!(!evidence.op.is_empty(), "evidence op must not be empty");
+                assert!(
+                    !evidence.detail.is_empty(),
+                    "evidence detail must not be empty"
+                );
             }
             assert!(
                 finding.note.is_some(),
@@ -1495,7 +1505,10 @@ rules:
         assert!(analysis.clean_result_is_trustworthy());
         // Informational findings are still present, because silence is a designed state that shows its
         // evidence (Design.md:43).
-        assert!(!analysis.findings.is_empty());
+        assert!(
+            !analysis.findings.is_empty(),
+            "informational findings should be present"
+        );
         assert!(analysis
             .findings
             .iter()

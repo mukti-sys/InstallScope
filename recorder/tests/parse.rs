@@ -129,7 +129,7 @@ fn parses_the_fixture_without_errors() {
         stats.unmatched_unfinished, 0,
         "every unfinished syscall in this fixture is resumed; {stats:?}"
     );
-    assert!(!events.is_empty());
+    assert!(!events.is_empty(), "expected events not to be empty");
     // One exit notice per traced process: 4100, 4101, 4103.
     assert_eq!(stats.exits, 3, "one exit per process; {stats:?}");
     assert_eq!(stats.signals, 1, "one signal notice; {stats:?}");
@@ -704,7 +704,7 @@ fn the_event_cap_is_reported_rather_than_silently_truncating() {
 fn malformed_lines_are_counted_not_ignored() {
     let mut parser = Parser::new(FIXTURE_START_EPOCH);
     let events = parser.feed_line("this is not strace output at all", 1);
-    assert!(events.is_empty());
+    assert!(events.is_empty(), "malformed line should produce no events");
     assert_eq!(
         parser.stats().parse_errors,
         1,
