@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-node@v4
@@ -77,14 +77,14 @@ jobs:
           } | tee artifacts/runner-env.txt
 
       - name: Build the release binary
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       # ---- the ignored E2E test suite ---------------------------------------------------------
       - name: E2E tests (complete→clean and crash→PARTIAL)
         # These are the Phases.md:20 Done conditions, asserted in code rather than eyeballed.
         run: |
           set -uo pipefail
-          cargo test -p installscope-recorder --test e2e_linux -- --ignored --nocapture --test-threads=1 \
+          cargo test -p installscope-recorder --test e2e_linux --locked -- --ignored --nocapture --test-threads=1 \
             2>&1 | tee artifacts/e2e-tests.log
           exit "${PIPESTATUS[0]}"
 
@@ -235,12 +235,14 @@ jobs:
 
       - name: Step summary
         if: always()
+        env:
+          PACKAGE: ${{ inputs.package || 'lodash' }}
         run: |
           set -uo pipefail
           {
             echo "# Phase 1 — recorder E2E"
             echo ""
-            echo "Package recorded: \`${{ inputs.package || 'lodash' }}\`"
+            echo "Package recorded: \`$PACKAGE\`"
             echo ""
             if [ -f artifacts/verify.log ]; then
               echo "## Verification"

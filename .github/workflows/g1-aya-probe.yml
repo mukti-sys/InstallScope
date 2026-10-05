@@ -75,16 +75,16 @@ jobs:
       - name: Install nightly Rust with rust-src
         # rust-src is required because -Z build-std=core compiles core from source for
         # bpfel-unknown-none, which has no prebuilt std/core.
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ inputs.rust_toolchain }}
           components: rust-src, clippy, rustfmt
 
       - name: Install stable Rust for the loader
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@7bebc2e59eb8820162b7ac8f62a92bfdb2732447 # v1.25.1
 
       - name: Install bpf-linker
         # aya's eBPF codegen links through bpf-linker rather than the system linker.
@@ -154,14 +154,20 @@ jobs:
       # ---- the gate itself ------------------------------------------------------------------
       - name: Load, attach, and record one event
         id: probe
+        env:
+          TIMEOUT_MS: ${{ inputs.timeout_ms }}
         run: |
           set -uo pipefail
+          if [[ ! "$TIMEOUT_MS" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Bad input::Invalid timeout_ms: $TIMEOUT_MS"
+            exit 1
+          fi
           # sudo because BPF load needs CAP_BPF/CAP_PERFMON (Architecture.md:97).
           sudo ./harness/g1/target/release/g1-loader \
             --object harness/g1/g1-ebpf/target/bpfel-unknown-none/release/g1-ebpf \
             --out out/g1-result.json \
             --events out/g1-events.jsonl \
-            --timeout-ms "${{ inputs.timeout_ms }}" \
+            --timeout-ms "$TIMEOUT_MS" \
             2>&1 | tee out/loader.log
           status=${PIPESTATUS[0]}
           echo "status=$status" >> "$GITHUB_OUTPUT"

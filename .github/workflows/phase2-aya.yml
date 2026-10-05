@@ -161,13 +161,13 @@ jobs:
 
       # ---- toolchains -------------------------------------------------------------------------
       - name: Install nightly Rust with rust-src
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
           components: rust-src
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -222,7 +222,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          cargo build --release --features installscope/aya-backend 2>&1 \
+          cargo build --release --locked --features installscope/aya-backend 2>&1 \
             | tee artifacts/build-cli.log
           status=${PIPESTATUS[0]}
           echo "status=$status" >> "$GITHUB_OUTPUT"

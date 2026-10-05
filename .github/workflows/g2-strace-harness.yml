@@ -125,13 +125,17 @@ jobs:
           NODE
 
       - name: Summary
+        env:
+          MANAGER: ${{ inputs.manager }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          COUNT: ${{ steps.build.outputs.count }}
         run: |
           {
             echo "## G2 plan"
             echo ""
-            echo "Recording **${{ steps.build.outputs.count }}** packages, one ephemeral \`ubuntu-latest\` VM each."
+            echo "Recording **$COUNT** packages, one ephemeral \`ubuntu-latest\` VM each."
             echo ""
-            echo "Manager: \`${{ inputs.manager }}\` · per-install timeout: \`${{ inputs.timeout_seconds }}s\`"
+            echo "Manager: \`$MANAGER\` · per-install timeout: \`${TIMEOUT_SECONDS}s\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------------------------

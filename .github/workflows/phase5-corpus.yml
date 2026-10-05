@@ -217,14 +217,18 @@ jobs:
           if-no-files-found: error
 
       - name: Summary
+        env:
+          RECORDINGS: ${{ steps.shard.outputs.recordings }}
+          SHARDS: ${{ steps.shard.outputs.shard_count }}
+          VERSIONS: ${{ inputs.versions }}
         run: |
           set -euo pipefail
           {
             echo "## Phase 5 plan"
             echo ""
-            echo "\`${{ steps.shard.outputs.recordings }}\` recordings across \`${{ steps.shard.outputs.shard_count }}\` shard(s)."
+            echo "\`$RECORDINGS\` recordings across \`$SHARDS\` shard(s)."
             echo ""
-            echo "Selection rule: most recent \`${{ inputs.versions }}\` stable versions by publish time, prereleases excluded."
+            echo "Selection rule: most recent \`$VERSIONS\` stable versions by publish time, prereleases excluded."
             echo ""
             echo "Every recording gets a cold npm cache. Two recordings of one package against a shared"
             echo "cache would differ enormously for a reason that has nothing to do with the package."
@@ -252,7 +256,7 @@ jobs:
         with:
           node-version: "20"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@v2
         with:
           # Shared across shards: the build is identical, and 200 jobs each populating their own cache
@@ -482,7 +486,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: phase5-corpus
