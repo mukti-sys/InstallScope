@@ -612,7 +612,10 @@ mod tests {
             path: "packages/local-a".to_string(),
         };
         let after = lockfile(vec![member]);
-        assert!(diff(&before, &after).is_empty());
+        assert!(
+            diff(&before, &after).is_empty(),
+            "expected workspace-only diff to be empty"
+        );
     }
 
     #[test]

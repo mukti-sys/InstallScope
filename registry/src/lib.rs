@@ -655,7 +655,11 @@ mod tests {
             matches!(err, RegistryError::UnreadableStream { .. }),
             "got {err}"
         );
-        assert!(registry.index().is_empty());
+        assert!(
+            registry.index().is_empty(),
+            "expected index to be empty: {:?}",
+            registry.index()
+        );
     }
 
     #[test]
@@ -886,7 +890,11 @@ mod tests {
     fn verify_all_on_an_empty_store_reports_nothing_rather_than_failing() {
         let scratch = Scratch::new("verify-empty");
         let registry = Registry::open(scratch.path()).expect("open");
-        assert!(registry.verify_all().is_empty());
+        assert!(
+            registry.verify_all().is_empty(),
+            "{:?}",
+            registry.verify_all()
+        );
     }
 
     #[test]

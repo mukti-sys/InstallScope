@@ -729,7 +729,11 @@ mod tests {
             path: "/proc/self/oom_score_adj".to_string(),
             kind: WriteKind::Open,
         }));
-        assert!(profile.in_class(BehaviorClass::FilesystemEscape).is_empty());
+        assert!(
+            profile.in_class(BehaviorClass::FilesystemEscape).is_empty(),
+            "{:?}",
+            profile.in_class(BehaviorClass::FilesystemEscape)
+        );
     }
 
     #[test]
@@ -1038,7 +1042,7 @@ mod tests {
             "the escape class leads, because it is the one that matters most"
         );
         for class in BehaviorClass::ALL {
-            assert!(!class.as_str().is_empty());
+            assert_ne!(class.as_str(), "");
         }
     }
 

@@ -439,7 +439,7 @@ mod tests {
         let scratch = Scratch::new("empty");
         let store = Store::open(scratch.path()).expect("open");
         let digest = store.write(b"").expect("write");
-        assert!(store.read(&digest).expect("read").is_empty());
+        assert_eq!(store.read(&digest).expect("read"), [] as [u8; 0]);
         assert_ne!(digest, store.write(SAMPLE).expect("write"));
     }
 

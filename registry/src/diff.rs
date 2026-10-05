@@ -633,7 +633,11 @@ mod tests {
                 .map(|b| b.summary())
                 .collect::<Vec<_>>()
         );
-        assert!(result.highlights(0).is_empty());
+        assert!(
+            result.highlights(0).is_empty(),
+            "{:?}",
+            result.highlights(0)
+        );
     }
 
     #[test]
