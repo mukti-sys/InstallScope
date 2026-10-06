@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2026-10-06
+
+### Added
+- Custom Rule Catalogs: Added `--rules <PATH>` flag to `installscope report` so users can evaluate against external catalogs on disk with custom registry mirrors or build directories without recompiling.
+- Enhanced Signal Logging and Coverage Reporting: Expanded HTML report signal logging with detailed provenance and enriched coverage diagnostic caveats.
+
+### Fixed
+- Action Robustness: Resolved GitHub CLI API flag incompatibility in `action/comment`, hardened environment variable pass-through, and pinned GitHub Action commit SHAs to prevent supply-chain tampering.
+- CI and Lint Discipline: Resolved `assert_is_empty` and diagnostic formatting warnings across registry and lockfile test suites, enforcing clean `-D warnings` under stable Rust.
+
 ## [0.1.0] - 2026-09-04
 
 Initial public release of InstallScope — the flight recorder for package installs.

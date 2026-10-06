@@ -11,7 +11,7 @@ members = ["abi", "core", "lockfile", "recorder", "registry", "report", "cli"]
 exclude = ["harness", "recorder/aya-ebpf"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT OR Apache-2.0"

@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "installscope"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -280,11 +280,11 @@ dependencies = [
 
 [[package]]
 name = "installscope-abi"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "installscope-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "installscope-lockfile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "installscope-recorder"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aya",
  "bytes",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "installscope-registry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "installscope-core",
  "serde",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "installscope-report"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "installscope-core",
  "installscope-registry",
